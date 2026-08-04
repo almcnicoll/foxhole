@@ -2,15 +2,15 @@
 
 require_once __DIR__ . '/Exceptions.php';
 
-// Fetches half-hourly Agile (or any standard-unit-rates tariff) rates from the
-// public Octopus Energy API and caches the raw response for debugging.
+// Fetches half-hourly Agile (or any standard-unit-rates tariff) rates from
+// the public Octopus Energy API. Callers are responsible for persisting the
+// result (see Store::saveRateSlots) — this class only fetches and parses.
 class OctopusClient
 {
     private const BASE_URL = 'https://api.octopus.energy/v1';
 
     public function __construct(
         private readonly Logger $logger,
-        private readonly string $cacheFile = __DIR__ . '/../data/last_rates.json',
     ) {
     }
 
@@ -40,7 +40,6 @@ class OctopusClient
 
         // A single day is 48 slots, well under the API's default page_size=100,
         // so pagination ('next') is not expected here — not handled.
-        file_put_contents($this->cacheFile, $body);
 
         $slots = [];
         foreach ($data['results'] as $result) {

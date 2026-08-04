@@ -8,6 +8,7 @@ require_once __DIR__ . '/../src/Exceptions.php';
 require_once __DIR__ . '/../src/CostBasisProvider.php';
 require_once __DIR__ . '/../src/ScheduleBuilder.php';
 require_once __DIR__ . '/../src/Logger.php';
+require_once __DIR__ . '/../src/Store.php';
 
 $failures = 0;
 $checks = 0;
@@ -108,6 +109,44 @@ try {
 } catch (ScheduleBuildException $e) {
     check(true, 'mismatched slot/cost-basis counts throws ScheduleBuildException');
 }
+
+// --- Store: settings/password/rates/schedule persistence ---
+// Points the whole module at a throwaway file (see Store::db()'s "sticky path"
+// doc comment) so this never touches — and truncates — the real database.
+$testDbPath = sys_get_temp_dir() . '/foxhole_self_check_' . getmypid() . '.sqlite';
+@unlink($testDbPath);
+db($testDbPath);
+
+check(getSetting('nonexistent_key') === null, 'missing setting returns null');
+check(getSetting('nonexistent_key', 'fallback') === 'fallback', 'missing setting returns given default');
+setSetting('foxess_api_key', 'abc123');
+check(getSetting('foxess_api_key') === 'abc123', 'setting round-trips through the settings table');
+setSetting('foxess_api_key', 'replaced');
+check(getSetting('foxess_api_key') === 'replaced', 're-setting a key updates rather than duplicates (upsert)');
+
+check(verifySystemPassword('foxhole') === true, 'default password "foxhole" works before any password is set');
+check(verifySystemPassword('wrong') === false, 'wrong password rejected under the default');
+setSystemPassword('a-real-password');
+check(verifySystemPassword('foxhole') === false, 'old default stops working once a real password is set');
+check(verifySystemPassword('a-real-password') === true, 'new password verifies correctly');
+check(verifySystemPassword('a-real-password ') === false, 'password check is exact, not trimmed/fuzzy');
+
+$fetchedAt = new DateTimeImmutable('2026-01-04 16:00:00', new DateTimeZone('UTC'));
+saveRateSlots(buildSlots(array_fill(0, 4, 20.0)), $fetchedAt);
+$storedSlots = getLatestRateSlots();
+check(count($storedSlots) === 4, 'saved rate slots round-trip at the right count');
+check($storedSlots[0]['rate'] === 20.0, 'rate value round-trips');
+check($storedSlots[0]['fetched_at']->format(DATE_ATOM) === $fetchedAt->format(DATE_ATOM), 'fetched_at round-trips');
+saveRateSlots(buildSlots(array_fill(0, 2, 15.0)), $fetchedAt);
+check(count(getLatestRateSlots()) === 2, 'saving new rate slots replaces the old batch, not appends');
+
+$pushedAt = new DateTimeImmutable('2026-01-04 17:00:00', new DateTimeZone('UTC'));
+saveSchedule('2026-01-05', $groups, $pushedAt);
+$storedSchedule = getLatestSchedule();
+check($storedSchedule['groups'] == $groups, 'saved schedule groups round-trip identically (used for run.php\'s no-op diff)');
+check($storedSchedule['for_date'] === '2026-01-05', 'for_date round-trips');
+
+@unlink($testDbPath);
 
 if ($failures > 0) {
     fwrite(STDERR, "\n$failures/$checks checks failed\n");

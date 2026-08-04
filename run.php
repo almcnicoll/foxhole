@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/src/Logger.php';
 require_once __DIR__ . '/src/Exceptions.php';
+require_once __DIR__ . '/src/Store.php';
 require_once __DIR__ . '/src/OctopusClient.php';
 require_once __DIR__ . '/src/CostBasisProvider.php';
 require_once __DIR__ . '/src/ScheduleBuilder.php';
@@ -38,6 +39,10 @@ try {
 
     $costBasis = (new CostBasisProvider($config['cost_basis']))->getCostBasis(count($slots));
     $schedule = (new ScheduleBuilder($config['strategy'], $config['battery']))->build($slots, $costBasis);
+    $now = new DateTimeImmutable('now', $timezone);
+
+    // Rates are worth recording even in a dry run — it's what powers the dashboard.
+    saveRateSlots($slots, $now);
 
     if ($dryRun) {
         $logger->info('Dry run for ' . $tomorrow->format('Y-m-d') . ': ' . count($schedule['groups']) . ' group(s), not pushed.');
@@ -45,22 +50,21 @@ try {
         exit(0);
     }
 
-    $lastScheduleFile = __DIR__ . '/data/last_schedule.json';
-    $lastSchedule = is_file($lastScheduleFile) ? json_decode((string) file_get_contents($lastScheduleFile), true) : null;
-
-    if ($lastSchedule == $schedule) {
+    if ($schedule['groups'] == getLatestSchedule()['groups']) {
         $logger->info('Schedule for ' . $tomorrow->format('Y-m-d') . ' unchanged from last run, skipping FoxESS push.');
         exit(0);
     }
 
-    $foxess = new FoxessClient(
-        $config['foxess']['api_key'],
-        $config['foxess']['device_sn'],
-        $config['foxess']['base_url'],
-    );
+    $apiKey = getSetting('foxess_api_key', '');
+    $deviceSn = getSetting('foxess_device_sn', '');
+    if ($apiKey === '' || $deviceSn === '') {
+        throw new FoxessPushException('FoxESS credentials not configured — set them at settings.php');
+    }
+
+    $foxess = new FoxessClient($apiKey, $deviceSn, $config['foxess']['base_url']);
     $foxess->pushSchedule($schedule['groups']);
 
-    file_put_contents($lastScheduleFile, json_encode($schedule, JSON_PRETTY_PRINT));
+    saveSchedule($tomorrow->format('Y-m-d'), $schedule['groups'], $now);
     $logger->info(sprintf(
         'Pushed schedule for %s: %d group(s), %d FoxESS API call(s) this run.',
         $tomorrow->format('Y-m-d'),

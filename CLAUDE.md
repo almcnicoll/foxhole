@@ -7,58 +7,149 @@ Guidance for Claude Code (or any future maintainer) working in this repo.
 A small PHP app that once a day fetches tomorrow's Octopus Agile half-hourly
 electricity rates, computes a battery charge/discharge schedule from them,
 and pushes that schedule to a FoxESS inverter. Runs as a one-shot cron job on
-shared hosting — no daemon, no framework, no Composer dependencies (cURL and
-JSON are both PHP core extensions).
+shared hosting — no daemon, no framework, no Composer dependencies (cURL,
+JSON, and SQLite are all PHP core/bundled extensions).
+
+It also has a minimal password-walled web UI: a dashboard showing the latest
+fetched prices and the resolved charge/discharge schedule, and a settings
+page for FoxESS credentials and the system password.
 
 Full spec: [doc/foxess-agile-scheduler-spec.md](doc/foxess-agile-scheduler-spec.md).
-Read it before making structural changes — this file covers what the spec
-doesn't: decisions made while building, and things confirmed against live
-services that the spec left open.
+The spec covers v1 (cron-only, config-file credentials, no UI); the SQLite
+storage and web UI described below are a v2 addition on top of it, done at
+the user's request. Read the spec before making structural changes to the
+scheduling logic — this file covers what the spec doesn't: decisions made
+while building, and things confirmed against live services that were left
+open.
 
 ## Layout
 
 ```
-config.php            # real credentials, gitignored — copy of config.example.php
+config.php            # non-secret tunables, gitignored — copy of config.example.php
 config.example.php    # template, safe to commit
-run.php               # entry point, invoked by cron (supports --dry-run)
+run.php               # cron entry point (supports --dry-run)
+index.php             # dashboard (password-walled)
+login.php / logout.php
+settings.php          # FoxESS credentials + system password form (password-walled)
 src/
   Logger.php           # timestamped file logger, rotates past 2MB
   Exceptions.php        # OctopusFetchException / ScheduleBuildException / FoxessPushException
-  OctopusClient.php     # fetches + caches half-hourly rates from api.octopus.energy
+  Store.php             # SQLite connection + settings/rates/schedule/password persistence
+  Auth.php              # session-based login gate, built on Store's password check
+  Layout.php             # shared HTML header/footer for the web pages
+  OctopusClient.php     # fetches half-hourly rates from api.octopus.energy (fetch/parse only, no storage)
   CostBasisProvider.php # resolves the "worth charging below this" reference price
   ScheduleBuilder.php   # rates + cost basis -> FoxESS scheduler groups
   FoxessClient.php      # signs + sends requests to the FoxESS OpenAPI
 tests/
-  self_check.php        # standalone assert-style test for ScheduleBuilder/CostBasisProvider
-logs/scheduler.log
-data/last_rates.json      # raw cache of the most recent Octopus fetch
-data/last_schedule.json   # last schedule successfully pushed, used to skip no-op pushes
+  self_check.php        # standalone assert-style test for ScheduleBuilder/CostBasisProvider/Store
+logs/
+  scheduler.log
+  .htaccess              # deny all web access
+data/
+  scheduler.sqlite       # settings (incl. FoxESS creds + password hash), rate_slots, schedule_groups
+  .htaccess               # deny all web access
 ```
 
-No autoloader — `run.php` and `tests/self_check.php` just `require_once` each
-`src/` file in dependency order. Keep it that way unless the file count grows
-enough to justify one; it hasn't.
+No autoloader — every entry point just `require_once`s the `src/` files it
+needs. Keep it that way unless the file count grows enough to justify one;
+it hasn't.
+
+No routing framework for the web pages either — `index.php`/`settings.php`/etc.
+are plain scripts meant to sit at the same directory level `run.php` already
+deploys to (a typical shared host serves the whole app directory as-is, no
+separate "public" docroot in the spec's target environment). Don't introduce
+a `public/` subfolder without checking that assumption still holds for
+wherever this actually gets deployed.
+
+## Data storage: SQLite, no ORM
+
+`src/Store.php` is the entire data layer — plain `PDO` + hand-written SQL,
+three tables, `CREATE TABLE IF NOT EXISTS` run on every connection instead of
+a migration system (the schema is small and stable enough that idempotent
+DDL is simpler than tracking migrations).
+
+- **`settings`** — plain key/value (`key TEXT PRIMARY KEY, value TEXT`).
+  Holds `foxess_api_key`, `foxess_device_sn`, `system_password_hash`. A
+  key/value table was chosen over typed columns because the set of "small
+  bits of config the UI can edit" is exactly the kind of thing that grows
+  over time (see roadmap) — a new setting is a new row, not a migration.
+- **`rate_slots`** — the latest Octopus fetch. `saveRateSlots()` deletes and
+  re-inserts on every call, mirroring the old `last_rates.json`
+  latest-fetch-only semantics. It is *not* an accumulating history table,
+  even though nothing would break if it were — don't repurpose it as one
+  without deciding on retention first (see roadmap's history/reporting item).
+- **`schedule_groups`** — the latest schedule actually pushed to FoxESS.
+  Same replace-not-append pattern. This is also what `run.php` diffs the
+  freshly-computed schedule against to decide whether to skip a no-op push.
+
+`Store::db()` takes an optional, "sticky" path override specifically so
+`tests/self_check.php` can point the whole module at a throwaway SQLite file
+— call `db($somePath)` once and every other Store function's internal
+no-arg `db()` call reuses that connection. **Never run the test suite
+against the real `data/scheduler.sqlite`** — `saveRateSlots`/`saveSchedule`
+truncate on every call, so doing so would wipe the live dashboard data.
 
 ## Request flow (`run.php`)
 
-1. Load `config.php`.
+1. Load `config.php` (non-secret tunables only — see Config & secrets below).
 2. `OctopusClient::fetchRatesForDate()` — GET rates for tomorrow (local
-   midnight-to-midnight, converted to UTC for the API query), cache raw JSON
-   to `data/last_rates.json`. Throws `OctopusFetchException` on transport
-   failure *or* on fewer than 48 slots (rates not fully published yet).
-3. `CostBasisProvider::getCostBasis()` — 48 values (currently flat, `fixed`
+   midnight-to-midnight, converted to UTC for the API query). Throws
+   `OctopusFetchException` on transport failure *or* on fewer than 48 slots
+   (rates not fully published yet).
+3. `saveRateSlots()` — persisted to SQLite immediately, even in `--dry-run`
+   (it's just a record of what was fetched, and it's what powers the
+   dashboard).
+4. `CostBasisProvider::getCostBasis()` — 48 values (currently flat, `fixed`
    mode) to compare Agile rates against.
-4. `ScheduleBuilder::build()` — pure price-threshold logic, no I/O. Produces
+5. `ScheduleBuilder::build()` — pure price-threshold logic, no I/O. Produces
    `{groups: [...]}`.
-5. Diff against `data/last_schedule.json`; skip the FoxESS call if unchanged.
-6. `FoxessClient::pushSchedule()` — signs and POSTs to
+6. `--dry-run` stops here and prints the computed schedule — no FoxESS
+   credentials are even read.
+7. Diff the computed groups against `getLatestSchedule()`; skip the FoxESS
+   call if unchanged.
+8. Read `foxess_api_key`/`foxess_device_sn` from `Store` (via `getSetting()`)
+   — throws `FoxessPushException` with a pointer to `settings.php` if either
+   is empty.
+9. `FoxessClient::pushSchedule()` — signs and POSTs to
    `/op/v1/device/scheduler/enable`.
-7. On success, persist the new `last_schedule.json` and log a summary. On any
-   failure, log at ERROR, best-effort email `notify.alert_email`, exit 1 so
-   cron surfaces the failure.
+10. On success, `saveSchedule()` persists the new schedule and logs a
+    summary. On any failure, log at ERROR, best-effort email
+    `notify.alert_email`, exit 1 so cron surfaces the failure.
 
-`--dry-run` runs everything through step 4, prints the computed schedule, and
-exits — no network call to FoxESS, no state written.
+## Web UI & auth
+
+Three pages, no JS framework, inline CSS via `src/Layout.php`:
+
+- **`login.php`** — single password field, checked via
+  `Store::verifySystemPassword()`. No password has been set until someone
+  visits `settings.php` and sets one — until then the literal password is
+  `foxhole` (`Store::DEFAULT_SYSTEM_PASSWORD`). There is deliberately no
+  brute-force protection (no lockout, no rate limit, no captcha) — this is a
+  single-user hobby tool, not proportionate to add without being asked. If
+  this ever gets exposed somewhere less trusted than "my own inverter's
+  control panel," add one.
+- **`index.php`** — reads the latest `rate_slots` + `schedule_groups`,
+  resolves each half-hour slot's mode by checking which schedule group (if
+  any) its local start time falls in (`slotWorkMode()` in `index.php`), and
+  renders one unified table. Deliberately merges prices and schedule into a
+  single view rather than two separate tables — that merge *is* the
+  "quick glance" the UI exists for.
+- **`settings.php`** — FoxESS `api_key`/`device_sn` (pre-filled from
+  `Store`, plain text — the user themself set them, no reason to hide them
+  from themself) and an optional password change (blank = unchanged,
+  8-char minimum, must be confirmed twice). No CSRF token — same reasoning
+  as the brute-force point above.
+
+Auth is a native PHP session (`src/Auth.php`, `session_start()` +
+`$_SESSION['authed']`) — no token store, no "remember me," nothing custom.
+`requireLogin()` at the top of a page redirects to `login.php` if there's no
+session.
+
+**Password sent in cleartext if the host isn't serving HTTPS** — this app
+doesn't force a redirect to HTTPS itself (shared-host TLS setups vary too
+much to assume one). Put it behind HTTPS at the host level; don't rely on
+this app for that.
 
 ## Decisions made while building (things the spec left open)
 
@@ -115,18 +206,37 @@ conflicting groups.
 retry/backoff beyond a single retry." Only retries cURL-level failures
 (timeouts, DNS, connection refused), not HTTP error statuses.
 
+**FoxESS credentials live in SQLite, not `config.php`.** User-requested
+change from the original spec, so they're editable from `settings.php`
+without touching a file on the server. `config.php` keeps everything that
+isn't secret and isn't meant to be UI-editable (Octopus product/tariff
+codes, battery/strategy tunables, `foxess.base_url`, notification email).
+
+**`data/` and `logs/` get a deny-all `.htaccess`.** Necessary now in a way it
+wasn't for the old JSON files: `data/scheduler.sqlite` holds the FoxESS API
+key and the password hash, and on the flat "whole directory is the docroot"
+deployment this app targets, anything not explicitly blocked is
+web-servable as a raw file download. This is an Apache-specific mitigation
+(`mod_authz_core`/`mod_access_compat`, both essentially universal on cPanel
+hosts) — if this ever gets deployed on nginx or similar, it needs an
+equivalent `location` block instead; `.htaccess` does nothing there.
+
 ## Config & secrets
 
 `config.php` is real and gitignored; `config.example.php` is the committed
-template. If you add a new config key, update both files and the shape
-described in the spec's §4.
+template — both hold only non-secret tunables now (FoxESS `api_key`/
+`device_sn` moved to `data/scheduler.sqlite`, managed via `settings.php`).
+If you add a new config key, update both files and the shape described in
+the spec's §4. If you add a new *secret*, it belongs in the `settings` table
+via `Store`, not in `config.php`.
 
 ## Running
 
 ```bash
-php -l run.php src/*.php          # syntax check
-php tests/self_check.php          # ScheduleBuilder / CostBasisProvider logic
-php run.php --dry-run             # full pipeline against live Octopus API, no FoxESS write
+php -l run.php src/*.php *.php     # syntax check
+php tests/self_check.php           # ScheduleBuilder / CostBasisProvider / Store logic
+php run.php --dry-run              # full pipeline against live Octopus API, no FoxESS write, no DB creds needed
+php -S localhost:8000              # serve the UI locally — visit /login.php, default password "foxhole"
 ```
 
 `tests/self_check.php` is plain PHP with a local `check()` helper — not
@@ -134,7 +244,8 @@ php run.php --dry-run             # full pipeline against live Octopus API, no F
 `php.ini` and shared hosts often disable it in production, which would make
 an assert-based test silently do nothing. If you add logic with a branch or
 loop worth protecting, extend this file rather than reaching for a test
-framework.
+framework. It uses a throwaway SQLite file (see the `Store::db()` note
+above) — never point it at the real database.
 
 There's no live-fire test against a real FoxESS device in this repo — that
 needs real credentials and touches a physical inverter, so it's a manual
@@ -150,8 +261,14 @@ step for whoever deploys this, not something to script here.
   price-threshold logic by design (spec §7). A smarter optimiser (solar
   forecast, load-aware) would replace this method's body without touching
   its inputs/outputs — `run.php` and `FoxessClient` don't need to change.
+- **More settings-table config**: if more of `config.php` ends up needing a
+  UI (see roadmap), it follows the same pattern `foxess_api_key` already
+  does — `getSetting()`/`setSetting()`, no schema change needed for a plain
+  scalar value.
 
-## Out of scope (spec §12 — don't build these without a scope conversation)
+## Out of scope (spec §12, still true post-UI — don't build these without a scope conversation)
 
-Web dashboard, solar forecasting, multi-inverter support, historical
-analytics, retry/backoff beyond one attempt.
+Solar generation forecasting, multi-inverter support, historical cost
+analytics/reporting (note: `rate_slots`/`schedule_groups` are replace-only,
+*not* an accumulating history — see Data storage above), retry/backoff
+beyond one attempt.

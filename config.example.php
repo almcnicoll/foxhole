@@ -6,9 +6,9 @@ return [
         'tariff_code'  => 'E-1R-AGILE-24-10-01-C',  // region-specific GSP letter suffix, e.g. -C for London (A-P, not X — see CLAUDE.md)
     ],
     'foxess' => [
-        'api_key'   => '00000000-0000-0000-0000-000000000000', // from FoxESS Cloud > API Management
-        'device_sn' => 'YOUR_DEVICE_SERIAL',
-        'base_url'  => 'https://www.foxesscloud.com',
+        // api_key / device_sn are no longer set here — enter them via settings.php,
+        // stored in data/scheduler.sqlite. base_url is the only non-secret bit left.
+        'base_url' => 'https://www.foxesscloud.com',
     ],
     'battery' => [
         'capacity_kwh'      => 10.0,
