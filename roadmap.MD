@@ -23,11 +23,15 @@ reprioritised.
 - [ ] Set the cron entry (spec §10) and confirm `logs/scheduler.log` is
       actually being written on the real host — file permissions on shared
       hosts sometimes differ from local testing.
-- [ ] Confirm the host actually serves `.htaccess` (Apache/`mod_authz_core`
-      or `mod_access_compat`) — that's what's currently blocking web access
-      to `data/scheduler.sqlite` (API key + password hash) and `logs/`. If
-      the host is nginx or anything else, that protection silently does
-      nothing and needs a different mechanism before going live.
+- [x] Confirm the host actually serves `.htaccess` — checked live on
+      almcnicoll.co.uk (Plesk, Apache+PHP-FPM): `data/scheduler.sqlite` and
+      `logs/scheduler.log` both return 403. Re-check this if the hosting
+      setup ever changes (e.g. a move to pure nginx, where `.htaccess` is
+      silently ignored).
+- [ ] Copy `config.php` onto the live host — it's gitignored on purpose, so
+      a fresh git deploy/pull won't have it; confirmed 404 on
+      `almcnicoll.co.uk/foxhole/config.php` (2026-08-04), meaning it's
+      missing there entirely right now, not just inaccessible.
 - [ ] Put the site behind HTTPS at the host level — the login/settings forms
       submit the system password and API key in cleartext otherwise. This
       app doesn't force an HTTPS redirect itself (see CLAUDE.md).
@@ -66,10 +70,11 @@ commitment, just a starting point for prioritisation:
    the `settings` table gaining a device selector and `run.php` looping —
    not worth building until there's a second inverter.
 5. **Login hardening** (rate limiting / lockout on `login.php`, CSRF token on
-   `settings.php`). Skipped deliberately for a single-user tool behind a
-   password wall — revisit if this is ever exposed somewhere less trusted,
-   or if the "no CSRF token" choice starts to feel wrong once there's more
-   than one form on the site.
+   `settings.php` and `run-now.php`). Skipped deliberately for a single-user
+   tool behind a password wall — revisit if this is ever exposed somewhere
+   less trusted. `run-now.php` is the higher-priority one of the two if this
+   gets picked up: a forged request there triggers a real inverter push, not
+   just a settings change.
 
 ## Explicitly not planned
 

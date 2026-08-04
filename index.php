@@ -30,7 +30,19 @@ function slotWorkMode(int $slotMinutes, array $groups): string
 }
 
 renderHeader('Dashboard');
+
+$ran = $_GET['ran'] ?? null;
+$ranOk = ($_GET['ok'] ?? null) === '1';
+$ranMsg = (string) ($_GET['msg'] ?? '');
 ?>
+
+<?php if ($ran): ?>
+  <p class="<?= $ranOk ? 'notice' : 'error' ?>"><?= htmlspecialchars($ranMsg) ?></p>
+<?php endif; ?>
+
+<form method="post" action="run-now.php">
+  <button type="submit">Run now</button>
+</form>
 
 <?php if (!$slots): ?>
   <p class="muted">No rates fetched yet — run.php hasn't completed a successful fetch.</p>

@@ -27,13 +27,15 @@ open.
 ```
 config.php            # non-secret tunables, gitignored — copy of config.example.php
 config.example.php    # template, safe to commit
-run.php               # cron entry point (supports --dry-run)
+run.php               # cron entry point (CLI-only, supports --dry-run)
+run-now.php           # manual trigger for the same pipeline (login-only, POST-only)
 index.php             # dashboard (password-walled)
 login.php / logout.php
 settings.php          # FoxESS credentials + system password form (password-walled)
 src/
   Logger.php           # timestamped file logger, rotates past 2MB
   Exceptions.php        # OctopusFetchException / ScheduleBuildException / FoxessPushException
+  Runner.php             # runScheduler(): the fetch -> build -> (push) pipeline, shared by run.php and run-now.php
   Store.php             # SQLite connection + settings/rates/schedule/password persistence
   Auth.php              # session-based login gate, built on Store's password check
   Layout.php             # shared HTML header/footer for the web pages
@@ -90,7 +92,14 @@ no-arg `db()` call reuses that connection. **Never run the test suite
 against the real `data/scheduler.sqlite`** — `saveRateSlots`/`saveSchedule`
 truncate on every call, so doing so would wipe the live dashboard data.
 
-## Request flow (`run.php`)
+## Request flow (`src/Runner.php`'s `runScheduler()`)
+
+The actual fetch → build → (push) pipeline lives in one function,
+`runScheduler(bool $dryRun): array`, shared by two entry points with two
+different trust gates — see below. It never calls `exit()`; it always
+returns `['ok' => bool, 'dryRun' => bool, 'message' => string, 'schedule' => ?array]`
+and lets the caller decide what to do with that (an exit code for cron, an
+on-screen message for the UI).
 
 1. Load `config.php` (non-secret tunables only — see Config & secrets below).
 2. `OctopusClient::fetchRatesForDate()` — GET rates for tomorrow (local
@@ -104,7 +113,7 @@ truncate on every call, so doing so would wipe the live dashboard data.
    mode) to compare Agile rates against.
 5. `ScheduleBuilder::build()` — pure price-threshold logic, no I/O. Produces
    `{groups: [...]}`.
-6. `--dry-run` stops here and prints the computed schedule — no FoxESS
+6. `--dry-run` stops here and returns the computed schedule — no FoxESS
    credentials are even read.
 7. Diff the computed groups against `getLatestSchedule()`; skip the FoxESS
    call if unchanged.
@@ -114,12 +123,43 @@ truncate on every call, so doing so would wipe the live dashboard data.
 9. `FoxessClient::pushSchedule()` — signs and POSTs to
    `/op/v1/device/scheduler/enable`.
 10. On success, `saveSchedule()` persists the new schedule and logs a
-    summary. On any failure, log at ERROR, best-effort email
-    `notify.alert_email`, exit 1 so cron surfaces the failure.
+    summary. On any failure, log at ERROR and best-effort email
+    `notify.alert_email` — both happen inside `runScheduler()` itself, so
+    they're identical regardless of which entry point called it.
+
+**Two entry points, two trust gates, same pipeline:**
+
+- **`run.php`** — CLI-only (`PHP_SAPI !== 'cli'` check, first thing in the
+  file, before `$argv` is even read, since `$argv` doesn't exist outside
+  CLI). Discovered this needed enforcing when a browser hit to
+  `https://almcnicoll.co.uk/foxhole/run.php` produced a fatal error
+  (`in_array('--dry-run', null)` — `$argv` is `null` under FastCGI — throws a
+  `TypeError` on PHP 8). The deeper issue: without the guard, that URL was
+  reachable with **no authentication at all** and would trigger a real push
+  to the inverter. It's a thin wrapper now — parse `--dry-run`, call
+  `runScheduler()`, translate the result to stdout/stderr and an exit code.
+- **`run-now.php`** — the "Run now" button on the dashboard. Gated by
+  `requireLogin()` instead of the CLI check (same session/password system as
+  the rest of the UI), and POST-only (a GET — a stray link, a crawler,
+  browser prefetch — doesn't trigger a live push). Always a real run, never
+  `--dry-run` — redirects back to `index.php?ran=1&ok=…&msg=…` with the
+  result, which `index.php` renders as a banner. No CSRF token, same
+  reasoning as `settings.php` below — but this one has real-world
+  consequences (an actual inverter push) that a settings change doesn't, so
+  it's the first thing to add a token to if this ever gets hardened.
+
+**Cron setup** (spec §10's crontab line assumes raw cron access; on Plesk-
+style panel hosting, "Scheduled Tasks" in the domain's control panel does the
+same job — action type "Run a PHP script" or "Run a command", pointing at
+`php /path/to/run.php` on whatever schedule you pick, typically ~17:00 UK
+time to clear Octopus's ~16:00 publish time with some buffer). To trigger a
+run outside that schedule, use the dashboard's "Run now" button — that's the
+supported way now; there's still no browser-based way to hit `run.php`
+directly, by design (see above).
 
 ## Web UI & auth
 
-Three pages, no JS framework, inline CSS via `src/Layout.php`:
+No JS framework, inline CSS via `src/Layout.php`:
 
 - **`login.php`** — single password field, checked via
   `Store::verifySystemPassword()`. No password has been set until someone
@@ -134,7 +174,11 @@ Three pages, no JS framework, inline CSS via `src/Layout.php`:
   any) its local start time falls in (`slotWorkMode()` in `index.php`), and
   renders one unified table. Deliberately merges prices and schedule into a
   single view rather than two separate tables — that merge *is* the
-  "quick glance" the UI exists for.
+  "quick glance" the UI exists for. Also has the "Run now" button (a plain
+  POST form to `run-now.php`) and, after that redirects back, a result
+  banner read from `?ran=1&ok=…&msg=…` — no session flash-message plumbing,
+  just query-string state, which is enough for a once-in-a-while manual
+  action.
 - **`settings.php`** — FoxESS `api_key`/`device_sn` (pre-filled from
   `Store`, plain text — the user themself set them, no reason to hide them
   from themself) and an optional password change (blank = unchanged,
