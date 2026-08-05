@@ -152,15 +152,7 @@ class ScheduleBuilder
             return ['groups' => $groups, 'explanations' => $explanations];
         }
 
-        $intervals = [];
-        foreach ($groups as $i => $g) {
-            $intervals[] = [
-                'start' => $g['startHour'] * 60 + $g['startMinute'],
-                'end' => $g['endHour'] * 60 + $g['endMinute'],
-                'workMode' => $g['workMode'],
-                'explanation' => $explanations[$i] ?? '',
-            ];
-        }
+        $intervals = $this->groupsToIntervals($groups, $explanations);
 
         foreach ($overrides as $override) {
             $label = $override['kind'] === 'fill_your_boots' ? 'Fill your boots' : 'Power down';
@@ -191,30 +183,79 @@ class ScheduleBuilder
 
         usort($intervals, fn($a, $b) => $a['start'] <=> $b['start']);
 
+        return $this->intervalsToGroups($intervals);
+    }
+
+    /**
+     * Splices today's already-decided plan (for whatever's left of today) onto tomorrow's
+     * freshly computed one, into a single set of recurring groups — the FoxESS scheduler
+     * has no date field, only time-of-day, so pushing tomorrow's plan wholesale would
+     * clobber the hours still left today (see CLAUDE.md's "Today/Tomorrow fix"). Today's
+     * plan wins for [$nowMinutes, midnight); tomorrow's plan fills everything else,
+     * including the [midnight, $nowMinutes) stretch that's logically "later" once today's
+     * date rolls over.
+     *
+     * @param array $todayGroups periodsToGroups()-shaped groups for the remainder of today
+     * @param string[] $todayExplanations same length/order as $todayGroups
+     * @param array $tomorrowGroups periodsToGroups()-shaped groups for tomorrow
+     * @param string[] $tomorrowExplanations same length/order as $tomorrowGroups
+     * @param int $nowMinutes minutes since local midnight
+     * @return array{groups: array, explanations: string[]}
+     */
+    public function spliceForPush(array $todayGroups, array $todayExplanations, array $tomorrowGroups, array $tomorrowExplanations, int $nowMinutes): array
+    {
+        $todayTail = $this->subtractInterval($this->groupsToIntervals($todayGroups, $todayExplanations), 0, $nowMinutes);
+        $tomorrowRest = $this->subtractInterval($this->groupsToIntervals($tomorrowGroups, $tomorrowExplanations), $nowMinutes, 24 * 60);
+
+        $intervals = [...$todayTail, ...$tomorrowRest];
+        usort($intervals, fn($a, $b) => $a['start'] <=> $b['start']);
+
+        return $this->intervalsToGroups($intervals);
+    }
+
+    /** @return array<int, array{start: int, end: int, workMode: string, explanation: string}> */
+    private function groupsToIntervals(array $groups, array $explanations): array
+    {
+        $intervals = [];
+        foreach ($groups as $i => $g) {
+            $end = $g['endHour'] * 60 + $g['endMinute'];
+            $intervals[] = [
+                'start' => $g['startHour'] * 60 + $g['startMinute'],
+                'end' => $end === 0 ? 24 * 60 : $end, // endHour/endMinute of 0 means midnight, i.e. end of day
+                'workMode' => $g['workMode'],
+                'explanation' => $explanations[$i] ?? '',
+            ];
+        }
+        return $intervals;
+    }
+
+    /** @return array{groups: array, explanations: string[]} */
+    private function intervalsToGroups(array $intervals): array
+    {
         $chargeKw = (float) ($this->batteryConfig['max_charge_kw'] ?? 0);
         $dischargeKw = (float) ($this->batteryConfig['max_discharge_kw'] ?? 0);
         $minSocOnGrid = (int) ($this->batteryConfig['min_soc_on_grid'] ?? 0);
         $reserveSoc = (int) ($this->batteryConfig['reserve_soc'] ?? 0);
 
-        $newGroups = [];
-        $newExplanations = [];
+        $groups = [];
+        $explanations = [];
         foreach ($intervals as $iv) {
+            $end = $iv['end'] === 24 * 60 ? 0 : $iv['end'];
             $isCharge = $iv['workMode'] === 'ForceCharge';
-            $newGroups[] = [
+            $groups[] = [
                 'enable' => 1,
                 'startHour' => intdiv($iv['start'], 60),
                 'startMinute' => $iv['start'] % 60,
-                'endHour' => intdiv($iv['end'], 60),
-                'endMinute' => $iv['end'] % 60,
+                'endHour' => intdiv($end, 60),
+                'endMinute' => $end % 60,
                 'workMode' => $iv['workMode'],
                 'minSocOnGrid' => $minSocOnGrid,
                 'fdSoc' => $isCharge ? 100 : $reserveSoc,
                 'fdPwr' => (int) round(($isCharge ? $chargeKw : $dischargeKw) * 1000),
             ];
-            $newExplanations[] = $iv['explanation'];
+            $explanations[] = $iv['explanation'];
         }
-
-        return ['groups' => $newGroups, 'explanations' => $newExplanations];
+        return ['groups' => $groups, 'explanations' => $explanations];
     }
 
     private static function toMinutes(string $hhmm): int

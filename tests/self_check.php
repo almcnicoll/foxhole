@@ -456,10 +456,34 @@ check(count($importFixed) === 48 && $importFixed[0]['rate'] === 20.0, 'import ca
 
 $pushedAt = new DateTimeImmutable('2026-01-04 17:00:00', new DateTimeZone('UTC'));
 saveSchedule('2026-01-05', $groups, $schedule['explanations'], $pushedAt);
-$storedSchedule = getLatestSchedule();
+$storedSchedule = getScheduleForDate('2026-01-05');
 check($storedSchedule['groups'] == $groups, 'saved schedule groups round-trip identically (used for run.php\'s no-op diff)');
 check($storedSchedule['for_date'] === '2026-01-05', 'for_date round-trips');
 check($storedSchedule['explanations'] === $schedule['explanations'], 'saved explanations round-trip in the same order as their groups');
+
+// A second date's schedule doesn't wipe out the first — this is what lets a run
+// computing tomorrow's plan splice against today's still-stored one.
+saveSchedule('2026-01-06', $groups, $schedule['explanations'], $pushedAt);
+check(getScheduleForDate('2026-01-05')['groups'] == $groups, 'saving a schedule for a new date leaves an earlier date\'s schedule alone');
+pruneOldSchedules('2026-01-06');
+check(getScheduleForDate('2026-01-05')['pushed_at'] === null, 'pruneOldSchedules removes dates before the given cutoff');
+check(getScheduleForDate('2026-01-06')['pushed_at'] !== null, 'pruneOldSchedules leaves current/future dates alone');
+
+// --- ScheduleBuilder: spliceForPush() carries today's remaining plan into tomorrow's ---
+$todayGroups = [['enable' => 1, 'startHour' => 20, 'startMinute' => 0, 'endHour' => 0, 'endMinute' => 0, 'workMode' => 'ForceDischarge', 'minSocOnGrid' => 15, 'fdSoc' => 15, 'fdPwr' => 3000]];
+$todayExplanations = ['Selling 20:00-00:00.'];
+$tomorrowGroups = [['enable' => 1, 'startHour' => 2, 'startMinute' => 0, 'endHour' => 5, 'endMinute' => 0, 'workMode' => 'ForceCharge', 'minSocOnGrid' => 15, 'fdSoc' => 100, 'fdPwr' => 3000]];
+$tomorrowExplanations = ['Charging 02:00-05:00.'];
+$splice = (new ScheduleBuilder($strategy, $battery))->spliceForPush($todayGroups, $todayExplanations, $tomorrowGroups, $tomorrowExplanations, 18 * 60);
+$spliceModes = array_map(fn($g) => $g['workMode'] . ' ' . $g['startHour'] . '-' . $g['endHour'], $splice['groups']);
+check($spliceModes === ['ForceCharge 2-5', 'ForceDischarge 20-0'], 'splice keeps today\'s 20:00-00:00 tail and tomorrow\'s 02:00-05:00 plan untouched when now (18:00) is before both, sorted by start time: got ' . implode(',', $spliceModes));
+
+$splice2 = (new ScheduleBuilder($strategy, $battery))->spliceForPush($todayGroups, $todayExplanations, $tomorrowGroups, $tomorrowExplanations, 21 * 60);
+$tail = $splice2['groups'][array_key_last($splice2['groups'])];
+check(
+    $tail['startHour'] === 21 && $tail['endHour'] === 0,
+    'splice trims today\'s plan to start from "now" (21:00), not its original 20:00 start',
+);
 
 @unlink($testDbPath);
 

@@ -107,7 +107,29 @@ function runScheduler(bool $dryRun): array
             return ['ok' => true, 'dryRun' => true, 'message' => $message, 'schedule' => $schedule];
         }
 
-        if ($schedule['groups'] == getLatestSchedule()['groups']) {
+        // Whichever hours are still left of today can't just be overwritten by tomorrow's
+        // plan wholesale — the FoxESS scheduler has no date field, only time-of-day, so
+        // that would clobber today's already-correct decisions for the rest of today (see
+        // CLAUDE.md's "Today/Tomorrow fix"). Splice today's stored plan onto tomorrow's
+        // freshly-built one when there's a today plan to splice against; otherwise (e.g.
+        // fallback-to-today runs before ~16:00) there's nothing to splice, push as-is.
+        $pushGroups = $schedule['groups'];
+        $pushExplanations = $schedule['explanations'];
+        if ($targetDate == $tomorrow) {
+            $todayPlan = getScheduleForDate($today->format('Y-m-d'));
+            if ($todayPlan['pushed_at'] !== null) {
+                $nowMinutes = ((int) $now->format('G')) * 60 + (int) $now->format('i');
+                $spliced = $scheduleBuilder->spliceForPush($todayPlan['groups'], $todayPlan['explanations'], $schedule['groups'], $schedule['explanations'], $nowMinutes);
+                $pushGroups = $spliced['groups'];
+                $pushExplanations = $spliced['explanations'];
+            }
+        }
+
+        // Compared against the last *actually pushed* (i.e. spliced) groups, not the raw
+        // per-date plan — the splice boundary moves every run even when nothing about the
+        // underlying prices changed, so diffing raw plans would misfire the skip.
+        $lastPushed = json_decode(getSetting('last_pushed_groups_json', '') ?: 'null', true);
+        if ($pushGroups == $lastPushed) {
             $message = 'Schedule for ' . $targetDate->format('Y-m-d') . ' unchanged from last run, skipped FoxESS push.';
             $logger->info($message);
             return ['ok' => true, 'dryRun' => false, 'message' => $message, 'schedule' => $schedule];
@@ -126,7 +148,7 @@ function runScheduler(bool $dryRun): array
         foreach ($deviceSns as $sn) {
             $clients[$sn] = new FoxessClient($apiKey, $sn, $config['foxess']['base_url']);
         }
-        $pushResult = pushToDevices($clients, $schedule['groups'], $logger);
+        $pushResult = pushToDevices($clients, $pushGroups, $logger);
         if ($pushResult['failures']) {
             throw new FoxessPushException(sprintf(
                 'Push failed for %d/%d inverter(s): %s',
@@ -136,13 +158,17 @@ function runScheduler(bool $dryRun): array
             ));
         }
 
+        // Raw per-date plan (unspliced) — what the next run splices against, and what the
+        // dashboard shows for that date.
         saveSchedule($targetDate->format('Y-m-d'), $schedule['groups'], $schedule['explanations'], $now);
+        pruneOldSchedules($today->format('Y-m-d'));
+        setSetting('last_pushed_groups_json', json_encode($pushGroups));
         setSetting('schedule_summary', $schedule['summary']);
         $message = sprintf(
             'Pushed schedule for %s to %d inverter(s): %d group(s), %d FoxESS API call(s) this run. %s',
             $targetDate->format('Y-m-d'),
             count($deviceSns),
-            count($schedule['groups']),
+            count($pushGroups),
             $pushResult['callCount'],
             $schedule['summary'],
         );
@@ -222,6 +248,7 @@ function reapplyOverrides(): array
 
     $now = new DateTimeImmutable('now', $timezone);
     saveSchedule($targetDate, $overlaid['groups'], $overlaid['explanations'], $now);
+    setSetting('last_pushed_groups_json', json_encode($overlaid['groups']));
     setSetting('schedule_summary', $base['summary']);
     $logger->info("Override applied and pushed for $targetDate.");
     return ['ok' => true, 'message' => "Saved and pushed to today's active schedule ($targetDate)."];

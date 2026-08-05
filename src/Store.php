@@ -146,7 +146,7 @@ function saveSchedule(string $forDate, array $groups, array $explanations, DateT
 {
     $pdo = db();
     $pdo->beginTransaction();
-    $pdo->exec('DELETE FROM schedule_groups');
+    $pdo->prepare('DELETE FROM schedule_groups WHERE for_date = ?')->execute([$forDate]);
     $stmt = $pdo->prepare('INSERT INTO schedule_groups
         (for_date, start_hour, start_minute, end_hour, end_minute, work_mode, min_soc_on_grid, fd_soc, fd_pwr, explanation, pushed_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
@@ -169,14 +169,21 @@ function saveSchedule(string $forDate, array $groups, array $explanations, DateT
 }
 
 /**
+ * One row set per calendar date — needed so a run computing tomorrow's plan doesn't wipe
+ * out today's still-in-effect one (see CLAUDE.md's "Today/Tomorrow" note). `saveSchedule()`
+ * only replaces the given date's rows, so at least today's and tomorrow's plans can be
+ * stored at once; call pruneOldSchedules() to drop dates that have fully passed.
+ *
  * @return array{for_date: ?string, pushed_at: ?DateTimeImmutable, groups: array, explanations: string[]}
- *         `groups` intentionally excludes `explanation` — it's what run.php diffs against to decide
- *         whether to skip a no-op push, and that check must stay about what's actually sent to FoxESS,
- *         not wording that can change without the schedule itself changing.
+ *         `groups` intentionally excludes `explanation` — it's what the no-op-push diff
+ *         compares, and that check must stay about what's actually sent to FoxESS, not
+ *         wording that can change without the schedule itself changing.
  */
-function getLatestSchedule(): array
+function getScheduleForDate(string $forDate): array
 {
-    $rows = db()->query('SELECT * FROM schedule_groups ORDER BY start_hour ASC, start_minute ASC')->fetchAll(PDO::FETCH_ASSOC);
+    $stmt = db()->prepare('SELECT * FROM schedule_groups WHERE for_date = ? ORDER BY start_hour ASC, start_minute ASC');
+    $stmt->execute([$forDate]);
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
     $groups = array_map(fn($row) => [
         'enable' => 1,
         'startHour' => (int) $row['start_hour'],
@@ -195,6 +202,12 @@ function getLatestSchedule(): array
         'groups' => $groups,
         'explanations' => array_column($rows, 'explanation'),
     ];
+}
+
+/** Schedules are date-linked (see getScheduleForDate) — anything before today can never be spliced against again. */
+function pruneOldSchedules(string $today): void
+{
+    db()->prepare('DELETE FROM schedule_groups WHERE for_date < ?')->execute([$today]);
 }
 
 /**

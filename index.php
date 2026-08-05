@@ -13,7 +13,12 @@ $timezone = new DateTimeZone($config['strategy']['timezone'] ?? 'Europe/London')
 $minSoc = (float) ($config['battery']['min_soc_on_grid'] ?? 0);
 
 $slots = getLatestRateSlots();
-$schedule = getLatestSchedule();
+// Rate slots are only ever fetched for one date at a time (see Store::saveRateSlots) —
+// show that same date's own plan, not a spliced view (splicing is a push-time-only
+// concern, see Runner.php's runScheduler()).
+$schedule = $slots
+    ? getScheduleForDate($slots[0]['from']->setTimezone($timezone)->format('Y-m-d'))
+    : ['for_date' => null, 'pushed_at' => null, 'groups' => [], 'explanations' => []];
 
 // Live battery state, one call per configured inverter — best-effort, the rest of the
 // dashboard is all local DB reads and shouldn't break if FoxESS is slow or unreachable.
