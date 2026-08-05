@@ -306,7 +306,7 @@ priciest M overall" threshold logic to something that reasons about import
 *and* export price together. Deliberately still a greedy heuristic, not an
 LP/global optimiser: the output has to come with a plain-English explanation
 per decision (see below), and an optimiser's output is much harder to narrate
-honestly than "we picked this because X" rules. Four rules, each a fairly
+honestly than "we picked this because X" rules. Five rules, each a fairly
 direct translation of a specific ask:
 
 - *Charge when cheap* (unchanged): below `cost_basis` for that slot.
@@ -322,7 +322,24 @@ direct translation of a specific ask:
   see the `$preIndexes`/`$postIndexes` split). Cheapest-first is still the
   tiebreaker *within* each half; this only matters when the cap would
   otherwise force a choice between an equally-cheap pre- and post-peak slot.
-- *Sell at the export peak, but only if there is one*: discharge slots are
+- *Clear space ahead of each cheap charging window, cheapest window first*:
+  user-requested — force-charging correctly happened during a negative-price
+  window, but nothing discharged beforehand to make more room for it.
+  `findChargingWindows()` finds maximal runs of charge *candidates* (the full
+  eligible set, not the capped `$chargeIndexes`) that actually got at least
+  one slot selected, ranks them by the average rate of the slots that were
+  actually selected within each, and reserves one discharge slot immediately
+  before each window's true start — cheapest window first — until
+  `expensive_slots_to_export` runs out. Anchoring on the *candidate* window
+  rather than the capped selection matters: for a wide cheap block, the cap
+  can select from the middle of it, so anchoring on `min($chargeIndexes)`
+  directly either lands the reservation inside the still-cheap block itself
+  or misses the window's true edge — caught in review before this shipped.
+  Reservations share the existing discharge cap rather than a separate
+  budget (no new config value) and can consume all of it if there are enough
+  cheap windows — by design, not a bug to guard against.
+- *Sell at the export peak, but only if there is one*: with whatever
+  discharge budget remains after the above, discharge slots are
   ranked by export rate descending — **if** export price actually varies
   today (`max - min > 0`). If it's flat (the common case: default export
   mode is a fixed 12p), there's no "best time to sell," so discharge falls

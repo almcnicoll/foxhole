@@ -154,7 +154,10 @@ $exportSlots5 = buildSlots(array_fill(0, 48, 12.0));
 $slots5 = buildSlots($rates5);
 $schedule5 = (new ScheduleBuilder(['cheap_slots_to_charge' => 1, 'expensive_slots_to_export' => 1, 'timezone' => 'Europe/London'], $battery))
     ->build($slots5, $exportSlots5, $costBasis5);
-check(str_contains($schedule5['explanations'][0], 'below both your'), 'a slot cheap enough for both reasons is explained as such');
+// Found by role, not position 0 — a pre-charge discharge reservation (see below) can
+// legitimately land chronologically before the charge period itself.
+$chargeGroupIndex5 = array_search('ForceCharge', array_column($schedule5['groups'], 'workMode'), true);
+check($chargeGroupIndex5 !== false && str_contains($schedule5['explanations'][$chargeGroupIndex5], 'below both your'), 'a slot cheap enough for both reasons is explained as such');
 
 // --- ScheduleBuilder: prefers slots before today's import peak when there are more candidates than the cap ---
 $rates6 = array_fill(0, 48, 20.0);
@@ -198,6 +201,128 @@ $schedule8 = (new ScheduleBuilder(['cheap_slots_to_charge' => 0, 'expensive_slot
 $dischargeGroup8 = $schedule8['groups'][0];
 check($dischargeGroup8['startHour'] === 8, 'variable export price -> discharge follows the export peak, not the import peak');
 check(str_contains($schedule8['explanations'][0], 'highest export rate today'), 'export-driven discharge is explained by the export rate, not import');
+
+// --- ScheduleBuilder: pre-charge discharge reservation, core scenario ---
+// A wide cheap block (10:00-21 = indexes 10..21, V-shaped prices) with a cap smaller than
+// the block width, so the cheapest-first-then-capped selection lands mid-block (14..19,
+// i.e. 07:00-10:00) rather than at the block's true leading edge (index 10, 05:00). This is
+// exactly the shape that broke an earlier anchor-on-the-selection design.
+$rates9 = array_fill(0, 48, 20.0);
+$rates9[10] = 8.0;
+$rates9[11] = 7.0;
+$rates9[12] = 6.0;
+$rates9[13] = 5.0;
+$rates9[14] = 4.0;
+$rates9[15] = 3.0;
+$rates9[16] = 2.0;
+$rates9[17] = 2.5;
+$rates9[18] = 3.5;
+$rates9[19] = 4.5;
+$rates9[20] = 5.5;
+$rates9[21] = 6.5;
+$rates9[40] = 45.0; // clear peak, keeps the pre-peak partition irrelevant to this scenario
+$costBasis9 = array_fill(0, 48, 10.0);
+$slots9 = buildSlots($rates9);
+$strategy9 = ['cheap_slots_to_charge' => 6, 'expensive_slots_to_export' => 4, 'timezone' => 'Europe/London'];
+$schedule9 = (new ScheduleBuilder($strategy9, $battery))->build($slots9, null, $costBasis9);
+
+$chargeGroups9 = array_values(array_filter($schedule9['groups'], fn($g) => $g['workMode'] === 'ForceCharge'));
+check(
+    count($chargeGroups9) === 1 && $chargeGroups9[0]['startHour'] === 7 && $chargeGroups9[0]['startMinute'] === 0,
+    'charge selection lands mid-block (07:00) as expected for this data, setting up the real test below',
+);
+
+$dischargeGroups9 = array_values(array_filter($schedule9['groups'], fn($g) => $g['workMode'] === 'ForceDischarge'));
+$preChargeGroup9 = null;
+foreach ($dischargeGroups9 as $g) {
+    if ($g['startHour'] === 4 && $g['startMinute'] === 30) {
+        $preChargeGroup9 = $g;
+    }
+}
+check(
+    $preChargeGroup9 !== null && $preChargeGroup9['endHour'] === 5 && $preChargeGroup9['endMinute'] === 0,
+    'a discharge slot is reserved immediately before the block\'s true leading edge (04:30-05:00), not immediately before the selected charge period (07:00)',
+);
+check(
+    $rates9[9] >= $costBasis9[9],
+    'regression guard: the reserved slot (index 9) is genuinely outside the cheap candidate window, not just outside the capped selection — proves the anchor uses the full candidate set',
+);
+check(
+    count(explanationsContaining($schedule9['explanations'], 'ahead of the cheap charging window')) === 1,
+    'the reservation has the expected explanation phrasing',
+);
+
+// --- ScheduleBuilder: two cheap windows, cheapest wins priority under a tight cap ---
+$rates10 = array_fill(0, 48, 20.0);
+$rates10[4] = -3.0;
+$rates10[5] = -3.0; // window A: very cheap (negative)
+$rates10[30] = 8.0;
+$rates10[31] = 8.0; // window B: moderately cheap, still below cost basis
+$rates10[40] = 45.0; // evening peak
+$costBasis10 = array_fill(0, 48, 10.0);
+$slots10 = buildSlots($rates10);
+
+$schedule10 = (new ScheduleBuilder(['cheap_slots_to_charge' => 4, 'expensive_slots_to_export' => 1, 'timezone' => 'Europe/London'], $battery))
+    ->build($slots10, null, $costBasis10);
+$dischargeGroups10 = array_values(array_filter($schedule10['groups'], fn($g) => $g['workMode'] === 'ForceDischarge'));
+check(count($dischargeGroups10) === 1, 'a cap of 1 allows exactly one discharge group');
+check(
+    $dischargeGroups10 !== [] && $dischargeGroups10[0]['startHour'] === 1 && $dischargeGroups10[0]['startMinute'] === 30,
+    'the cheaper window (avg -3p, starting 02:00) wins the single discharge slot over both the pricier window (avg 8p) and the evening peak (45p)',
+);
+
+// --- ScheduleBuilder: same two windows, but the cap is big enough for everything ---
+$schedule11 = (new ScheduleBuilder(['cheap_slots_to_charge' => 4, 'expensive_slots_to_export' => 3, 'timezone' => 'Europe/London'], $battery))
+    ->build($slots10, null, $costBasis10);
+$dischargeGroups11 = array_values(array_filter($schedule11['groups'], fn($g) => $g['workMode'] === 'ForceDischarge'));
+$starts11 = array_map(fn($g) => sprintf('%02d:%02d', $g['startHour'], $g['startMinute']), $dischargeGroups11);
+sort($starts11);
+check(
+    $starts11 === ['01:30', '14:30', '20:00'],
+    'with enough cap, both windows get a reservation and the evening peak still gets its price-ranked slot: got ' . implode(',', $starts11),
+);
+
+$preChargeExplanations11 = explanationsContaining($schedule11['explanations'], 'ahead of the cheap charging window');
+check(count($preChargeExplanations11) === 2, 'both reservations produce their own explanation');
+check(
+    count(explanationsContaining($preChargeExplanations11, 'at 02:00')) === 1,
+    'window A\'s reservation cites its own charging window start time (02:00)',
+);
+check(
+    count(explanationsContaining($preChargeExplanations11, 'at 15:00')) === 1,
+    'window B\'s reservation cites its own charging window start time (15:00), not window A\'s',
+);
+
+// --- ScheduleBuilder: a window starting at midnight gets no reservation (nothing exists before it) ---
+$rates12 = array_fill(0, 48, 20.0);
+$rates12[0] = 3.0;
+$rates12[1] = 3.0; // cheap window starting at midnight
+$rates12[20] = 5.0;
+$rates12[21] = 5.0; // a second, later window
+$rates12[40] = 45.0;
+$costBasis12 = array_fill(0, 48, 10.0);
+$slots12 = buildSlots($rates12);
+$schedule12 = (new ScheduleBuilder(['cheap_slots_to_charge' => 4, 'expensive_slots_to_export' => 2, 'timezone' => 'Europe/London'], $battery))
+    ->build($slots12, null, $costBasis12);
+$dischargeGroups12 = array_values(array_filter($schedule12['groups'], fn($g) => $g['workMode'] === 'ForceDischarge'));
+$starts12 = array_map(fn($g) => sprintf('%02d:%02d', $g['startHour'], $g['startMinute']), $dischargeGroups12);
+sort($starts12);
+check(
+    $starts12 === ['09:30', '20:00'],
+    'the midnight-starting window gets no reservation (nothing before it), but the second window (09:30) and the evening peak (20:00) still get theirs: got ' . implode(',', $starts12),
+);
+
+// --- ScheduleBuilder: zero discharge cap means no discharge groups at all, charge unaffected ---
+$schedule13 = (new ScheduleBuilder(['cheap_slots_to_charge' => 6, 'expensive_slots_to_export' => 0, 'timezone' => 'Europe/London'], $battery))
+    ->build($slots9, null, $costBasis9);
+check(
+    array_filter($schedule13['groups'], fn($g) => $g['workMode'] === 'ForceDischarge') === [],
+    'zero discharge cap means no discharge groups at all, even with a qualifying cheap window present',
+);
+check(
+    count(array_filter($schedule13['groups'], fn($g) => $g['workMode'] === 'ForceCharge')) === 1,
+    'charge selection is unaffected by a zero discharge cap',
+);
 
 // --- Runner: pushToDevices() attempts every device and reports per-device failures ---
 // Stubs override pushSchedule() directly (public, not final) rather than hitting the

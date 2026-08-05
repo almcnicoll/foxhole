@@ -14,9 +14,13 @@ require_once __DIR__ . '/Exceptions.php';
 //   - When there are more charge candidates than the cap, prefer ones before
 //     today's most expensive import slot, so the battery tends to be full
 //     heading into it.
-//   - Discharge/export the slots with the highest export rate, if export price
-//     actually varies today. If it's flat, fall back to offsetting the most
-//     expensive import slots instead (a flat export has no "best time to sell").
+//   - Ahead of each cheap charging window, reserve one discharge slot (cheapest
+//     window first) so there's a bit more room to absorb it — out of the same
+//     discharge cap as everything else, not an extra budget.
+//   - With whatever discharge budget remains, sell at the slots with the
+//     highest export rate, if export price actually varies today. If it's
+//     flat, fall back to offsetting the most expensive import slots instead
+//     (a flat export has no "best time to sell").
 class ScheduleBuilder
 {
     public function __construct(
@@ -83,30 +87,97 @@ class ScheduleBuilder
             $chargeReasons[$i] = $chargeCandidates[$i];
         }
 
-        // --- Discharge candidates: sell at the export peak if export price actually varies,
+        $timezone = new DateTimeZone($this->strategyConfig['timezone'] ?? 'Europe/London');
+        $dischargeCap = max(0, (int) ($this->strategyConfig['expensive_slots_to_export'] ?? 0));
+
+        // Reserve a discharge slot immediately before each cheap charging window (cheapest
+        // window first), so the battery has a bit more room to absorb it — out of the same
+        // cap as everything else below, not an extra budget. Windows are found from the
+        // full candidate set (not the capped $chargeIndexes): for a wide cheap block, the
+        // cap can select from the middle of it, so anchoring on the selection itself would
+        // either land inside the cheap block or miss the window's true edge entirely.
+        $preChargeIndexes = []; // reserved index => next-charge-time string, for the explanation
+        $budget = $dischargeCap;
+        foreach ($this->findChargingWindows($chargeCandidates, $chargeIndexes, $importRates) as $window) {
+            if ($budget <= 0) {
+                break;
+            }
+            $candidate = $window['start'] - 1;
+            if ($candidate < 0 || isset($chargeCandidates[$candidate]) || isset($preChargeIndexes[$candidate])) {
+                continue; // no room before this window, or already claimed by another one
+            }
+            $preChargeIndexes[$candidate] = $importSlots[$window['firstChargeIndex']]['from']->setTimezone($timezone)->format('H:i');
+            $budget--;
+        }
+
+        // --- Remaining budget: sell at the export peak if export price actually varies,
         // otherwise fall back to offsetting the most expensive import slots (the old behaviour). ---
         $dischargeSortRates = $exportIsVariable ? $exportRates : $importRates;
         $dischargeCandidates = [];
         for ($i = 0; $i < $n; $i++) {
-            if (!in_array($i, $chargeIndexes, true)) {
+            if (!in_array($i, $chargeIndexes, true) && !isset($preChargeIndexes[$i])) {
                 $dischargeCandidates[$i] = $dischargeSortRates[$i];
             }
         }
         arsort($dischargeCandidates); // descending, keys preserved
-        $dischargeCap = max(0, (int) ($this->strategyConfig['expensive_slots_to_export'] ?? 0));
-        $dischargeIndexes = array_slice(array_keys($dischargeCandidates), 0, $dischargeCap);
-        foreach ($dischargeIndexes as $i) {
+        $priceRankedIndexes = array_slice(array_keys($dischargeCandidates), 0, max(0, $dischargeCap - count($preChargeIndexes)));
+        foreach ([...$priceRankedIndexes, ...array_keys($preChargeIndexes)] as $i) {
             $modes[$i] = 'ForceDischarge';
         }
 
-        $timezone = new DateTimeZone($this->strategyConfig['timezone'] ?? 'Europe/London');
         $periods = $this->mergeContiguous($importSlots, $modes, $timezone);
 
         return [
             'groups' => $this->periodsToGroups($periods),
-            'explanations' => $this->explainPeriods($periods, $importRates, $exportRates, $costBasis, $bestExportRate, $chargeReasons, $exportIsVariable),
+            'explanations' => $this->explainPeriods($periods, $importRates, $exportRates, $costBasis, $bestExportRate, $chargeReasons, $exportIsVariable, $preChargeIndexes),
             'summary' => $this->explainPeak($importSlots[$peakImportIndex], $importRates[$peakImportIndex], $timezone, count($chargeIndexes) > 0),
         ];
+    }
+
+    /**
+     * Maximal contiguous runs of $chargeCandidates (the full eligible set, not the capped
+     * selection) that actually got at least one slot into $chargeIndexes, ranked
+     * cheapest-first by the average rate of the slots that were actually selected within
+     * each window — i.e. how cheap the real charging happening there is, not a hypothetical
+     * full-window average that might include slots the cap didn't select.
+     *
+     * @return array<int, array{start: int, firstChargeIndex: int, avgRate: float}>
+     */
+    private function findChargingWindows(array $chargeCandidates, array $chargeIndexes, array $importRates): array
+    {
+        $candidateIndexes = array_keys($chargeCandidates);
+        sort($candidateIndexes);
+
+        $windows = [];
+        $windowStart = null;
+        $prev = null;
+        foreach ($candidateIndexes as $i) {
+            if ($prev !== null && $i !== $prev + 1) {
+                $windows[] = [$windowStart, $prev];
+                $windowStart = null;
+            }
+            $windowStart ??= $i;
+            $prev = $i;
+        }
+        if ($windowStart !== null) {
+            $windows[] = [$windowStart, $prev];
+        }
+
+        $chargingWindows = [];
+        foreach ($windows as [$start, $end]) {
+            $selected = array_values(array_filter($chargeIndexes, fn($i) => $i >= $start && $i <= $end));
+            if (!$selected) {
+                continue; // the cap excluded this whole window — nothing to make room for
+            }
+            $chargingWindows[] = [
+                'start' => $start,
+                'firstChargeIndex' => min($selected),
+                'avgRate' => $this->average($importRates, $selected),
+            ];
+        }
+        usort($chargingWindows, fn($a, $b) => $a['avgRate'] <=> $b['avgRate']);
+
+        return $chargingWindows;
     }
 
     private static function indexOfMax(array $values): int
@@ -185,6 +256,7 @@ class ScheduleBuilder
         ?float $bestExportRate,
         array $chargeReasons,
         bool $exportIsVariable,
+        array $nextChargeTimeByIndex,
     ): array {
         $explanations = [];
         foreach ($periods as $period) {
@@ -210,8 +282,22 @@ class ScheduleBuilder
                     $bestExportRate,
                 );
             } else {
-                $avgRate = $this->average($exportIsVariable ? $exportRates : $importRates, $slotIndexes);
-                $explanations[] = $this->explainDischarge($range, $exportIsVariable, $avgRate);
+                // A period is usually a single reserved slot, but don't assume it —
+                // use whichever slot in the (possibly merged) period has a reservation.
+                $nextChargeTime = null;
+                foreach ($slotIndexes as $i) {
+                    if (isset($nextChargeTimeByIndex[$i])) {
+                        $nextChargeTime = $nextChargeTimeByIndex[$i];
+                        break;
+                    }
+                }
+                if ($nextChargeTime !== null) {
+                    $avgImport = $this->average($importRates, $slotIndexes);
+                    $explanations[] = $this->explainDischarge($range, false, $avgImport, true, $nextChargeTime);
+                } else {
+                    $avgRate = $this->average($exportIsVariable ? $exportRates : $importRates, $slotIndexes);
+                    $explanations[] = $this->explainDischarge($range, $exportIsVariable, $avgRate);
+                }
             }
         }
         return $explanations;
@@ -241,8 +327,16 @@ class ScheduleBuilder
         return sprintf('Charging %s (avg %sp/kWh) — below your %sp cost basis.', $range, $rate, number_format($avgCostBasis, 2));
     }
 
-    private function explainDischarge(string $range, bool $exportDriven, float $avgRate): string
+    private function explainDischarge(string $range, bool $exportDriven, float $avgRate, bool $isPreCharge = false, ?string $nextChargeTime = null): string
     {
+        if ($isPreCharge) {
+            return sprintf(
+                'Discharging %s (avg import %sp/kWh) — clearing space in the battery ahead of the cheap charging window at %s, so more of it can be bought.',
+                $range,
+                number_format($avgRate, 2),
+                $nextChargeTime,
+            );
+        }
         if ($exportDriven) {
             return sprintf('Selling %s (avg export %sp/kWh) — the highest export rate today.', $range, number_format($avgRate, 2));
         }
