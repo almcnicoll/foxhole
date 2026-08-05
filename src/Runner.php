@@ -103,21 +103,36 @@ function runScheduler(bool $dryRun): array
         }
 
         $apiKey = getSetting('foxess_api_key', '');
-        $deviceSn = getSetting('foxess_device_sn', '');
-        if ($apiKey === '' || $deviceSn === '') {
-            throw new FoxessPushException('FoxESS credentials not configured — set them at settings.php');
+        if ($apiKey === '') {
+            throw new FoxessPushException('FoxESS API key not configured — set it at settings.php');
+        }
+        $deviceSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('foxess_device_sns', '')))));
+        if (!$deviceSns) {
+            throw new FoxessPushException('No FoxESS device serial numbers configured — set them at settings.php');
         }
 
-        $foxess = new FoxessClient($apiKey, $deviceSn, $config['foxess']['base_url']);
-        $foxess->pushSchedule($schedule['groups']);
+        $clients = [];
+        foreach ($deviceSns as $sn) {
+            $clients[$sn] = new FoxessClient($apiKey, $sn, $config['foxess']['base_url']);
+        }
+        $pushResult = pushToDevices($clients, $schedule['groups'], $logger);
+        if ($pushResult['failures']) {
+            throw new FoxessPushException(sprintf(
+                'Push failed for %d/%d inverter(s): %s',
+                count($pushResult['failures']),
+                count($deviceSns),
+                implode('; ', $pushResult['failures']),
+            ));
+        }
 
         saveSchedule($targetDate->format('Y-m-d'), $schedule['groups'], $schedule['explanations'], $now);
         setSetting('schedule_summary', $schedule['summary']);
         $message = sprintf(
-            'Pushed schedule for %s: %d group(s), %d FoxESS API call(s) this run. %s',
+            'Pushed schedule for %s to %d inverter(s): %d group(s), %d FoxESS API call(s) this run. %s',
             $targetDate->format('Y-m-d'),
+            count($deviceSns),
             count($schedule['groups']),
-            $foxess->callCount(),
+            $pushResult['callCount'],
             $schedule['summary'],
         );
         $logger->info($message);
@@ -138,6 +153,33 @@ function runScheduler(bool $dryRun): array
         alertOnFailure($config, 'FoxESS scheduler: unexpected error', $e->getMessage());
         return ['ok' => false, 'dryRun' => $dryRun, 'message' => $message, 'schedule' => null];
     }
+}
+
+/**
+ * Pushes the same schedule to every configured device, attempting all of them
+ * even if an earlier one fails — one bad inverter shouldn't stop the others
+ * from getting a real, working update. The caller decides whether any
+ * failures should count as an overall run failure (currently: yes, always —
+ * see runScheduler()).
+ *
+ * @param array<string, FoxessClient> $clients device serial number => client
+ * @return array{callCount: int, failures: string[]}
+ */
+function pushToDevices(array $clients, array $groups, Logger $logger): array
+{
+    $callCount = 0;
+    $failures = [];
+    foreach ($clients as $sn => $client) {
+        try {
+            $client->pushSchedule($groups);
+            $logger->info("Pushed schedule to $sn.");
+        } catch (FoxessPushException $e) {
+            $logger->error("Push to $sn failed: " . $e->getMessage());
+            $failures[] = "$sn: " . $e->getMessage();
+        }
+        $callCount += $client->callCount();
+    }
+    return ['callCount' => $callCount, 'failures' => $failures];
 }
 
 function alertOnFailure(array $config, string $subject, string $message): void

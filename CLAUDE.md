@@ -73,7 +73,8 @@ a migration system (the schema is small and stable enough that idempotent
 DDL is simpler than tracking migrations).
 
 - **`settings`** — plain key/value (`key TEXT PRIMARY KEY, value TEXT`).
-  Holds `foxess_api_key`, `foxess_device_sn`, `system_password_hash`,
+  Holds `foxess_api_key`, `foxess_device_sns` (newline-separated — see
+  "Multi-inverter support" below), `system_password_hash`,
   `{import,export}_price_mode`, `{import,export}_price_fixed_pence`,
   `schedule_summary` (the latest day-level explanation sentence — see
   "Cost-optimising ScheduleBuilder" below). A key/value table was chosen
@@ -137,11 +138,13 @@ on-screen message for the UI).
    credentials are even read.
 7. Diff the computed groups against `getLatestSchedule()`; skip the FoxESS
    call if unchanged.
-8. Read `foxess_api_key`/`foxess_device_sn` from `Store` (via `getSetting()`)
-   — throws `FoxessPushException` with a pointer to `settings.php` if either
-   is empty.
-9. `FoxessClient::pushSchedule()` — signs and POSTs to
-   `/op/v1/device/scheduler/enable`.
+8. Read `foxess_api_key`/`foxess_device_sns` from `Store` (via `getSetting()`)
+   — throws `FoxessPushException` with a pointer to `settings.php` if the key
+   is empty or the device list is empty.
+9. `pushToDevices()` — one `FoxessClient` per configured device serial
+   number, each signing and POSTing to `/op/v1/device/scheduler/enable`
+   independently. See "Multi-inverter support" below for why this loop lives
+   in `Runner.php` rather than inside `FoxessClient` itself.
 10. On success, `saveSchedule()` persists the new schedule and logs a
     summary. On any failure, log at ERROR and best-effort email
     `notify.alert_email` — both happen inside `runScheduler()` itself, so
@@ -202,13 +205,15 @@ No JS framework, inline CSS via `src/Layout.php`:
   `?ran=1&ok=…&msg=…` — no session flash-message plumbing,
   just query-string state, which is enough for a once-in-a-while manual
   action.
-- **`settings.php`** — FoxESS `api_key`/`device_sn` (pre-filled from
+- **`settings.php`** — FoxESS `api_key`/`device_sns` (pre-filled from
   `Store`, plain text — the user themself set them, no reason to hide them
-  from themself), import/export price source (API vs. fixed pence/kWh, one
-  `<select>` + one `<input>` per side, no JS toggling — the fixed-price input
-  is simply ignored server-side when mode is `api`), and an optional password
-  change (blank = unchanged, 8-char minimum, must be confirmed twice). No
-  CSRF token — same reasoning as the brute-force point above.
+  from themself; `device_sns` is a `<textarea>`, one serial per line — see
+  "Multi-inverter support" below), import/export price source (API vs. fixed
+  pence/kWh, one `<select>` + one `<input>` per side, no JS toggling — the
+  fixed-price input is simply ignored server-side when mode is `api`), and
+  an optional password change (blank = unchanged, 8-char minimum, must be
+  confirmed twice). No CSRF token — same reasoning as the brute-force point
+  above.
 
 Auth is a native PHP session (`src/Auth.php`, `session_start()` +
 `$_SESSION['authed']`) — no token store, no "remember me," nothing custom.
@@ -379,7 +384,14 @@ changed this endpoint before and could again.
 `Token`/`Timestamp`/`Signature`/`Lang`/`Content-Type`. Confirmed against
 multiple independent third-party implementations, not just the spec — this
 part is solid. `errno 40256` from FoxESS means a missing/stale auth header,
-not a bad schedule payload.
+not a bad schedule payload. `errno 41811` ("User permissions do not allow
+this operation") is a *different*, account/permission-layer error — TonyM1958's
+FoxESS-Cloud wiki documents it, but its actual trigger is thinly documented
+in the community. One concrete cause traced live in this project: `device_sn`
+being set to an API client ID from FoxESS Cloud's API Management page rather
+than the actual inverter serial number — the account legitimately has no
+write permission over a "device" that isn't a real device it owns. Worth
+checking first if this recurs, before assuming it's account-level.
 
 **`fdSoc` / `fdPwr` field semantics are a best-effort guess, not confirmed.**
 The spec's own example payload was marked "confirm exact field names against
@@ -420,6 +432,33 @@ change from the original spec, so they're editable from `settings.php`
 without touching a file on the server. `config.php` keeps everything that
 isn't secret and isn't meant to be UI-editable (Octopus product/tariff
 codes, battery/strategy tunables, `foxess.base_url`, notification email).
+
+**Multi-inverter support: one setting holding a newline-separated list, not a
+devices table.** User has two inverters and wants the same schedule pushed to
+both. `foxess_device_sns` replaced the old singular `foxess_device_sn` —
+still just one row in the existing key/value `settings` table (newline-
+separated serials), not a new table with add/remove rows. A real devices
+table would make sense at "manage a fleet" scale; at "a couple of inverters
+in one household" scale it's pure ceremony for what's fundamentally a short
+list of strings. Old single-value installs migrate for free: `settings.php`'s
+display falls back to the legacy `foxess_device_sn` key the first time it
+renders with nothing under the new key, so an existing value shows up as a
+starting point instead of a blank box (see the fallback in `settings.php`).
+
+`FoxessClient` itself is untouched — still scoped to exactly one device, same
+signing/request logic as before. The looping lives in `Runner.php`'s
+`pushToDevices()`, which constructs one client per configured serial and
+**always attempts every device, even after an earlier one fails** — a bad
+serial or a permission error on inverter #1 shouldn't stop inverter #2 from
+getting a real, working push. Failures are collected per-device (labelled by
+serial number) rather than the loop bailing on the first exception; if
+*any* device failed, the whole run is still reported as failed (logged,
+alerted, non-zero exit) — a schedule "mostly" applied isn't treated as
+success, but every device that *can* be updated still gets updated. This
+loop is unit-tested (`tests/self_check.php`) using anonymous subclasses that
+override `FoxessClient::pushSchedule()` directly — `pushSchedule` is public
+and not `final`, so this needs no changes to `FoxessClient` and never touches
+the network.
 
 **`data/` and `logs/` get a deny-all `.htaccess`.** Necessary now in a way it
 wasn't for the old JSON files: `data/scheduler.sqlite` holds the FoxESS API

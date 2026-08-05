@@ -14,7 +14,8 @@ $priceKinds = ['import' => ['api', '0'], 'export' => ['fixed', '12']];
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $apiKey = trim((string) ($_POST['api_key'] ?? ''));
-    $deviceSn = trim((string) ($_POST['device_sn'] ?? ''));
+    $deviceSnsRaw = (string) ($_POST['device_sns'] ?? '');
+    $deviceSns = array_values(array_filter(array_map('trim', explode("\n", $deviceSnsRaw))));
     $newPassword = (string) ($_POST['new_password'] ?? '');
     $confirmPassword = (string) ($_POST['confirm_password'] ?? '');
 
@@ -33,8 +34,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($apiKey === '') {
         $errors[] = 'API key is required.';
     }
-    if ($deviceSn === '') {
-        $errors[] = 'Device serial number is required.';
+    if (!$deviceSns) {
+        $errors[] = 'At least one device serial number is required.';
     }
     if ($newPassword !== '' || $confirmPassword !== '') {
         if ($newPassword !== $confirmPassword) {
@@ -46,7 +47,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if (!$errors) {
         setSetting('foxess_api_key', $apiKey);
-        setSetting('foxess_device_sn', $deviceSn);
+        setSetting('foxess_device_sns', implode("\n", $deviceSns));
         foreach ($priceKinds as $kind => [$defaultMode, $defaultFixed]) {
             setSetting("{$kind}_price_mode", $priceModes[$kind]);
             if ($priceModes[$kind] === 'fixed') {
@@ -60,7 +61,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 } else {
     $apiKey = getSetting('foxess_api_key', '');
-    $deviceSn = getSetting('foxess_device_sn', '');
+    // foxess_device_sn (singular) is the pre-multi-inverter key — fall back to it once,
+    // purely so an existing single value shows up as a starting point instead of a blank
+    // box the first time this page loads after the upgrade.
+    $deviceSnsRaw = getSetting('foxess_device_sns') ?? getSetting('foxess_device_sn', '');
     $priceModes = [];
     $priceFixed = [];
     foreach ($priceKinds as $kind => [$defaultMode, $defaultFixed]) {
@@ -80,8 +84,8 @@ renderHeader('Settings');
     <legend>FoxESS API</legend>
     <label for="api_key">API key</label>
     <input type="text" id="api_key" name="api_key" value="<?= htmlspecialchars($apiKey) ?>" required>
-    <label for="device_sn">Device serial number</label>
-    <input type="text" id="device_sn" name="device_sn" value="<?= htmlspecialchars($deviceSn) ?>" required>
+    <label for="device_sns">Device serial numbers (one per line — the same schedule is pushed to each)</label>
+    <textarea id="device_sns" name="device_sns" rows="3" required><?= htmlspecialchars($deviceSnsRaw) ?></textarea>
   </fieldset>
 
   <fieldset>

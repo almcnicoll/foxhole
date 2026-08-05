@@ -9,8 +9,12 @@ reprioritised.
 ## Before first live cron run (do these, not optional)
 
 - [ ] Visit `settings.php` (default password `foxhole`) and set the real
-      FoxESS `api_key`/`device_sn`, and change the password to something
-      real while you're there.
+      FoxESS `api_key` and device serial number(s) — one per line if you
+      have more than one inverter — and change the password to something
+      real while you're there. Use the inverter's actual serial number, not
+      an API client ID from FoxESS Cloud's API Management page (confirmed
+      live: entering a client ID there produces `errno 41811`, "User
+      permissions do not allow this operation" — see CLAUDE.md).
 - [ ] Fill in `config.php`: real Octopus tariff code for your region (see
       [CLAUDE.md](CLAUDE.md#decisions-made-while-building-things-the-spec-left-open)
       re: the region-letter fix) and `cost_basis.fixed_pence_per_kwh`.
@@ -83,10 +87,7 @@ commitment, just a starting point for prioritisation:
    balance through the day, so discharge can't promise to sell more than the
    battery will actually hold. Worth doing once the price-only version has
    been live long enough to see whether this gap matters in practice.
-5. **Multi-inverter support.** No current need (single inverter). Would mean
-   the `settings` table gaining a device selector and `run.php` looping —
-   not worth building until there's a second inverter.
-6. **Login hardening** (rate limiting / lockout on `login.php`, CSRF token on
+5. **Login hardening** (rate limiting / lockout on `login.php`, CSRF token on
    `settings.php` and `run-now.php`). Skipped deliberately for a single-user
    tool behind a password wall — revisit if this is ever exposed somewhere
    less trusted. `run-now.php` is the higher-priority one of the two if this

@@ -11,6 +11,8 @@ require_once __DIR__ . '/../src/Logger.php';
 require_once __DIR__ . '/../src/Store.php';
 require_once __DIR__ . '/../src/OctopusClient.php';
 require_once __DIR__ . '/../src/PriceProvider.php';
+require_once __DIR__ . '/../src/FoxessClient.php';
+require_once __DIR__ . '/../src/Runner.php';
 
 $failures = 0;
 $checks = 0;
@@ -196,6 +198,36 @@ $schedule8 = (new ScheduleBuilder(['cheap_slots_to_charge' => 0, 'expensive_slot
 $dischargeGroup8 = $schedule8['groups'][0];
 check($dischargeGroup8['startHour'] === 8, 'variable export price -> discharge follows the export peak, not the import peak');
 check(str_contains($schedule8['explanations'][0], 'highest export rate today'), 'export-driven discharge is explained by the export rate, not import');
+
+// --- Runner: pushToDevices() attempts every device and reports per-device failures ---
+// Stubs override pushSchedule() directly (public, not final) rather than hitting the
+// network — this must never make a real FoxESS call.
+$pushLogger = new Logger(sys_get_temp_dir() . '/foxhole_self_check_' . getmypid() . '_push.log');
+$okDevice = new class('key', 'SN-OK', 'https://example.invalid') extends FoxessClient {
+    public int $calls = 0;
+    public function pushSchedule(array $groups): array
+    {
+        $this->calls++;
+        return ['errno' => 0];
+    }
+};
+$failDevice = new class('key', 'SN-FAIL', 'https://example.invalid') extends FoxessClient {
+    public int $calls = 0;
+    public function pushSchedule(array $groups): array
+    {
+        $this->calls++;
+        throw new FoxessPushException('simulated failure');
+    }
+};
+
+$pushResult = pushToDevices(['SN-FAIL' => $failDevice, 'SN-OK' => $okDevice], [], $pushLogger);
+check($failDevice->calls === 1 && $okDevice->calls === 1, 'every device is attempted even when an earlier one in the list fails');
+check(count($pushResult['failures']) === 1, 'exactly the one failing device is reported');
+check(str_contains($pushResult['failures'][0], 'SN-FAIL'), 'a failure is labelled with the device serial number that failed');
+check(str_contains($pushResult['failures'][0], 'simulated failure'), 'the underlying error message is preserved');
+
+$allOkResult = pushToDevices(['SN-OK' => $okDevice], [], $pushLogger);
+check($allOkResult['failures'] === [], 'no failures reported when every device succeeds');
 
 // --- Store: settings/password/rates/schedule persistence ---
 // Points the whole module at a throwaway file (see Store::db()'s "sticky path"
