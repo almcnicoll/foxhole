@@ -13,3 +13,7 @@ class ScheduleBuildException extends RuntimeException
 class FoxessPushException extends RuntimeException
 {
 }
+
+class SolarForecastException extends RuntimeException
+{
+}

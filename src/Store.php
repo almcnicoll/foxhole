@@ -70,6 +70,14 @@ function db(?string $overridePath = null): PDO
         explanation TEXT,
         pushed_at TEXT NOT NULL
     )');
+    // Disposable, replace-on-every-fetch — same pattern as rate_slots, see saveSolarForecast().
+    $pdo->exec('CREATE TABLE IF NOT EXISTS solar_forecast (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        slot_from TEXT NOT NULL,
+        slot_to TEXT NOT NULL,
+        watt_hours INTEGER NOT NULL,
+        fetched_at TEXT NOT NULL
+    )');
     // One row per (date, kind) — a date-linked exception to the normal schedule, not
     // history, so it's fine as a plain upsertable table rather than the disposable
     // replace-all pattern rate_slots/schedule_groups use.
@@ -208,6 +216,40 @@ function getScheduleForDate(string $forDate): array
 function pruneOldSchedules(string $today): void
 {
     db()->prepare('DELETE FROM schedule_groups WHERE for_date < ?')->execute([$today]);
+}
+
+/**
+ * @param array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, watt_hours: int}> $slots
+ *        SolarForecastClient::fetchForecast()'s output — replaced whole on every fetch, same
+ *        disposable-table pattern as rate_slots (see CLAUDE.md's "Data storage" section).
+ */
+function saveSolarForecast(array $slots, DateTimeImmutable $fetchedAt): void
+{
+    $pdo = db();
+    $pdo->beginTransaction();
+    $pdo->exec('DELETE FROM solar_forecast');
+    $stmt = $pdo->prepare('INSERT INTO solar_forecast (slot_from, slot_to, watt_hours, fetched_at) VALUES (?, ?, ?, ?)');
+    foreach ($slots as $slot) {
+        $stmt->execute([
+            $slot['from']->format(DATE_ATOM),
+            $slot['to']->format(DATE_ATOM),
+            $slot['watt_hours'],
+            $fetchedAt->format(DATE_ATOM),
+        ]);
+    }
+    $pdo->commit();
+}
+
+/** @return array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, watt_hours: int, fetched_at: DateTimeImmutable}> */
+function getLatestSolarForecast(): array
+{
+    $rows = db()->query('SELECT * FROM solar_forecast ORDER BY slot_from ASC')->fetchAll(PDO::FETCH_ASSOC);
+    return array_map(fn($row) => [
+        'from' => new DateTimeImmutable($row['slot_from']),
+        'to' => new DateTimeImmutable($row['slot_to']),
+        'watt_hours' => (int) $row['watt_hours'],
+        'fetched_at' => new DateTimeImmutable($row['fetched_at']),
+    ], $rows);
 }
 
 /**

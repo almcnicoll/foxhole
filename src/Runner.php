@@ -8,6 +8,7 @@ require_once __DIR__ . '/PriceProvider.php';
 require_once __DIR__ . '/CostBasisProvider.php';
 require_once __DIR__ . '/ScheduleBuilder.php';
 require_once __DIR__ . '/FoxessClient.php';
+require_once __DIR__ . '/SolarForecastClient.php';
 
 /**
  * Runs the full fetch -> build -> (push) pipeline once. Shared by run.php
@@ -81,6 +82,18 @@ function runScheduler(bool $dryRun): array
             }
         } catch (OctopusFetchException $e) {
             $logger->warn('Export price fetch failed, storing without export prices: ' . $e->getMessage());
+        }
+
+        // Not on the critical path — not used by ScheduleBuilder yet (see roadmap.MD's
+        // "Solar-generation-aware scheduling"), just retrieved and stored for now, same
+        // best-effort treatment as export prices: log and carry on if it fails.
+        if ($config['solar']['enabled'] ?? false) {
+            try {
+                $forecast = (new SolarForecastClient($logger))->fetchForecast($config['solar'], $timezone);
+                saveSolarForecast($forecast, new DateTimeImmutable('now', $timezone));
+            } catch (SolarForecastException $e) {
+                $logger->warn('Solar forecast fetch failed, skipping: ' . $e->getMessage());
+            }
         }
 
         $costBasis = (new CostBasisProvider($config['cost_basis']))->getCostBasis(count($slots));

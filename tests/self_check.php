@@ -469,6 +469,18 @@ pruneOldSchedules('2026-01-06');
 check(getScheduleForDate('2026-01-05')['pushed_at'] === null, 'pruneOldSchedules removes dates before the given cutoff');
 check(getScheduleForDate('2026-01-06')['pushed_at'] !== null, 'pruneOldSchedules leaves current/future dates alone');
 
+// --- Store: solar forecast round-trips, and each fetch replaces the previous one whole ---
+$londonTzForSolar = new DateTimeZone('Europe/London');
+$solarSlots = [
+    ['from' => new DateTimeImmutable('2026-01-05 06:00', $londonTzForSolar), 'to' => new DateTimeImmutable('2026-01-05 07:00', $londonTzForSolar), 'watt_hours' => 300],
+    ['from' => new DateTimeImmutable('2026-01-05 07:00', $londonTzForSolar), 'to' => new DateTimeImmutable('2026-01-05 08:00', $londonTzForSolar), 'watt_hours' => 900],
+];
+saveSolarForecast($solarSlots, $pushedAt);
+$storedSolar = getLatestSolarForecast();
+check(count($storedSolar) === 2 && $storedSolar[1]['watt_hours'] === 900, 'saved solar forecast slots round-trip');
+saveSolarForecast([$solarSlots[0]], $pushedAt);
+check(count(getLatestSolarForecast()) === 1, 'a new solar forecast fetch replaces the previous one whole, like rate_slots');
+
 // --- ScheduleBuilder: spliceForPush() carries today's remaining plan into tomorrow's ---
 $todayGroups = [['enable' => 1, 'startHour' => 20, 'startMinute' => 0, 'endHour' => 0, 'endMinute' => 0, 'workMode' => 'ForceDischarge', 'minSocOnGrid' => 15, 'fdSoc' => 15, 'fdPwr' => 3000]];
 $todayExplanations = ['Selling 20:00-00:00.'];
