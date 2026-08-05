@@ -45,6 +45,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
+    $solarEnabled = isset($_POST['solar_enabled']);
+    $solarFields = ['latitude', 'longitude', 'declination', 'azimuth', 'kwp'];
+    $solarValues = [];
+    foreach ($solarFields as $field) {
+        $solarValues[$field] = trim((string) ($_POST["solar_{$field}"] ?? ''));
+    }
+    if ($solarEnabled) {
+        foreach ($solarFields as $field) {
+            if (!is_numeric($solarValues[$field])) {
+                $errors[] = 'Solar ' . $field . ' must be a number.';
+            }
+        }
+    }
+
     if (!$errors) {
         setSetting('foxess_api_key', $apiKey);
         setSetting('foxess_device_sns', implode("\n", $deviceSns));
@@ -52,6 +66,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             setSetting("{$kind}_price_mode", $priceModes[$kind]);
             if ($priceModes[$kind] === 'fixed') {
                 setSetting("{$kind}_price_fixed_pence", (string) (float) $priceFixed[$kind]);
+            }
+        }
+        setSetting('solar_enabled', $solarEnabled ? '1' : '0');
+        foreach ($solarFields as $field) {
+            if ($solarValues[$field] !== '') {
+                setSetting("solar_{$field}", (string) (float) $solarValues[$field]);
             }
         }
         if ($newPassword !== '') {
@@ -70,6 +90,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     foreach ($priceKinds as $kind => [$defaultMode, $defaultFixed]) {
         $priceModes[$kind] = getSetting("{$kind}_price_mode", $defaultMode);
         $priceFixed[$kind] = getSetting("{$kind}_price_fixed_pence", $defaultFixed);
+    }
+    $solarEnabled = getSetting('solar_enabled', '0') === '1';
+    $solarFields = ['latitude', 'longitude', 'declination', 'azimuth', 'kwp'];
+    $solarValues = [];
+    foreach ($solarFields as $field) {
+        $solarValues[$field] = getSetting("solar_{$field}", '');
     }
 }
 
@@ -100,6 +126,25 @@ renderHeader('Settings');
       <label for="<?= $kind ?>_price_fixed_pence">Fixed <?= $kind ?> price (p/kWh)</label>
       <input type="number" step="0.01" min="0" id="<?= $kind ?>_price_fixed_pence" name="<?= $kind ?>_price_fixed_pence" value="<?= htmlspecialchars($priceFixed[$kind]) ?>">
     <?php endforeach; ?>
+  </fieldset>
+
+  <fieldset>
+    <legend>Solar forecast</legend>
+    <p class="muted">Retrieved from <a href="https://forecast.solar" target="_blank" rel="noopener">Forecast.Solar</a> (free, no API key) and shown on the dashboard — not yet used to change the schedule itself.</p>
+    <label for="solar_enabled">
+      <input type="checkbox" id="solar_enabled" name="solar_enabled" <?= $solarEnabled ? 'checked' : '' ?>>
+      Enabled
+    </label>
+    <label for="solar_latitude">Latitude</label>
+    <input type="number" step="any" id="solar_latitude" name="solar_latitude" value="<?= htmlspecialchars($solarValues['latitude']) ?>">
+    <label for="solar_longitude">Longitude</label>
+    <input type="number" step="any" id="solar_longitude" name="solar_longitude" value="<?= htmlspecialchars($solarValues['longitude']) ?>">
+    <label for="solar_declination">Panel angle / declination (degrees from horizontal, 0-90)</label>
+    <input type="number" step="any" min="0" max="90" id="solar_declination" name="solar_declination" value="<?= htmlspecialchars($solarValues['declination']) ?>">
+    <label for="solar_azimuth">Azimuth (degrees from south, -180 to 180)</label>
+    <input type="number" step="any" min="-180" max="180" id="solar_azimuth" name="solar_azimuth" value="<?= htmlspecialchars($solarValues['azimuth']) ?>">
+    <label for="solar_kwp">Installed capacity (kWp)</label>
+    <input type="number" step="any" min="0" id="solar_kwp" name="solar_kwp" value="<?= htmlspecialchars($solarValues['kwp']) ?>">
   </fieldset>
 
   <fieldset>

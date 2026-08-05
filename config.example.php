@@ -34,17 +34,6 @@ return [
         'mode' => 'fixed',
         'fixed_pence_per_kwh' => 24.50, // current standing tariff rate — update when tariff changes
     ],
-    'solar' => [
-        // Optional — retrieved and stored each run, but not yet used by ScheduleBuilder
-        // (see roadmap.MD's "Solar-generation-aware scheduling"). Free tier at forecast.solar,
-        // no API key needed. Leave 'enabled' false if you have no panels.
-        'enabled' => false,
-        'latitude' => 51.7391942816367,
-        'longitude' => -1.1726518586423484,
-        'declination' => 20,   // panel tilt, degrees from horizontal
-        'azimuth' => 31,       // panel facing, degrees from south (-180..180)
-        'kwp' => 8,            // installed peak capacity, kW
-    ],
     'notify' => [
         'alert_email' => 'you@example.com', // optional, for failure notifications
     ],

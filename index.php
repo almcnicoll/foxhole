@@ -13,6 +13,7 @@ $timezone = new DateTimeZone($config['strategy']['timezone'] ?? 'Europe/London')
 $minSoc = (float) ($config['battery']['min_soc_on_grid'] ?? 0);
 
 $slots = getLatestRateSlots();
+$solarForecast = getSetting('solar_enabled', '0') === '1' ? getLatestSolarForecast() : [];
 // Rate slots are only ever fetched for one date at a time (see Store::saveRateSlots) —
 // show that same date's own plan, not a spliced view (splicing is a push-time-only
 // concern, see Runner.php's runScheduler()).
@@ -50,6 +51,40 @@ function slotWorkMode(int $slotMinutes, array $groups): string
         }
     }
     return 'SelfUse';
+}
+
+/** @param array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, watt_hours: int, fetched_at: DateTimeImmutable}> $forecast */
+function renderSolarForecast(array $forecast, DateTimeZone $timezone): void
+{
+    if (!$forecast) {
+        return;
+    }
+    ?>
+<h3>Solar forecast</h3>
+<p class="muted">Estimated generation, fetched <?= htmlspecialchars($forecast[0]['fetched_at']->setTimezone($timezone)->format('D j M, H:i')) ?> — not yet used to shape the schedule.</p>
+<table>
+    <thead>
+        <tr>
+            <th>Period</th>
+            <th>Est. generation (kWh)</th>
+        </tr>
+    </thead>
+    <tbody>
+        <?php foreach ($forecast as $slot):
+          if ($slot['from'] == $slot['to']) {
+              continue; // zero-width sunrise/sunset marker from SolarForecastClient, nothing to show
+          }
+          $localFrom = $slot['from']->setTimezone($timezone);
+          $localTo = $slot['to']->setTimezone($timezone);
+      ?>
+        <tr>
+            <td><?= htmlspecialchars($localFrom->format('D j M, H:i')) ?>–<?= htmlspecialchars($localTo->format('H:i')) ?></td>
+            <td class="currency"><?= htmlspecialchars(number_format($slot['watt_hours'] / 1000, 2)) ?></td>
+        </tr>
+        <?php endforeach; ?>
+    </tbody>
+</table>
+<?php
 }
 
 function renderSlotTable(array $slotsForColumn, DateTimeZone $timezone, array $groups): void
@@ -175,6 +210,8 @@ $ranClass = !$ranOk ? 'alert-error' : (str_contains($ranMsg, 'unchanged') ? 'ale
     <?php renderSlotTable($leftSlots, $timezone, $schedule['groups']); ?>
     <?php renderSlotTable($rightSlots, $timezone, $schedule['groups']); ?>
 </div>
+
+<?php renderSolarForecast($solarForecast, $timezone); ?>
 <?php endif; ?>
 
 <?php

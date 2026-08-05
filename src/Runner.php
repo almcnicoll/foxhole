@@ -86,13 +86,29 @@ function runScheduler(bool $dryRun): array
 
         // Not on the critical path — not used by ScheduleBuilder yet (see roadmap.MD's
         // "Solar-generation-aware scheduling"), just retrieved and stored for now, same
-        // best-effort treatment as export prices: log and carry on if it fails.
-        if ($config['solar']['enabled'] ?? false) {
-            try {
-                $forecast = (new SolarForecastClient($logger))->fetchForecast($config['solar'], $timezone);
-                saveSolarForecast($forecast, new DateTimeImmutable('now', $timezone));
-            } catch (SolarForecastException $e) {
-                $logger->warn('Solar forecast fetch failed, skipping: ' . $e->getMessage());
+        // best-effort treatment as export prices: log and carry on if it fails. Panel
+        // geometry/enabled live in Store (settings.php), same pattern as FoxESS creds —
+        // see CLAUDE.md's "More settings-table config". Forecast.Solar's free tier only
+        // allows a handful of calls/day per location, so refetch at most every 2h; the
+        // existing stored forecast (if any) is left as-is otherwise.
+        if (getSetting('solar_enabled', '0') === '1') {
+            $existingForecast = getLatestSolarForecast();
+            $twoHoursAgo = new DateTimeImmutable('-2 hours', $timezone);
+            $staleEnough = !$existingForecast || $existingForecast[0]['fetched_at'] < $twoHoursAgo;
+            if ($staleEnough) {
+                try {
+                    $solarConfig = [
+                        'latitude' => getSetting('solar_latitude', '0'),
+                        'longitude' => getSetting('solar_longitude', '0'),
+                        'declination' => getSetting('solar_declination', '0'),
+                        'azimuth' => getSetting('solar_azimuth', '0'),
+                        'kwp' => getSetting('solar_kwp', '0'),
+                    ];
+                    $forecast = (new SolarForecastClient($logger))->fetchForecast($solarConfig, $timezone);
+                    saveSolarForecast($forecast, new DateTimeImmutable('now', $timezone));
+                } catch (SolarForecastException $e) {
+                    $logger->warn('Solar forecast fetch failed, skipping: ' . $e->getMessage());
+                }
             }
         }
 
