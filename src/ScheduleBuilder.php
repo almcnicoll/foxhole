@@ -2,8 +2,21 @@
 
 require_once __DIR__ . '/Exceptions.php';
 
-// Turns 48 Agile rate slots + a cost basis into FoxESS scheduler groups.
-// Pure price-threshold logic (see spec §7) — no solar/load forecasting.
+// Turns import/export rate slots + a cost basis into FoxESS scheduler groups,
+// plus a plain-English explanation for each decision. A greedy, explainable
+// heuristic by design, not a global optimiser — the spec wants price-threshold
+// logic (§7), and explanations need to be narratable, which argues against an
+// opaque solver anyway. See CLAUDE.md for the reasoning behind each rule.
+//
+// Selection rules:
+//   - Charge a slot if it's below your cost basis, OR cheap enough that even
+//     the day's best export rate would make buying now profitable (arbitrage).
+//   - When there are more charge candidates than the cap, prefer ones before
+//     today's most expensive import slot, so the battery tends to be full
+//     heading into it.
+//   - Discharge/export the slots with the highest export rate, if export price
+//     actually varies today. If it's flat, fall back to offsetting the most
+//     expensive import slots instead (a flat export has no "best time to sell").
 class ScheduleBuilder
 {
     public function __construct(
@@ -13,57 +26,101 @@ class ScheduleBuilder
     }
 
     /**
-     * @param array $slots 48 chronological slots from OctopusClient (UTC datetimes)
-     * @param float[] $costBasis 48 values aligned to $slots, pence/kWh
-     * @return array{groups: array}
+     * @param array $importSlots N chronological slots (UTC datetimes), ['from','to','rate']
+     * @param ?array $exportSlots same shape/length as $importSlots, or null if unavailable this run
+     * @param float[] $costBasis N values aligned to $importSlots, pence/kWh
+     * @return array{groups: array, explanations: string[], summary: string}
      */
-    public function build(array $slots, array $costBasis): array
+    public function build(array $importSlots, ?array $exportSlots, array $costBasis): array
     {
-        $n = count($slots);
+        $n = count($importSlots);
         if ($n !== count($costBasis)) {
             throw new ScheduleBuildException('Slot count and cost basis count must match');
+        }
+        if ($exportSlots !== null && count($exportSlots) !== $n) {
+            throw new ScheduleBuildException('Slot count and export slot count must match');
         }
         if ($n === 0) {
             throw new ScheduleBuildException('No slots to build a schedule from');
         }
 
+        $importRates = array_column($importSlots, 'rate');
+        $exportRates = $exportSlots !== null ? array_column($exportSlots, 'rate') : null;
+
+        $peakImportIndex = self::indexOfMax($importRates);
+        $bestExportRate = $exportRates !== null ? max($exportRates) : null;
+        $exportIsVariable = $exportRates !== null && max($exportRates) - min($exportRates) > 0.0;
+
         $modes = array_fill(0, $n, 'SelfUse');
 
-        // Candidates for charging: strictly cheaper than what we'd otherwise pay.
-        $chargeCandidates = [];
+        // --- Charge candidates: below cost basis, or cheap enough to arbitrage against the best export rate ---
+        $chargeCandidates = []; // index => reason[] ('cost_basis' and/or 'arbitrage')
         for ($i = 0; $i < $n; $i++) {
-            if ($slots[$i]['rate'] < $costBasis[$i]) {
-                $chargeCandidates[$i] = $slots[$i]['rate'];
+            $reasons = [];
+            if ($importRates[$i] < $costBasis[$i]) {
+                $reasons[] = 'cost_basis';
+            }
+            if ($bestExportRate !== null && $importRates[$i] < $bestExportRate) {
+                $reasons[] = 'arbitrage';
+            }
+            if ($reasons) {
+                $chargeCandidates[$i] = $reasons;
             }
         }
-        asort($chargeCandidates); // ascending by rate, keys preserved
+
+        // Prefer slots before today's import peak, so the battery is more likely to be
+        // full heading into it — only fall back to post-peak slots if that's not enough.
+        $preIndexes = array_values(array_filter(array_keys($chargeCandidates), fn($i) => $i < $peakImportIndex));
+        $postIndexes = array_values(array_filter(array_keys($chargeCandidates), fn($i) => $i >= $peakImportIndex));
+        usort($preIndexes, fn($a, $b) => $importRates[$a] <=> $importRates[$b]);
+        usort($postIndexes, fn($a, $b) => $importRates[$a] <=> $importRates[$b]);
+
         $chargeCap = max(0, (int) ($this->strategyConfig['cheap_slots_to_charge'] ?? 0));
-        $chargeIndexes = array_slice(array_keys($chargeCandidates), 0, $chargeCap, true);
+        $chargeIndexes = array_slice([...$preIndexes, ...$postIndexes], 0, $chargeCap);
+        $chargeReasons = [];
         foreach ($chargeIndexes as $i) {
             $modes[$i] = 'ForceCharge';
+            $chargeReasons[$i] = $chargeCandidates[$i];
         }
 
-        // Most expensive slots overall get force-discharged, whatever charging picked.
+        // --- Discharge candidates: sell at the export peak if export price actually varies,
+        // otherwise fall back to offsetting the most expensive import slots (the old behaviour). ---
+        $dischargeSortRates = $exportIsVariable ? $exportRates : $importRates;
         $dischargeCandidates = [];
         for ($i = 0; $i < $n; $i++) {
             if (!in_array($i, $chargeIndexes, true)) {
-                $dischargeCandidates[$i] = $slots[$i]['rate'];
+                $dischargeCandidates[$i] = $dischargeSortRates[$i];
             }
         }
-        arsort($dischargeCandidates); // descending by rate, keys preserved
+        arsort($dischargeCandidates); // descending, keys preserved
         $dischargeCap = max(0, (int) ($this->strategyConfig['expensive_slots_to_export'] ?? 0));
-        $dischargeIndexes = array_slice(array_keys($dischargeCandidates), 0, $dischargeCap, true);
+        $dischargeIndexes = array_slice(array_keys($dischargeCandidates), 0, $dischargeCap);
         foreach ($dischargeIndexes as $i) {
             $modes[$i] = 'ForceDischarge';
         }
 
         $timezone = new DateTimeZone($this->strategyConfig['timezone'] ?? 'Europe/London');
-        $periods = $this->mergeContiguous($slots, $modes, $timezone);
+        $periods = $this->mergeContiguous($importSlots, $modes, $timezone);
 
-        return ['groups' => $this->periodsToGroups($periods)];
+        return [
+            'groups' => $this->periodsToGroups($periods),
+            'explanations' => $this->explainPeriods($periods, $importRates, $exportRates, $costBasis, $bestExportRate, $chargeReasons, $exportIsVariable),
+            'summary' => $this->explainPeak($importSlots[$peakImportIndex], $importRates[$peakImportIndex], $timezone, count($chargeIndexes) > 0),
+        ];
     }
 
-    /** @return array<int, array{mode: string, start: DateTimeImmutable, end: DateTimeImmutable}> */
+    private static function indexOfMax(array $values): int
+    {
+        $maxIndex = 0;
+        foreach ($values as $i => $v) {
+            if ($v > $values[$maxIndex]) {
+                $maxIndex = $i;
+            }
+        }
+        return $maxIndex;
+    }
+
+    /** @return array<int, array{mode: string, startIndex: int, endIndex: int, start: DateTimeImmutable, end: DateTimeImmutable}> */
     private function mergeContiguous(array $slots, array $modes, DateTimeZone $timezone): array
     {
         $periods = [];
@@ -77,7 +134,7 @@ class ScheduleBuilder
                 $j++;
             }
             $end = $slots[$j]['to']->setTimezone($timezone);
-            $periods[] = ['mode' => $mode, 'start' => $start, 'end' => $end];
+            $periods[] = ['mode' => $mode, 'startIndex' => $i, 'endIndex' => $j, 'start' => $start, 'end' => $end];
             $i = $j + 1;
         }
 
@@ -117,5 +174,105 @@ class ScheduleBuilder
         }
 
         return $groups;
+    }
+
+    /** @return string[] one sentence per non-SelfUse period, same order periodsToGroups() emits groups in */
+    private function explainPeriods(
+        array $periods,
+        array $importRates,
+        ?array $exportRates,
+        array $costBasis,
+        ?float $bestExportRate,
+        array $chargeReasons,
+        bool $exportIsVariable,
+    ): array {
+        $explanations = [];
+        foreach ($periods as $period) {
+            if ($period['mode'] === 'SelfUse') {
+                continue;
+            }
+            $range = $this->formatRange($period);
+            $slotIndexes = range($period['startIndex'], $period['endIndex']);
+
+            if ($period['mode'] === 'ForceCharge') {
+                $avgImport = $this->average($importRates, $slotIndexes);
+                $avgCostBasis = $this->average($costBasis, $slotIndexes);
+                $reasonsInPeriod = [];
+                foreach ($slotIndexes as $i) {
+                    $reasonsInPeriod = [...$reasonsInPeriod, ...($chargeReasons[$i] ?? [])];
+                }
+                $explanations[] = $this->explainCharge(
+                    $range,
+                    $avgImport,
+                    $avgCostBasis,
+                    in_array('cost_basis', $reasonsInPeriod, true),
+                    in_array('arbitrage', $reasonsInPeriod, true),
+                    $bestExportRate,
+                );
+            } else {
+                $avgRate = $this->average($exportIsVariable ? $exportRates : $importRates, $slotIndexes);
+                $explanations[] = $this->explainDischarge($range, $exportIsVariable, $avgRate);
+            }
+        }
+        return $explanations;
+    }
+
+    private function explainCharge(string $range, float $avgImport, float $avgCostBasis, bool $usedCostBasis, bool $usedArbitrage, ?float $bestExportRate): string
+    {
+        $rate = number_format($avgImport, 2);
+        if ($usedCostBasis && $usedArbitrage) {
+            return sprintf(
+                'Charging %s (avg %sp/kWh) — below both your %sp cost basis and the best export rate today (%sp), so it beats your normal rate either way.',
+                $range,
+                $rate,
+                number_format($avgCostBasis, 2),
+                number_format($bestExportRate, 2),
+            );
+        }
+        if ($usedArbitrage) {
+            return sprintf(
+                'Charging %s (avg %sp/kWh) — above your %sp cost basis, but cheaper than the best export rate today (%sp), so it\'s worth buying now to sell or self-use later.',
+                $range,
+                $rate,
+                number_format($avgCostBasis, 2),
+                number_format($bestExportRate, 2),
+            );
+        }
+        return sprintf('Charging %s (avg %sp/kWh) — below your %sp cost basis.', $range, $rate, number_format($avgCostBasis, 2));
+    }
+
+    private function explainDischarge(string $range, bool $exportDriven, float $avgRate): string
+    {
+        if ($exportDriven) {
+            return sprintf('Selling %s (avg export %sp/kWh) — the highest export rate today.', $range, number_format($avgRate, 2));
+        }
+        return sprintf(
+            'Discharging %s (avg import %sp/kWh) — among the most expensive import slots today, so battery power offsets it instead of a flat-rate export.',
+            $range,
+            number_format($avgRate, 2),
+        );
+    }
+
+    private function explainPeak(array $peakSlot, float $peakRate, DateTimeZone $timezone, bool $chargedAnything): string
+    {
+        $time = $peakSlot['from']->setTimezone($timezone)->format('H:i');
+        if (!$chargedAnything) {
+            return sprintf("Today's most expensive import slot is %s at %sp/kWh — no slots were cheap enough to charge ahead of it.", $time, number_format($peakRate, 2));
+        }
+        return sprintf("Today's most expensive import slot is %s at %sp/kWh — charging is prioritised beforehand so the battery is topped up going into it.", $time, number_format($peakRate, 2));
+    }
+
+    private function formatRange(array $period): string
+    {
+        return $period['start']->format('H:i') . '–' . $period['end']->format('H:i');
+    }
+
+    private function average(array $values, array $indexes): float
+    {
+        $sum = 0.0;
+        foreach ($indexes as $i) {
+            $sum += $values[$i];
+        }
+        return $sum / count($indexes);
     }
 }

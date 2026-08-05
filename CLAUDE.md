@@ -74,10 +74,12 @@ DDL is simpler than tracking migrations).
 
 - **`settings`** — plain key/value (`key TEXT PRIMARY KEY, value TEXT`).
   Holds `foxess_api_key`, `foxess_device_sn`, `system_password_hash`,
-  `{import,export}_price_mode`, `{import,export}_price_fixed_pence`. A
-  key/value table was chosen over typed columns because the set of "small
-  bits of config the UI can edit" is exactly the kind of thing that grows
-  over time (see roadmap) — a new setting is a new row, not a migration.
+  `{import,export}_price_mode`, `{import,export}_price_fixed_pence`,
+  `schedule_summary` (the latest day-level explanation sentence — see
+  "Cost-optimising ScheduleBuilder" below). A key/value table was chosen
+  over typed columns because the set of "small bits of config/state the app
+  needs a single current value for" is exactly the kind of thing that grows
+  over time (see roadmap) — a new entry is a new row, not a migration.
 - **`rate_slots`** — the latest fetch, both `import_rate_pence` (purchase)
   and `export_rate_pence` (sale, nullable — see `PriceProvider` below).
   `saveRateSlots()` deletes and re-inserts on every call, mirroring the old
@@ -89,9 +91,13 @@ DDL is simpler than tracking migrations).
   as a guarded `DROP TABLE` + recreate in `Store::db()` rather than a real
   migration — there's never anything in it worth preserving across a schema
   change.
-- **`schedule_groups`** — the latest schedule actually pushed to FoxESS.
-  Same replace-not-append pattern. This is also what `run.php` diffs the
-  freshly-computed schedule against to decide whether to skip a no-op push.
+- **`schedule_groups`** — the latest schedule actually pushed to FoxESS,
+  plus a per-group `explanation` (nullable TEXT, added the same
+  disposable-table way as `rate_slots`' column change above). Same
+  replace-not-append pattern. This is also what `run.php` diffs the
+  freshly-computed schedule against to decide whether to skip a no-op push
+  — `getLatestSchedule()`'s `groups` key deliberately excludes `explanation`
+  so that diff stays about what's actually sent to FoxESS, not wording.
 
 `Store::db()` takes an optional, "sticky" path override specifically so
 `tests/self_check.php` can point the whole module at a throwaway SQLite file
@@ -112,19 +118,21 @@ on-screen message for the UI).
 1. Load `config.php` (non-secret tunables only — see Config & secrets below).
 2. `PriceProvider::resolveImport()` — tries **tomorrow** first (local
    midnight-to-midnight); if that throws `OctopusFetchException` (transport
-   failure, or fewer than 48 slots because Agile hasn't published yet), logs
-   an INFO line and retries for **today** instead. Today can't fail for the
-   "not published yet" reason — it was "tomorrow" as of yesterday's publish —
-   so this fallback is expected to succeed whenever tomorrow's don't exist
-   yet. Whichever date wins becomes `$targetDate` for the rest of the run.
-   See "Either side of midnight" below for why this exists.
+   failure, or zero slots because Agile hasn't published at all yet), logs
+   an INFO line and retries for **today** instead. Whichever date wins
+   becomes `$targetDate` for the rest of the run. See "Either side of
+   midnight" below for why this exists, and "Partial-day data is normal, not
+   a failure" for why the trigger is *zero* slots, not *fewer than 48*.
 3. `saveRateSlots()` — persisted to SQLite immediately, even in `--dry-run`
    (it's just a record of what was fetched, and it's what powers the
-   dashboard).
+   dashboard). Export prices are aligned to import's slots by timestamp, not
+   array position — see "Partial-day data is normal" below for why that
+   matters.
 4. `CostBasisProvider::getCostBasis()` — 48 values (currently flat, `fixed`
    mode) to compare Agile rates against.
-5. `ScheduleBuilder::build()` — pure price-threshold logic, no I/O. Produces
-   `{groups: [...]}`.
+5. `ScheduleBuilder::build()` — price/arbitrage-threshold logic, no I/O.
+   Produces `{groups: [...], explanations: [...], summary: '...'}`. See
+   "Cost-optimising ScheduleBuilder" below for the actual selection rules.
 6. `--dry-run` stops here and returns the computed schedule — no FoxESS
    credentials are even read.
 7. Diff the computed groups against `getLatestSchedule()`; skip the FoxESS
@@ -186,9 +194,12 @@ No JS framework, inline CSS via `src/Layout.php`:
   any) its local start time falls in (`slotWorkMode()` in `index.php`), and
   renders one unified table. Deliberately merges prices and schedule into a
   single view rather than two separate tables — that merge *is* the
-  "quick glance" the UI exists for. Also has the "Run now" button (a plain
-  POST form to `run-now.php`) and, after that redirects back, a result
-  banner read from `?ran=1&ok=…&msg=…` — no session flash-message plumbing,
+  "quick glance" the UI exists for. Below that, a "Why these decisions?"
+  section lists the day summary (`settings.schedule_summary`) and each
+  group's stored explanation, in the same order as the schedule table reads
+  top-to-bottom. Also has the "Run now" button (a plain POST form to
+  `run-now.php`) and, after that redirects back, a result banner read from
+  `?ran=1&ok=…&msg=…` — no session flash-message plumbing,
   just query-string state, which is enough for a once-in-a-while manual
   action.
 - **`settings.php`** — FoxESS `api_key`/`device_sn` (pre-filled from
@@ -219,9 +230,38 @@ instead. This is what makes "Run now" actually useful for daytime testing
 (previously it just failed with "not published yet" any time before ~16:00,
 which was most of the day), and means a missed cron run gets caught up
 automatically next time cron *does* fire, rather than silently doing nothing
-until the following evening. The fallback can't itself hit the "not
-published" failure — today's rates were "tomorrow" as of yesterday's publish,
-so by definition they're already complete by the time today exists.
+until the following evening.
+
+**Partial-day data is normal, not a failure.** Originally assumed "today can't
+fail the completeness check — it was 'tomorrow' as of yesterday's publish, so
+it's always complete by the time today exists." That assumption was wrong,
+and caused real, repeated failures in production (`"Octopus returned 46 of 48
+slots"`, on both "today" and "tomorrow", days in a row). Investigated with
+live requests before touching any code: Octopus's own `count`/`next` fields
+confirm this isn't pagination, and a direct query with no date filter showed
+their published horizon for a tariff can genuinely end mid-afternoon on
+"today" — the last hour or so of a day can still be missing well after that
+day has started. This is just how the live feed behaves, not something in
+our control. Fix: `OctopusClient` no longer throws on `count($slots) < 48` —
+it logs a WARN and returns whatever it has (down to zero). `PriceProvider`
+throws `OctopusFetchException` only when a fetch comes back completely empty
+(genuinely nothing usable, e.g. tomorrow before publish) — that's the one
+case that still triggers the tomorrow→today fallback above. A partial day
+(e.g. 46/48) is used as-is: `ScheduleBuilder` never assumed exactly 48 slots
+to begin with, so the missing hour simply stays on `SelfUse` until a later
+run has full data for it.
+
+One consequence worth knowing: import and export are fetched independently,
+and now routinely have *different* slot counts (import might be a same-day
+partial 46; fixed-mode export always generates a clean 48 covering the whole
+day). `Runner.php` aligns them by matching each import slot's timestamp
+against export's, not by raw array position/count — and matches by
+`getTimestamp()` specifically, not a formatted string, because import's
+slots are UTC (from Octopus) while fixed-mode export's are built in the
+configured local timezone; the same instant formats differently between the
+two, so a naive string comparison silently fails every lookup. If any import
+slot has no matching export entry, export is dropped for that run (logged as
+a WARN) rather than risking a misaligned zip.
 
 One cosmetic side effect worth knowing about: `schedule_groups.for_date` only
 updates when a push actually happens — if a same-day fallback push and a
@@ -235,12 +275,17 @@ either way. Not worth solving — it's a label, not a functional bug.
 **Export price failures don't block a push; import price failures do.**
 `PriceProvider::resolveImport()`/`resolveExport()` share the same API-vs-fixed
 logic, but `Runner.php` treats their failures very differently: import is on
-the critical path (`ScheduleBuilder` needs it) so an `OctopusFetchException`
-there aborts the run exactly like before this feature existed. Export is
-display-only right now — nothing in `ScheduleBuilder` reads it — so its
-failure is caught, logged as a WARN, and stored as `NULL` for that run rather
-than blocking the actual charge/discharge push. If export price ever starts
-feeding scheduling decisions (see roadmap), this asymmetry needs revisiting.
+the critical path (`ScheduleBuilder` can't run without it) so an
+`OctopusFetchException` there aborts the run exactly like before this feature
+existed. Export *does* now feed real scheduling decisions (arbitrage and
+discharge timing — see "Cost-optimising ScheduleBuilder" below), but a
+missing export price is still treated as "degrade gracefully," not "abort":
+its failure is caught, logged as a WARN, and passed to `ScheduleBuilder` as
+`null` for that run. `ScheduleBuilder` falls back to cost-basis-only charging
+and import-price-based discharge selection when that happens — the same
+behaviour the app had before export prices existed at all. A day without
+export data still gets a sensible schedule; it just can't arbitrage or chase
+the export peak until export data is available again.
 
 **Export defaults to fixed 12p, import defaults to live Agile.** Matches
 reality for most FoxESS+Agile owners: dynamic import, flat export rate. Both
@@ -249,6 +294,73 @@ without touching the other. The Agile Outgoing product/tariff codes
 (`AGILE-OUTGOING-19-05-13` / `E-1R-AGILE-OUTGOING-19-05-13-C` for London) are
 confirmed live and wired up in `config.php`, but only get called if someone
 actually switches export to `api` mode.
+
+**Cost-optimising `ScheduleBuilder`: a greedy, explainable heuristic, not a
+solver.** User-requested upgrade from pure "cheapest N below cost basis /
+priciest M overall" threshold logic to something that reasons about import
+*and* export price together. Deliberately still a greedy heuristic, not an
+LP/global optimiser: the output has to come with a plain-English explanation
+per decision (see below), and an optimiser's output is much harder to narrate
+honestly than "we picked this because X" rules. Four rules, each a fairly
+direct translation of a specific ask:
+
+- *Charge when cheap* (unchanged): below `cost_basis` for that slot.
+- *Charge for arbitrage*: **or** below the day's best export rate, even if
+  above cost basis — if you can buy at 11p and the best you'd ever be paid to
+  sell is 12p, that's a profitable trade regardless of what your "normal"
+  rate is. This is a new, independent OR-condition alongside cost basis, not
+  a replacement for it — see `chargeCandidates` in `ScheduleBuilder::build()`.
+- *Full battery before the peak*: when there are more charge candidates than
+  `cheap_slots_to_charge` allows, candidates before today's single most
+  expensive import slot are used up before candidates after it (two sorted
+  lists, pre-peak concatenated before post-peak, then sliced to the cap —
+  see the `$preIndexes`/`$postIndexes` split). Cheapest-first is still the
+  tiebreaker *within* each half; this only matters when the cap would
+  otherwise force a choice between an equally-cheap pre- and post-peak slot.
+- *Sell at the export peak, but only if there is one*: discharge slots are
+  ranked by export rate descending — **if** export price actually varies
+  today (`max - min > 0`). If it's flat (the common case: default export
+  mode is a fixed 12p), there's no "best time to sell," so discharge falls
+  back to the original behaviour — ranked by import price descending, i.e.
+  offsetting the most expensive grid-import slots instead. This is the literal
+  reading of "if export rate is variable ... force-sell when highest": the
+  variability check is what decides which ranking key is used, not just
+  whether export data exists at all.
+
+**No live battery SoC — the "spare energy" question is decided by battery
+capacity/power maths, not tracked state.** The FoxESS API isn't queried for
+the inverter's actual current charge level anywhere in this app (the spec's
+`real/query` endpoint that could provide it is unused). `ScheduleBuilder`
+doesn't track a running kWh balance across the day either. Both charge and
+discharge slot counts are still capped by the plain `cheap_slots_to_charge`/
+`expensive_slots_to_export` config values (see "cheap_slots_to_charge is a
+plain config cap" above) — there's no check that discharge slots don't
+promise to export more energy than was actually charged. In practice this
+mostly self-corrects (Agile's daily shape means cheap import and expensive
+export rarely swap places), and FoxESS's own firmware will just discharge
+whatever's actually available rather than erroring — but if this ever needs
+tightening, fetching real SoC via `real/query` and simulating a running
+balance through the day is the natural next step. Flagged in roadmap.MD.
+
+**Explanations are generated from the same reason data used to select slots,
+not re-derived from raw numbers after the fact.** `ScheduleBuilder::build()`
+threads the *actual* reason (`cost_basis`, `arbitrage`, or which rate series
+drove discharge selection) through to `explainPeriods()`, rather than having
+the explanation function independently re-check thresholds. This matters:
+if explanation and selection logic ever drifted apart (e.g. selection using
+`exportIsVariable` but explanation re-deriving "was export used" from
+`$exportRates !== null`), the sentence shown could describe a rule that
+wasn't actually the one applied — an early draft had exactly this bug for
+the flat-export case. One sentence per emitted group (`explanations`, same
+order as `groups`) plus one day-level `summary` about the import peak.
+Persisted in `schedule_groups.explanation` (one column, nullable, dropped
+alongside the rest of that row on every push — same disposable-table pattern
+as `rate_slots`) and `settings.schedule_summary` (a single value, reusing the
+existing key/value table rather than adding new schema for one string).
+`getLatestSchedule()['groups']` deliberately excludes explanation text — it's
+what the no-op-push diff compares, and wording drift shouldn't trigger a
+re-push when the actual schedule hasn't changed. `index.php` renders both
+under "Why these decisions?" below the price table.
 
 **FoxESS scheduler endpoint: v1, not v0 or v3.** Cross-checked the live
 FoxESS OpenAPI docs, the `foxesscommunity.com` forums, and existing
@@ -354,10 +466,13 @@ step for whoever deploys this, not something to script here.
   when a time-banded tariff like Flux goes live) is stubbed with a `TODO`,
   deliberately not implemented against guessed API shapes. See spec §13 and
   [roadmap.MD](roadmap.MD).
-- **Scheduling algorithm**: `ScheduleBuilder::build()` is pure
-  price-threshold logic by design (spec §7). A smarter optimiser (solar
-  forecast, load-aware) would replace this method's body without touching
-  its inputs/outputs — `run.php` and `FoxessClient` don't need to change.
+- **Scheduling algorithm**: `ScheduleBuilder::build()` is a greedy,
+  explainable price/arbitrage heuristic by design (see "Cost-optimising
+  ScheduleBuilder" above), not a global optimiser — spec §7 wants
+  price-threshold logic, and explanations need to be narratable. A smarter
+  version (solar forecast, load-aware, real SoC tracking) would replace this
+  method's body without touching its inputs/outputs — `run.php` and
+  `FoxessClient` don't need to change.
 - **More settings-table config**: if more of `config.php` ends up needing a
   UI (see roadmap), it follows the same pattern `foxess_api_key` already
   does — `getSetting()`/`setSetting()`, no schema change needed for a plain

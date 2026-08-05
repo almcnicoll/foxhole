@@ -75,6 +75,17 @@ $ranMsg = (string) ($_GET['msg'] ?? '');
     <?php endforeach; ?>
     </tbody>
   </table>
+
+  <?php if ($schedule['explanations']): ?>
+    <h2>Why these decisions?</h2>
+    <?php $summary = getSetting('schedule_summary'); ?>
+    <?php if ($summary): ?><p class="muted"><?= htmlspecialchars($summary) ?></p><?php endif; ?>
+    <ul>
+      <?php foreach ($schedule['explanations'] as $explanation): ?>
+        <li><?= htmlspecialchars((string) $explanation) ?></li>
+      <?php endforeach; ?>
+    </ul>
+  <?php endif; ?>
 <?php endif; ?>
 
 <?php

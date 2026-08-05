@@ -46,6 +46,16 @@ function db(?string $overridePath = null): PDO
         export_rate_pence REAL,
         fetched_at TEXT NOT NULL
     )');
+    // Same disposable-table story as rate_slots above: schedule_groups gained an
+    // `explanation` column, so drop and recreate on the old schema rather than migrate.
+    // (Unlike rate_slots' rename, this is a pure add, so — unlike the check above —
+    // "column missing" alone doesn't distinguish old-schema from no-table-yet; check
+    // both explicitly.)
+    $groupsTableExists = (int) $pdo->query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schedule_groups'")->fetchColumn() > 0;
+    $hasExplanationColumn = (int) $pdo->query("SELECT COUNT(*) FROM pragma_table_info('schedule_groups') WHERE name = 'explanation'")->fetchColumn() > 0;
+    if ($groupsTableExists && !$hasExplanationColumn) {
+        $pdo->exec('DROP TABLE schedule_groups');
+    }
     $pdo->exec('CREATE TABLE IF NOT EXISTS schedule_groups (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         for_date TEXT NOT NULL,
@@ -57,6 +67,7 @@ function db(?string $overridePath = null): PDO
         min_soc_on_grid INTEGER NOT NULL,
         fd_soc INTEGER NOT NULL,
         fd_pwr INTEGER NOT NULL,
+        explanation TEXT,
         pushed_at TEXT NOT NULL
     )');
 
@@ -115,16 +126,19 @@ function getLatestRateSlots(): array
     ], $rows);
 }
 
-/** @param array $groups shape produced by ScheduleBuilder: enable/startHour/.../fdPwr */
-function saveSchedule(string $forDate, array $groups, DateTimeImmutable $pushedAt): void
+/**
+ * @param array $groups shape produced by ScheduleBuilder: enable/startHour/.../fdPwr
+ * @param string[] $explanations same length/order as $groups — see ScheduleBuilder::build()
+ */
+function saveSchedule(string $forDate, array $groups, array $explanations, DateTimeImmutable $pushedAt): void
 {
     $pdo = db();
     $pdo->beginTransaction();
     $pdo->exec('DELETE FROM schedule_groups');
     $stmt = $pdo->prepare('INSERT INTO schedule_groups
-        (for_date, start_hour, start_minute, end_hour, end_minute, work_mode, min_soc_on_grid, fd_soc, fd_pwr, pushed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-    foreach ($groups as $group) {
+        (for_date, start_hour, start_minute, end_hour, end_minute, work_mode, min_soc_on_grid, fd_soc, fd_pwr, explanation, pushed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    foreach ($groups as $i => $group) {
         $stmt->execute([
             $forDate,
             $group['startHour'],
@@ -135,13 +149,19 @@ function saveSchedule(string $forDate, array $groups, DateTimeImmutable $pushedA
             $group['minSocOnGrid'],
             $group['fdSoc'],
             $group['fdPwr'],
+            $explanations[$i] ?? null,
             $pushedAt->format(DATE_ATOM),
         ]);
     }
     $pdo->commit();
 }
 
-/** @return array{for_date: ?string, pushed_at: ?DateTimeImmutable, groups: array} */
+/**
+ * @return array{for_date: ?string, pushed_at: ?DateTimeImmutable, groups: array, explanations: string[]}
+ *         `groups` intentionally excludes `explanation` — it's what run.php diffs against to decide
+ *         whether to skip a no-op push, and that check must stay about what's actually sent to FoxESS,
+ *         not wording that can change without the schedule itself changing.
+ */
 function getLatestSchedule(): array
 {
     $rows = db()->query('SELECT * FROM schedule_groups ORDER BY start_hour ASC, start_minute ASC')->fetchAll(PDO::FETCH_ASSOC);
@@ -161,6 +181,7 @@ function getLatestSchedule(): array
         'for_date' => $rows[0]['for_date'] ?? null,
         'pushed_at' => isset($rows[0]) ? new DateTimeImmutable($rows[0]['pushed_at']) : null,
         'groups' => $groups,
+        'explanations' => array_column($rows, 'explanation'),
     ];
 }
 

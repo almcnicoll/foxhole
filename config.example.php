@@ -28,12 +28,11 @@ return [
     ],
     'cost_basis' => [
         // What you actually pay for electricity — used as the "worth charging below this" threshold.
-        // Only ever charge from the grid when the Agile rate is cheaper than this.
-        'mode' => 'fixed', // 'fixed' now; 'octopus_product' once a time-banded tariff (e.g. Flux) is live
+        // Only ever charge from the grid when the Agile rate is cheaper than this. Not a real tariff
+        // fetch — 'octopus_product' mode is an unimplemented stub (see CostBasisProvider), so 'fixed'
+        // is the only mode that currently does anything.
+        'mode' => 'fixed',
         'fixed_pence_per_kwh' => 24.50, // current standing tariff rate — update when tariff changes
-        // Used only when mode = 'octopus_product', same shape as the octopus config above:
-        'product_code' => null,
-        'tariff_code'  => null,
     ],
     'notify' => [
         'alert_email' => 'you@example.com', // optional, for failure notifications

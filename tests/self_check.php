@@ -25,7 +25,7 @@ function check(bool $cond, string $msg): void
     }
 }
 
-/** Build 48 synthetic UTC slots for 2026-01-05 (Europe/London = UTC in January, keeps hour math simple). */
+/** Build N synthetic UTC slots for 2026-01-05 (Europe/London = UTC in January, keeps hour math simple). */
 function buildSlots(array $rates): array
 {
     $slots = [];
@@ -35,6 +35,11 @@ function buildSlots(array $rates): array
         $slots[] = ['from' => $from, 'to' => $from->modify('+30 minutes'), 'rate' => $rates[$i]];
     }
     return $slots;
+}
+
+function explanationsContaining(array $explanations, string $needle): array
+{
+    return array_values(array_filter($explanations, fn($e) => str_contains($e, $needle)));
 }
 
 // --- CostBasisProvider: fixed mode ---
@@ -50,7 +55,7 @@ try {
     check(true, 'octopus_product mode throws a clear stub error');
 }
 
-// --- ScheduleBuilder: main price-threshold behaviour ---
+// --- ScheduleBuilder: main price-threshold behaviour (no export data) ---
 $rates = array_fill(0, 48, 30.0); // above the 24.5 cost basis -> SelfUse by default
 for ($i = 0; $i < 6; $i++) {
     $rates[$i] = 10.0; // 00:00-03:00 cheap, below cost basis
@@ -64,7 +69,7 @@ $costBasis = array_fill(0, 48, 24.5);
 $strategy = ['cheap_slots_to_charge' => 6, 'expensive_slots_to_export' => 4, 'timezone' => 'Europe/London'];
 $battery = ['capacity_kwh' => 10.0, 'max_charge_kw' => 3.0, 'max_discharge_kw' => 3.0, 'min_soc_on_grid' => 15, 'reserve_soc' => 15];
 
-$schedule = (new ScheduleBuilder($strategy, $battery))->build($slots, $costBasis);
+$schedule = (new ScheduleBuilder($strategy, $battery))->build($slots, null, $costBasis);
 $groups = $schedule['groups'];
 
 check(count($groups) === 2, 'exactly one merged charge period and one discharge period');
@@ -81,12 +86,17 @@ check($discharge !== null && $discharge['workMode'] === 'ForceDischarge', 'secon
 check($discharge && $discharge['startHour'] === 21 && $discharge['endHour'] === 23, 'expensive slots merge into one 21:00-23:00 period');
 check($discharge && $discharge['fdSoc'] === 15, 'discharge group floors at reserve_soc');
 
+check(count($schedule['explanations']) === 2, 'one explanation per emitted group');
+check(str_contains($schedule['explanations'][0], 'cost basis'), 'charge explanation without export data cites the cost basis');
+check(str_contains($schedule['explanations'][1], 'flat-rate export'), 'discharge explanation without export data explains the import-price fallback');
+check(str_contains($schedule['summary'], '21:00'), "summary names today's actual import peak time");
+
 // --- ScheduleBuilder: cap is an upper bound, not a target ---
 $rates2 = array_fill(0, 48, 30.0);
 $rates2[10] = 5.0;
 $rates2[11] = 6.0; // only 2 slots below the 24.5 cost basis, cap is 6
 $slots2 = buildSlots($rates2);
-$schedule2 = (new ScheduleBuilder($strategy, $battery))->build($slots2, $costBasis);
+$schedule2 = (new ScheduleBuilder($strategy, $battery))->build($slots2, null, $costBasis);
 $chargeGroups2 = array_values(array_filter($schedule2['groups'], fn($g) => $g['workMode'] === 'ForceCharge'));
 check(count($chargeGroups2) === 1, 'only the 2 qualifying slots become one period, not padded to the cap of 6');
 check($chargeGroups2[0]['startHour'] === 5 && $chargeGroups2[0]['startMinute'] === 0, 'period starts at slot 10 (05:00)');
@@ -97,20 +107,95 @@ $rates3 = range(1, 10); // 10 distinct ascending rates, all below a very high co
 $slots3 = buildSlots($rates3);
 $costBasis3 = array_fill(0, 10, 1000.0); // every slot qualifies as a charge candidate
 $strategy3 = ['cheap_slots_to_charge' => 8, 'expensive_slots_to_export' => 4, 'timezone' => 'Europe/London'];
-$schedule3 = (new ScheduleBuilder($strategy3, $battery))->build($slots3, $costBasis3);
+$schedule3 = (new ScheduleBuilder($strategy3, $battery))->build($slots3, null, $costBasis3);
 $chargeCount3 = count(array_filter($schedule3['groups'], fn($g) => $g['workMode'] === 'ForceCharge'));
 $dischargeCount3 = count(array_filter($schedule3['groups'], fn($g) => $g['workMode'] === 'ForceDischarge'));
 check($chargeCount3 + $dischargeCount3 <= 2, 'charge and discharge periods stay contiguous-merged and non-overlapping');
 // 8 cheapest of 10 are claimed for charging, leaving only 2 slots for the top-4 discharge cap.
 check(true, 'discharge cap of 4 is naturally limited to the 2 slots left unclaimed by charging');
 
-// --- ScheduleBuilder: mismatched slot/cost-basis counts is a build error ---
+// --- ScheduleBuilder: mismatched slot/cost-basis, and slot/export, counts are build errors ---
 try {
-    (new ScheduleBuilder($strategy, $battery))->build($slots, array_fill(0, 10, 24.5));
+    (new ScheduleBuilder($strategy, $battery))->build($slots, null, array_fill(0, 10, 24.5));
     check(false, 'mismatched slot/cost-basis counts should throw');
 } catch (ScheduleBuildException $e) {
     check(true, 'mismatched slot/cost-basis counts throws ScheduleBuildException');
 }
+try {
+    (new ScheduleBuilder($strategy, $battery))->build($slots, buildSlots(array_fill(0, 10, 12.0)), $costBasis);
+    check(false, 'mismatched slot/export counts should throw');
+} catch (ScheduleBuildException $e) {
+    check(true, 'mismatched slot/export counts throws ScheduleBuildException');
+}
+
+// --- ScheduleBuilder: arbitrage — charge above cost basis but below the day's best export rate ---
+$rates4 = array_fill(0, 48, 20.0); // flat, all above the 10p cost basis
+$rates4[10] = 11.0; // 05:00 — above cost basis (10p) but below best export (12p): pure arbitrage
+$rates4[34] = 45.0; // peak, 17:00
+$costBasis4 = array_fill(0, 48, 10.0);
+$exportRates4 = array_fill(0, 48, 12.0); // flat export
+$slots4 = buildSlots($rates4);
+$exportSlots4 = buildSlots($exportRates4);
+$strategy4 = ['cheap_slots_to_charge' => 1, 'expensive_slots_to_export' => 1, 'timezone' => 'Europe/London'];
+$schedule4 = (new ScheduleBuilder($strategy4, $battery))->build($slots4, $exportSlots4, $costBasis4);
+$chargeGroups4 = array_values(array_filter($schedule4['groups'], fn($g) => $g['workMode'] === 'ForceCharge'));
+check(count($chargeGroups4) === 1 && $chargeGroups4[0]['startHour'] === 5, 'a slot above cost basis but below the best export rate is still charged (arbitrage)');
+$arbitrageExplanations = explanationsContaining($schedule4['explanations'], 'best export rate today');
+check(count($arbitrageExplanations) === 1, 'the arbitrage-only charge is explained by reference to the best export rate');
+
+// --- ScheduleBuilder: combined cost-basis + arbitrage reasoning is explained as such ---
+$rates5 = array_fill(0, 48, 20.0);
+$rates5[10] = 5.0; // below BOTH the 10p cost basis AND the 12p export rate
+$rates5[34] = 45.0;
+$costBasis5 = array_fill(0, 48, 10.0);
+$exportSlots5 = buildSlots(array_fill(0, 48, 12.0));
+$slots5 = buildSlots($rates5);
+$schedule5 = (new ScheduleBuilder(['cheap_slots_to_charge' => 1, 'expensive_slots_to_export' => 1, 'timezone' => 'Europe/London'], $battery))
+    ->build($slots5, $exportSlots5, $costBasis5);
+check(str_contains($schedule5['explanations'][0], 'below both your'), 'a slot cheap enough for both reasons is explained as such');
+
+// --- ScheduleBuilder: prefers slots before today's import peak when there are more candidates than the cap ---
+$rates6 = array_fill(0, 48, 20.0);
+$rates6[4] = 5.0;  // 02:00, before the peak
+$rates6[6] = 5.0;  // 03:00, before the peak
+$rates6[30] = 5.0; // 15:00, after the peak
+$rates6[32] = 5.0; // 16:00, after the peak
+$rates6[20] = 45.0; // peak at 10:00
+$costBasis6 = array_fill(0, 48, 24.5);
+$slots6 = buildSlots($rates6);
+$strategy6 = ['cheap_slots_to_charge' => 2, 'expensive_slots_to_export' => 2, 'timezone' => 'Europe/London'];
+$schedule6 = (new ScheduleBuilder($strategy6, $battery))->build($slots6, null, $costBasis6);
+$chargeGroups6 = array_values(array_filter($schedule6['groups'], fn($g) => $g['workMode'] === 'ForceCharge'));
+check(count($chargeGroups6) === 2, 'both equally-cheap pre-peak slots are picked (as two separate periods)');
+foreach ($chargeGroups6 as $g) {
+    check($g['startHour'] < 10, 'charge slot ' . $g['startHour'] . ':00 was chosen from before the 10:00 peak, not the equally-cheap slot(s) after it');
+}
+
+// --- ScheduleBuilder: flat export price falls back to import-price discharge selection ---
+$rates7 = array_fill(0, 48, 20.0);
+$rates7[34] = 45.0; // import peak at 17:00
+$costBasis7 = array_fill(0, 48, 24.5);
+$exportSlots7 = buildSlots(array_fill(0, 48, 12.0)); // perfectly flat
+$slots7 = buildSlots($rates7);
+$schedule7 = (new ScheduleBuilder(['cheap_slots_to_charge' => 0, 'expensive_slots_to_export' => 1, 'timezone' => 'Europe/London'], $battery))
+    ->build($slots7, $exportSlots7, $costBasis7);
+$dischargeGroup7 = $schedule7['groups'][0];
+check($dischargeGroup7['startHour'] === 17, 'flat export price -> discharge still targets the most expensive import slot');
+check(str_contains($schedule7['explanations'][0], 'flat-rate export'), 'flat export price is explained as a fallback, not claimed as an export peak');
+
+// --- ScheduleBuilder: variable export price switches discharge to the export peak instead ---
+$rates8 = array_fill(0, 48, 20.0);
+$rates8[34] = 45.0; // import peak at 17:00
+$costBasis8 = array_fill(0, 48, 24.5);
+$exportRates8 = array_fill(0, 48, 12.0);
+$exportRates8[16] = 30.0; // export peak at 08:00 — a different time from the import peak
+$exportSlots8 = buildSlots($exportRates8);
+$slots8 = buildSlots($rates8);
+$schedule8 = (new ScheduleBuilder(['cheap_slots_to_charge' => 0, 'expensive_slots_to_export' => 1, 'timezone' => 'Europe/London'], $battery))
+    ->build($slots8, $exportSlots8, $costBasis8);
+$dischargeGroup8 = $schedule8['groups'][0];
+check($dischargeGroup8['startHour'] === 8, 'variable export price -> discharge follows the export peak, not the import peak');
+check(str_contains($schedule8['explanations'][0], 'highest export rate today'), 'export-driven discharge is explained by the export rate, not import');
 
 // --- Store: settings/password/rates/schedule persistence ---
 // Points the whole module at a throwaway file (see Store::db()'s "sticky path"
@@ -173,10 +258,11 @@ $importFixed = $priceProvider->resolveImport($aDay);
 check(count($importFixed) === 48 && $importFixed[0]['rate'] === 20.0, 'import can be switched to fixed mode too, bypassing Octopus entirely');
 
 $pushedAt = new DateTimeImmutable('2026-01-04 17:00:00', new DateTimeZone('UTC'));
-saveSchedule('2026-01-05', $groups, $pushedAt);
+saveSchedule('2026-01-05', $groups, $schedule['explanations'], $pushedAt);
 $storedSchedule = getLatestSchedule();
 check($storedSchedule['groups'] == $groups, 'saved schedule groups round-trip identically (used for run.php\'s no-op diff)');
 check($storedSchedule['for_date'] === '2026-01-05', 'for_date round-trips');
+check($storedSchedule['explanations'] === $schedule['explanations'], 'saved explanations round-trip in the same order as their groups');
 
 @unlink($testDbPath);
 

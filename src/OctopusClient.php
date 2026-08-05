@@ -16,7 +16,11 @@ class OctopusClient
 
     /**
      * @return array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, rate: float}>
-     *         48 half-hour slots, ascending by start time, rate in pence/kWh inc. VAT.
+     *         Up to 48 half-hour slots, ascending by start time, rate in pence/kWh inc. VAT.
+     *         Can return fewer than 48 (even 0) — Octopus's published horizon sometimes lags
+     *         the last hour or so of "today" too, not just an unpublished "tomorrow". Callers
+     *         decide what "not enough" means (see PriceProvider); this method just fetches
+     *         and parses whatever currently exists.
      */
     public function fetchRatesForDate(string $productCode, string $tariffCode, DateTimeImmutable $localDate): array
     {
@@ -52,12 +56,12 @@ class OctopusClient
         usort($slots, fn($a, $b) => $a['from'] <=> $b['from']);
 
         if (count($slots) < 48) {
-            $this->logger->warn(sprintf(
-                'Octopus returned %d slots for %s, expected 48 (rates likely not published yet)',
-                count($slots),
-                $localDate->format('Y-m-d'),
-            ));
-            throw new OctopusFetchException(sprintf('Incomplete rate data: got %d/48 slots', count($slots)));
+            // Not necessarily a problem — Octopus's publish horizon can lag by an hour or two
+            // even for "today" (confirmed live: the API's own count/next/previous fields show
+            // no pagination involved, it genuinely just hasn't published the last slot or two
+            // yet). Missing slots simply stay on SelfUse until a later run has full data for
+            // them. Only a caller seeing zero usable slots should treat this as a failure.
+            $this->logger->warn(sprintf('Octopus returned %d/48 slots for %s', count($slots), $localDate->format('Y-m-d')));
         }
 
         return $slots;

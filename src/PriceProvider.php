@@ -66,7 +66,14 @@ class PriceProvider
             throw new OctopusFetchException("$kind price mode is 'api' but no Octopus product/tariff code is configured for it");
         }
 
-        return $this->octopus->fetchRatesForDate($productCode, $tariffCode, $localDate);
+        $slots = $this->octopus->fetchRatesForDate($productCode, $tariffCode, $localDate);
+        if ($slots === []) {
+            // OctopusClient no longer treats a partial day as fatal — this is the one case
+            // that genuinely means "nothing usable", so it's where resolve() draws the line.
+            throw new OctopusFetchException("No $kind rates published yet for " . $localDate->format('Y-m-d'));
+        }
+
+        return $slots;
     }
 
     /** @return array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, rate: float}> */

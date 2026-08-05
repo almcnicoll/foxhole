@@ -35,9 +35,11 @@ function runScheduler(bool $dryRun): array
         // normal case — cron runs once, after publish, to set up the next day)
         // but fall back to today if they're not out yet, so a run before ~16:00,
         // or a missed run catching up, still does something useful instead of
-        // just failing. Today's rates are always fully published by definition
-        // (they were "tomorrow" yesterday), so this fallback can't itself fail
-        // for the same reason.
+        // just failing. This fallback only itself fails if today comes back
+        // completely empty, which in practice hasn't been observed — Octopus's
+        // published horizon can still lag by an hour or two even for "today"
+        // (see OctopusClient/PriceProvider), but a partial day is usable, not
+        // a failure: it's just built with whatever slots exist.
         try {
             $targetDate = $tomorrow;
             $slots = $priceProvider->resolveImport($targetDate);
@@ -47,34 +49,49 @@ function runScheduler(bool $dryRun): array
             $slots = $priceProvider->resolveImport($targetDate);
         }
 
-        // Export prices are informational (dashboard only — ScheduleBuilder doesn't
-        // use them), so a failure here shouldn't block the import/schedule/push path
-        // that actually matters. Store null for the run rather than aborting it.
+        // Export prices feed ScheduleBuilder's arbitrage/discharge logic, but a failure
+        // here shouldn't block the import/schedule/push path that matters more — store
+        // null for the run rather than aborting it. Aligned to import by timestamp
+        // rather than requiring equal counts: import is now often a same-day *prefix*
+        // of a full 48 (partial-day data, see OctopusClient) while fixed-mode export is
+        // always a clean 48, so raw counts routinely differ even when every import slot
+        // does have a matching export entry. Matched via getTimestamp(), not a formatted
+        // string — OctopusClient's slots are UTC, fixed-mode slots are the configured
+        // local timezone, so the same instant can format differently between the two.
         $exportSlots = null;
         try {
             $candidate = $priceProvider->resolveExport($targetDate);
-            if (count($candidate) === count($slots)) {
-                $exportSlots = $candidate;
+            $exportByTime = [];
+            foreach ($candidate as $exportSlot) {
+                $exportByTime[$exportSlot['from']->getTimestamp()] = $exportSlot;
+            }
+            $aligned = [];
+            foreach ($slots as $importSlot) {
+                $match = $exportByTime[$importSlot['from']->getTimestamp()] ?? null;
+                if ($match === null) {
+                    $aligned = null;
+                    break;
+                }
+                $aligned[] = $match;
+            }
+            if ($aligned !== null) {
+                $exportSlots = $aligned;
             } else {
-                $logger->warn(sprintf(
-                    'Export price slot count (%d) does not match import (%d), storing without export prices.',
-                    count($candidate),
-                    count($slots),
-                ));
+                $logger->warn('Export price slots do not fully cover the import slots for this run, storing without export prices.');
             }
         } catch (OctopusFetchException $e) {
             $logger->warn('Export price fetch failed, storing without export prices: ' . $e->getMessage());
         }
 
         $costBasis = (new CostBasisProvider($config['cost_basis']))->getCostBasis(count($slots));
-        $schedule = (new ScheduleBuilder($config['strategy'], $config['battery']))->build($slots, $costBasis);
+        $schedule = (new ScheduleBuilder($config['strategy'], $config['battery']))->build($slots, $exportSlots, $costBasis);
         $now = new DateTimeImmutable('now', $timezone);
 
         // Rates are worth recording even in a dry run — it's what powers the dashboard.
         saveRateSlots($slots, $exportSlots, $now);
 
         if ($dryRun) {
-            $message = 'Dry run for ' . $targetDate->format('Y-m-d') . ': ' . count($schedule['groups']) . ' group(s), not pushed.';
+            $message = 'Dry run for ' . $targetDate->format('Y-m-d') . ': ' . count($schedule['groups']) . ' group(s), not pushed. ' . $schedule['summary'];
             $logger->info($message);
             return ['ok' => true, 'dryRun' => true, 'message' => $message, 'schedule' => $schedule];
         }
@@ -94,12 +111,14 @@ function runScheduler(bool $dryRun): array
         $foxess = new FoxessClient($apiKey, $deviceSn, $config['foxess']['base_url']);
         $foxess->pushSchedule($schedule['groups']);
 
-        saveSchedule($targetDate->format('Y-m-d'), $schedule['groups'], $now);
+        saveSchedule($targetDate->format('Y-m-d'), $schedule['groups'], $schedule['explanations'], $now);
+        setSetting('schedule_summary', $schedule['summary']);
         $message = sprintf(
-            'Pushed schedule for %s: %d group(s), %d FoxESS API call(s) this run.',
+            'Pushed schedule for %s: %d group(s), %d FoxESS API call(s) this run. %s',
             $targetDate->format('Y-m-d'),
             count($schedule['groups']),
             $foxess->callCount(),
+            $schedule['summary'],
         );
         $logger->info($message);
         return ['ok' => true, 'dryRun' => false, 'message' => $message, 'schedule' => $schedule];

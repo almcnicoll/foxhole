@@ -15,7 +15,10 @@ reprioritised.
       [CLAUDE.md](CLAUDE.md#decisions-made-while-building-things-the-spec-left-open)
       re: the region-letter fix) and `cost_basis.fixed_pence_per_kwh`.
 - [ ] Run `php run.php --dry-run` and sanity-check the printed schedule
-      against a day of real rates.
+      *and its explanations* against a day of real rates — the scheduling
+      algorithm changed substantially (arbitrage, export-peak discharge,
+      pre-peak charging preference) and is worth a skim before it's making
+      real decisions with real money.
 - [ ] Do one manual live push, then check `index.php` (or
       `FoxessClient::getSchedule()`/the FoxESS app) to confirm `fdSoc`/`fdPwr`
       actually behave as this build assumes — that mapping is inferred, not
@@ -70,13 +73,16 @@ commitment, just a starting point for prioritisation:
    would be the likely dependency.
 3. **Load-aware scheduling.** Similar idea, using historical/forecast
    household load instead of (or alongside) solar forecast.
-4. **Export-price-aware discharge scheduling.** `rate_slots.export_rate_pence`
-   is tracked and shown on the dashboard, but `ScheduleBuilder` still picks
-   discharge slots purely by import price being high — it doesn't know export
-   even exists. A genuinely profit-aware discharge decision (compare battery
-   cost-of-charge against the export price you'd actually be paid) is a real
-   algorithm change, not a config tweak — worth doing once the price data has
-   been live long enough to sanity-check against.
+4. **Live battery SoC awareness.** `ScheduleBuilder` now reasons about both
+   import and export price (arbitrage, export-peak discharge, pre-peak
+   charging — see CLAUDE.md), but has no idea how full the battery actually
+   is: charge/discharge slot counts are still plain config caps, not bounded
+   by a real energy balance. FoxESS's `real/query` endpoint (mentioned in the
+   spec, unused so far) could supply actual current SoC; the natural next
+   step is fetching it at the start of a run and simulating a running kWh
+   balance through the day, so discharge can't promise to sell more than the
+   battery will actually hold. Worth doing once the price-only version has
+   been live long enough to see whether this gap matters in practice.
 5. **Multi-inverter support.** No current need (single inverter). Would mean
    the `settings` table gaining a device selector and `run.php` looping —
    not worth building until there's a second inverter.
