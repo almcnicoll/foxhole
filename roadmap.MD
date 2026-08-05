@@ -49,6 +49,53 @@ reprioritised.
 
 ## Near-term
 
+- **Today/Tomorrow fix** — needed before cron is scheduled to run more than
+  once a day (the plan is every ~4h). FoxESS's scheduler endpoint has no
+  date field, only recurring hour/minute windows (see CLAUDE.md) — the
+  inverter just matches time-of-day against whatever was last pushed, with
+  no idea which calendar day it's actually in. `schedule_groups` currently
+  holds exactly one plan, replaced whole on every push
+  (`Store::saveSchedule()`'s `DELETE FROM ...`, see CLAUDE.md's "Data
+  storage" section) — fine for a once-daily cron run, but wrong under a
+  more frequent one: when Octopus's rates for the next day land (~16:00-
+  17:00) and a run computes and pushes that plan, the push today currently
+  overwrites the recurring schedule for the *whole day*, including hours
+  still left in *today* — silently replacing today's already-correct,
+  already-running decisions with tomorrow's for the rest of today.
+
+  Roughly:
+  1. Keep at least two schedules in storage at once, keyed by an explicit
+     `for_date` rather than the current single-row "latest" table.
+     `schedule_groups`'s schema and `Store::saveSchedule()`/
+     `getLatestSchedule()` all assume one live plan; needs to become "one
+     plan per date, at least two retained" (today's + tomorrow's — prune
+     once a date has fully passed).
+  2. A push must be a *splice*, not a straight overwrite, whenever both a
+     stored today-plan and freshly-computed tomorrow data exist: today's
+     plan for the remaining hours of today, followed by tomorrow's plan
+     from midnight — encoded as one set of recurring hour/minute groups,
+     since that's all the device understands. Example: a push at 18:00 on
+     2026-01-01 should push 2026-01-01's own plan for 18:00-23:30 plus
+     2026-01-02's plan for 00:00-17:30 — not all the way to 23:30. The
+     splice only needs to reach as far as the *next* scheduled run (~4h
+     out), since that run will recompute and re-push the boundary anyway;
+     pushing a full 24h of "tomorrow" would bake in decisions a later run
+     this cycle might legitimately want to revise (e.g. an override added
+     for later in the day).
+  3. Because runs happen every ~4h, the inverter should always be within
+     one run-interval of running the *correct* day's schedule — worth an
+     explicit check (or a self_check assertion) that a run's splice point
+     never falls in the past by the time the next run is actually due.
+
+  Touches `Store.php` (schema + functions), `Runner.php` (splice logic
+  before push), and probably reuses `ScheduleBuilder::applyOverrides()`'s
+  interval-subtraction machinery — splicing today's tail onto tomorrow's
+  head is the same kind of interval overlay overrides already do, just
+  keyed by date instead of override kind. The no-op push diff in
+  `runScheduler()` (`$schedule['groups'] == getLatestSchedule()['groups']`)
+  will also need to compare against the *spliced* result, not a single
+  date's plan, or it'll misfire.
+
 - **Flux cost-basis mode.** `CostBasisProvider`'s `octopus_product` branch is
   a stub (throws on purpose). Implement once Flux is actually live on the
   account: fetch Flux's own rate structure, confirm whether it's genuinely
