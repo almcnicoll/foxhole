@@ -1,6 +1,7 @@
 <?php
 
-function renderHeader(string $title, bool $showNav = true): void
+/** $headerExtra is raw HTML (caller escapes any dynamic text itself), rendered top-right of the title. */
+function renderHeader(string $title, bool $showNav = true, string $headerExtra = ''): void
 {
     ?><!doctype html>
 <html lang="en">
@@ -28,6 +29,13 @@ function renderHeader(string $title, bool $showNav = true): void
   .notice { color: #1a7f37; }
   .muted { color: #888; font-size: 0.85rem; }
   fieldset { display: flex; flex-direction: column; gap: 0.6rem; border: 1px solid #8883; border-radius: 6px; padding: 0.8rem; }
+  .page-header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }
+  .page-header h1 { margin: 0; }
+  .battery-status { display: flex; gap: 1rem; flex-wrap: wrap; }
+  .battery-item { display: flex; align-items: center; gap: 0.4rem; font-size: 0.85rem; }
+  .battery-item progress { width: 60px; height: 10px; }
+  .slot-columns { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+  .slot-columns table { flex: 1; min-width: 260px; }
 </style>
 </head>
 <body>
@@ -38,7 +46,10 @@ function renderHeader(string $title, bool $showNav = true): void
   <a href="logout.php">Log out</a>
 </nav>
 <?php endif; ?>
-<h1><?= htmlspecialchars($title) ?></h1>
+<div class="page-header">
+  <h1><?= htmlspecialchars($title) ?></h1>
+  <?= $headerExtra ?>
+</div>
     <?php
 }
 

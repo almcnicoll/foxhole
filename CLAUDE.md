@@ -195,16 +195,26 @@ No JS framework, inline CSS via `src/Layout.php`:
 - **`index.php`** — reads the latest `rate_slots` + `schedule_groups`,
   resolves each half-hour slot's mode by checking which schedule group (if
   any) its local start time falls in (`slotWorkMode()` in `index.php`), and
-  renders one unified table. Deliberately merges prices and schedule into a
-  single view rather than two separate tables — that merge *is* the
-  "quick glance" the UI exists for. Below that, a "Why these decisions?"
-  section lists the day summary (`settings.schedule_summary`) and each
-  group's stored explanation, in the same order as the schedule table reads
-  top-to-bottom. Also has the "Run now" button (a plain POST form to
-  `run-now.php`) and, after that redirects back, a result banner read from
-  `?ran=1&ok=…&msg=…` — no session flash-message plumbing,
-  just query-string state, which is enough for a once-in-a-while manual
-  action.
+  renders one unified table, split into two side-by-side columns
+  (`renderSlotTable()` called twice — 00:00–11:30 and 12:00–23:30, split by
+  local hour, not array index, since a partial day's slots aren't always
+  exactly 48) via the `.slot-columns` flex layout in `Layout.php`.
+  Deliberately merges prices and schedule into a single view rather than
+  further-separate tables — that merge *is* the "quick glance" the UI exists
+  for. A "Why these decisions?" section (day summary from
+  `settings.schedule_summary` + each group's stored explanation) renders
+  *above* the slot tables, not below — user-requested, so the reasoning
+  reads before the data it explains rather than after. Also has the "Run
+  now" button (a plain POST form to `run-now.php`) and, after that redirects
+  back, a result banner read from `?ran=1&ok=…&msg=…` — no session
+  flash-message plumbing, just query-string state, which is enough for a
+  once-in-a-while manual action. Top-right of the page header: one battery
+  indicator per configured device serial (`renderBatteryStatus()`, native
+  `<progress>` element — no chart library, no custom SVG, "native platform
+  feature" was enough), passed into `renderHeader()`'s new optional
+  `$headerExtra` slot rather than hardcoded into the shared header, so other
+  pages can use the same slot later without index.php-specific code leaking
+  into `Layout.php`.
 - **`settings.php`** — FoxESS `api_key`/`device_sns` (pre-filled from
   `Store`, plain text — the user themself set them, no reason to hide them
   from themself; `device_sns` is a `<textarea>`, one serial per line — see
@@ -349,20 +359,39 @@ direct translation of a specific ask:
   variability check is what decides which ranking key is used, not just
   whether export data exists at all.
 
-**No live battery SoC — the "spare energy" question is decided by battery
-capacity/power maths, not tracked state.** The FoxESS API isn't queried for
-the inverter's actual current charge level anywhere in this app (the spec's
-`real/query` endpoint that could provide it is unused). `ScheduleBuilder`
-doesn't track a running kWh balance across the day either. Both charge and
-discharge slot counts are still capped by the plain `cheap_slots_to_charge`/
-`expensive_slots_to_export` config values (see "cheap_slots_to_charge is a
-plain config cap" above) — there's no check that discharge slots don't
-promise to export more energy than was actually charged. In practice this
-mostly self-corrects (Agile's daily shape means cheap import and expensive
-export rarely swap places), and FoxESS's own firmware will just discharge
-whatever's actually available rather than erroring — but if this ever needs
-tightening, fetching real SoC via `real/query` and simulating a running
+**No live battery SoC *in the scheduling algorithm* — the "spare energy"
+question is still decided by battery capacity/power maths, not tracked
+state.** `real/query` is now called (see `FoxessClient::getBatterySoc()` and
+"Dashboard battery display" below), but only for the dashboard — `Runner.php`
+never reads it, and `ScheduleBuilder` still doesn't track a running kWh
+balance across the day. Both charge and discharge slot counts are still
+capped by the plain `cheap_slots_to_charge`/`expensive_slots_to_export`
+config values (see "cheap_slots_to_charge is a plain config cap" above) —
+there's no check that discharge slots don't promise to export more energy
+than was actually charged. In practice this mostly self-corrects (Agile's
+daily shape means cheap import and expensive export rarely swap places), and
+FoxESS's own firmware will just discharge whatever's actually available
+rather than erroring — but if this ever needs tightening, feeding
+`getBatterySoc()`'s result into `runScheduler()` and simulating a running
 balance through the day is the natural next step. Flagged in roadmap.MD.
+
+**Dashboard battery display: `SoC`/`SoC_1` field names are a best-effort
+guess, not confirmed against FoxESS's own docs** — same caveat as `fdSoc`/
+`fdPwr` above. Confirmed via community reference implementations
+(`TonyM1958/FoxESS-Cloud`'s `battery_vars`), not official documentation:
+single-battery inverters report the variable `SoC`, multi-battery ones report
+`SoC_1`/`SoC_2`/etc per battery. `getBatterySoc()` requests both `SoC` and
+`SoC_1` and returns whichever the device actually sends — reasonable enough
+for the common case (one battery per inverter, which is what both of the
+configured devices are), but wouldn't surface a second/third battery on a
+multi-battery inverter individually. `index.php` calls this once per
+configured device serial on every dashboard load — a live network call, not
+cached — and shows "unavailable" rather than breaking the page if it fails
+or times out; the rest of the dashboard is local SQLite reads and shouldn't
+depend on FoxESS being reachable. No caching layer for v1, consistent with
+this app's general "simplest thing that works" bias — worth adding if
+dashboard load time or FoxESS API quota ever becomes a real problem, but
+1,440 calls/day/device makes that unlikely for a personal dashboard.
 
 **Explanations are generated from the same reason data used to select slots,
 not re-derived from raw numbers after the fact.** `ScheduleBuilder::build()`

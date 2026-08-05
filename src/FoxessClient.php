@@ -43,6 +43,27 @@ class FoxessClient
         return $this->post('/op/v1/device/real/query', ['sns' => [$this->deviceSn]]);
     }
 
+    /**
+     * Current battery state of charge (0-100), or null if this device didn't report one.
+     * Field name per community reference implementations: 'SoC' for a single battery,
+     * 'SoC_1' for the first battery on a multi-battery inverter — not in FoxESS's own
+     * docs, so both are requested and whichever is present wins. See CLAUDE.md.
+     */
+    public function getBatterySoc(): ?float
+    {
+        $response = $this->post('/op/v1/device/real/query', [
+            'sns' => [$this->deviceSn],
+            'variables' => ['SoC', 'SoC_1'],
+        ]);
+        $datas = $response['result'][0]['datas'] ?? [];
+        foreach ($datas as $entry) {
+            if (in_array($entry['variable'] ?? null, ['SoC', 'SoC_1'], true)) {
+                return (float) $entry['value'];
+            }
+        }
+        return null;
+    }
+
     private function post(string $path, array $body, bool $isRetry = false): array
     {
         $this->callCount++;
