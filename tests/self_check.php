@@ -9,6 +9,8 @@ require_once __DIR__ . '/../src/CostBasisProvider.php';
 require_once __DIR__ . '/../src/ScheduleBuilder.php';
 require_once __DIR__ . '/../src/Logger.php';
 require_once __DIR__ . '/../src/Store.php';
+require_once __DIR__ . '/../src/OctopusClient.php';
+require_once __DIR__ . '/../src/PriceProvider.php';
 
 $failures = 0;
 $checks = 0;
@@ -132,13 +134,43 @@ check(verifySystemPassword('a-real-password') === true, 'new password verifies c
 check(verifySystemPassword('a-real-password ') === false, 'password check is exact, not trimmed/fuzzy');
 
 $fetchedAt = new DateTimeImmutable('2026-01-04 16:00:00', new DateTimeZone('UTC'));
-saveRateSlots(buildSlots(array_fill(0, 4, 20.0)), $fetchedAt);
+saveRateSlots(buildSlots(array_fill(0, 4, 20.0)), buildSlots(array_fill(0, 4, 12.0)), $fetchedAt);
 $storedSlots = getLatestRateSlots();
 check(count($storedSlots) === 4, 'saved rate slots round-trip at the right count');
-check($storedSlots[0]['rate'] === 20.0, 'rate value round-trips');
+check($storedSlots[0]['import_rate'] === 20.0, 'import rate value round-trips');
+check($storedSlots[0]['export_rate'] === 12.0, 'export rate value round-trips');
 check($storedSlots[0]['fetched_at']->format(DATE_ATOM) === $fetchedAt->format(DATE_ATOM), 'fetched_at round-trips');
-saveRateSlots(buildSlots(array_fill(0, 2, 15.0)), $fetchedAt);
-check(count(getLatestRateSlots()) === 2, 'saving new rate slots replaces the old batch, not appends');
+saveRateSlots(buildSlots(array_fill(0, 2, 15.0)), null, $fetchedAt);
+$noExportSlots = getLatestRateSlots();
+check(count($noExportSlots) === 2, 'saving new rate slots replaces the old batch, not appends');
+check($noExportSlots[0]['export_rate'] === null, 'a null export batch stores null export prices rather than stale ones');
+
+// --- PriceProvider: fixed mode (default + override), api mode without a configured product/tariff ---
+$priceLogger = new Logger(sys_get_temp_dir() . '/foxhole_self_check_' . getmypid() . '.log');
+$priceProvider = new PriceProvider(new OctopusClient($priceLogger), ['product_code' => null, 'tariff_code' => null]);
+$aDay = new DateTimeImmutable('2026-01-05', new DateTimeZone('Europe/London'));
+
+$exportDefault = $priceProvider->resolveExport($aDay);
+check(count($exportDefault) === 48, 'export resolves 48 slots by default (fixed mode)');
+check($exportDefault[0]['rate'] === 12.0, 'export defaults to 12p/kWh fixed when nothing is configured');
+check($exportDefault[0]['from']->format('H:i') === '00:00', 'fixed-mode slots start at local midnight');
+check($exportDefault[47]['to']->format('H:i') === '00:00', 'fixed-mode slots cover a full day, last slot ends at midnight');
+
+setSetting('export_price_mode', 'fixed');
+setSetting('export_price_fixed_pence', '7.5');
+check($priceProvider->resolveExport($aDay)[0]['rate'] === 7.5, 'export fixed price is overrideable via settings');
+
+try {
+    $priceProvider->resolveImport($aDay);
+    check(false, "import mode 'api' with no product/tariff code configured should throw");
+} catch (OctopusFetchException $e) {
+    check(true, "import mode 'api' with no product/tariff code configured throws a clear error, not a crash");
+}
+
+setSetting('import_price_mode', 'fixed');
+setSetting('import_price_fixed_pence', '20');
+$importFixed = $priceProvider->resolveImport($aDay);
+check(count($importFixed) === 48 && $importFixed[0]['rate'] === 20.0, 'import can be switched to fixed mode too, bypassing Octopus entirely');
 
 $pushedAt = new DateTimeImmutable('2026-01-04 17:00:00', new DateTimeZone('UTC'));
 saveSchedule('2026-01-05', $groups, $pushedAt);

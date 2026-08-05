@@ -35,6 +35,10 @@ reprioritised.
 - [ ] Put the site behind HTTPS at the host level — the login/settings forms
       submit the system password and API key in cleartext otherwise. This
       app doesn't force an HTTPS redirect itself (see CLAUDE.md).
+- [ ] Confirm your actual export/sale tariff rate at `settings.php` — it
+      defaults to a fixed 12p/kWh, which may not match your real contract.
+      If you're on Agile Outgoing instead of a flat export rate, switch
+      export price source to "Octopus Agile (API)" there.
 
 ## Near-term
 
@@ -66,10 +70,17 @@ commitment, just a starting point for prioritisation:
    would be the likely dependency.
 3. **Load-aware scheduling.** Similar idea, using historical/forecast
    household load instead of (or alongside) solar forecast.
-4. **Multi-inverter support.** No current need (single inverter). Would mean
+4. **Export-price-aware discharge scheduling.** `rate_slots.export_rate_pence`
+   is tracked and shown on the dashboard, but `ScheduleBuilder` still picks
+   discharge slots purely by import price being high — it doesn't know export
+   even exists. A genuinely profit-aware discharge decision (compare battery
+   cost-of-charge against the export price you'd actually be paid) is a real
+   algorithm change, not a config tweak — worth doing once the price data has
+   been live long enough to sanity-check against.
+5. **Multi-inverter support.** No current need (single inverter). Would mean
    the `settings` table gaining a device selector and `run.php` looping —
    not worth building until there's a second inverter.
-5. **Login hardening** (rate limiting / lockout on `login.php`, CSRF token on
+6. **Login hardening** (rate limiting / lockout on `login.php`, CSRF token on
    `settings.php` and `run-now.php`). Skipped deliberately for a single-user
    tool behind a password wall — revisit if this is ever exposed somewhere
    less trusted. `run-now.php` is the higher-priority one of the two if this

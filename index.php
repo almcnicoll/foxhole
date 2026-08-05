@@ -58,7 +58,7 @@ $ranMsg = (string) ($_GET['msg'] ?? '');
   </p>
 
   <table>
-    <thead><tr><th>Time</th><th>Rate (p/kWh)</th><th>Mode</th></tr></thead>
+    <thead><tr><th>Time</th><th>Import (p/kWh)</th><th>Export (p/kWh)</th><th>Mode</th></tr></thead>
     <tbody>
     <?php foreach ($slots as $slot):
         $localFrom = $slot['from']->setTimezone($timezone);
@@ -68,7 +68,8 @@ $ranMsg = (string) ($_GET['msg'] ?? '');
     ?>
       <tr>
         <td><?= htmlspecialchars($localFrom->format('H:i')) ?>–<?= htmlspecialchars($localTo->format('H:i')) ?></td>
-        <td><?= htmlspecialchars(number_format($slot['rate'], 2)) ?></td>
+        <td><?= htmlspecialchars(number_format($slot['import_rate'], 2)) ?></td>
+        <td><?= $slot['export_rate'] !== null ? htmlspecialchars(number_format($slot['export_rate'], 2)) : '—' ?></td>
         <td><span class="badge badge-<?= htmlspecialchars($mode) ?>"><?= htmlspecialchars($mode) ?></span></td>
       </tr>
     <?php endforeach; ?>

@@ -29,11 +29,21 @@ function db(?string $overridePath = null): PDO
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     )');
+    // rate_slots gained a second price column (export) and dropped the old
+    // single `rate_pence` column. The table is always fully replaced on every
+    // fetch anyway (see saveRateSlots) — nothing worth migrating — so on the
+    // old schema just drop and recreate rather than building a migration
+    // system for one rename.
+    $hasOldSchema = (int) $pdo->query("SELECT COUNT(*) FROM pragma_table_info('rate_slots') WHERE name = 'rate_pence'")->fetchColumn();
+    if ($hasOldSchema > 0) {
+        $pdo->exec('DROP TABLE rate_slots');
+    }
     $pdo->exec('CREATE TABLE IF NOT EXISTS rate_slots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         slot_from TEXT NOT NULL,
         slot_to TEXT NOT NULL,
-        rate_pence REAL NOT NULL,
+        import_rate_pence REAL NOT NULL,
+        export_rate_pence REAL,
         fetched_at TEXT NOT NULL
     )');
     $pdo->exec('CREATE TABLE IF NOT EXISTS schedule_groups (
@@ -68,32 +78,39 @@ function setSetting(string $key, string $value): void
     $stmt->execute(['key' => $key, 'value' => $value]);
 }
 
-/** @param array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, rate: float}> $slots */
-function saveRateSlots(array $slots, DateTimeImmutable $fetchedAt): void
+/**
+ * @param array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, rate: float}> $importSlots
+ * @param ?array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, rate: float}> $exportSlots
+ *        same length/order as $importSlots, or null if export prices couldn't be resolved this run
+ *        (stored as NULL per row rather than blocking the import/schedule/push path — see Runner.php)
+ */
+function saveRateSlots(array $importSlots, ?array $exportSlots, DateTimeImmutable $fetchedAt): void
 {
     $pdo = db();
     $pdo->beginTransaction();
     $pdo->exec('DELETE FROM rate_slots');
-    $stmt = $pdo->prepare('INSERT INTO rate_slots (slot_from, slot_to, rate_pence, fetched_at) VALUES (?, ?, ?, ?)');
-    foreach ($slots as $slot) {
+    $stmt = $pdo->prepare('INSERT INTO rate_slots (slot_from, slot_to, import_rate_pence, export_rate_pence, fetched_at) VALUES (?, ?, ?, ?, ?)');
+    foreach ($importSlots as $i => $slot) {
         $stmt->execute([
             $slot['from']->format(DATE_ATOM),
             $slot['to']->format(DATE_ATOM),
             $slot['rate'],
+            $exportSlots[$i]['rate'] ?? null,
             $fetchedAt->format(DATE_ATOM),
         ]);
     }
     $pdo->commit();
 }
 
-/** @return array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, rate: float, fetched_at: DateTimeImmutable}> */
+/** @return array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, import_rate: float, export_rate: ?float, fetched_at: DateTimeImmutable}> */
 function getLatestRateSlots(): array
 {
     $rows = db()->query('SELECT * FROM rate_slots ORDER BY slot_from ASC')->fetchAll(PDO::FETCH_ASSOC);
     return array_map(fn($row) => [
         'from' => new DateTimeImmutable($row['slot_from']),
         'to' => new DateTimeImmutable($row['slot_to']),
-        'rate' => (float) $row['rate_pence'],
+        'import_rate' => (float) $row['import_rate_pence'],
+        'export_rate' => $row['export_rate_pence'] !== null ? (float) $row['export_rate_pence'] : null,
         'fetched_at' => new DateTimeImmutable($row['fetched_at']),
     ], $rows);
 }

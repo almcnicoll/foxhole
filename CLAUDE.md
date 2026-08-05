@@ -40,6 +40,7 @@ src/
   Auth.php              # session-based login gate, built on Store's password check
   Layout.php             # shared HTML header/footer for the web pages
   OctopusClient.php     # fetches half-hourly rates from api.octopus.energy (fetch/parse only, no storage)
+  PriceProvider.php     # resolves import/export prices, per-side API-vs-fixed (settings.php)
   CostBasisProvider.php # resolves the "worth charging below this" reference price
   ScheduleBuilder.php   # rates + cost basis -> FoxESS scheduler groups
   FoxessClient.php      # signs + sends requests to the FoxESS OpenAPI
@@ -72,15 +73,22 @@ a migration system (the schema is small and stable enough that idempotent
 DDL is simpler than tracking migrations).
 
 - **`settings`** — plain key/value (`key TEXT PRIMARY KEY, value TEXT`).
-  Holds `foxess_api_key`, `foxess_device_sn`, `system_password_hash`. A
+  Holds `foxess_api_key`, `foxess_device_sn`, `system_password_hash`,
+  `{import,export}_price_mode`, `{import,export}_price_fixed_pence`. A
   key/value table was chosen over typed columns because the set of "small
   bits of config the UI can edit" is exactly the kind of thing that grows
   over time (see roadmap) — a new setting is a new row, not a migration.
-- **`rate_slots`** — the latest Octopus fetch. `saveRateSlots()` deletes and
-  re-inserts on every call, mirroring the old `last_rates.json`
-  latest-fetch-only semantics. It is *not* an accumulating history table,
-  even though nothing would break if it were — don't repurpose it as one
-  without deciding on retention first (see roadmap's history/reporting item).
+- **`rate_slots`** — the latest fetch, both `import_rate_pence` (purchase)
+  and `export_rate_pence` (sale, nullable — see `PriceProvider` below).
+  `saveRateSlots()` deletes and re-inserts on every call, mirroring the old
+  `last_rates.json` latest-fetch-only semantics. It is *not* an accumulating
+  history table, even though nothing would break if it were — don't
+  repurpose it as one without deciding on retention first (see roadmap's
+  history/reporting item). This table's disposability is also why its one
+  schema change so far (splitting `rate_pence` into two columns) was handled
+  as a guarded `DROP TABLE` + recreate in `Store::db()` rather than a real
+  migration — there's never anything in it worth preserving across a schema
+  change.
 - **`schedule_groups`** — the latest schedule actually pushed to FoxESS.
   Same replace-not-append pattern. This is also what `run.php` diffs the
   freshly-computed schedule against to decide whether to skip a no-op push.
@@ -102,10 +110,14 @@ and lets the caller decide what to do with that (an exit code for cron, an
 on-screen message for the UI).
 
 1. Load `config.php` (non-secret tunables only — see Config & secrets below).
-2. `OctopusClient::fetchRatesForDate()` — GET rates for tomorrow (local
-   midnight-to-midnight, converted to UTC for the API query). Throws
-   `OctopusFetchException` on transport failure *or* on fewer than 48 slots
-   (rates not fully published yet).
+2. `PriceProvider::resolveImport()` — tries **tomorrow** first (local
+   midnight-to-midnight); if that throws `OctopusFetchException` (transport
+   failure, or fewer than 48 slots because Agile hasn't published yet), logs
+   an INFO line and retries for **today** instead. Today can't fail for the
+   "not published yet" reason — it was "tomorrow" as of yesterday's publish —
+   so this fallback is expected to succeed whenever tomorrow's don't exist
+   yet. Whichever date wins becomes `$targetDate` for the rest of the run.
+   See "Either side of midnight" below for why this exists.
 3. `saveRateSlots()` — persisted to SQLite immediately, even in `--dry-run`
    (it's just a record of what was fetched, and it's what powers the
    dashboard).
@@ -181,9 +193,11 @@ No JS framework, inline CSS via `src/Layout.php`:
   action.
 - **`settings.php`** — FoxESS `api_key`/`device_sn` (pre-filled from
   `Store`, plain text — the user themself set them, no reason to hide them
-  from themself) and an optional password change (blank = unchanged,
-  8-char minimum, must be confirmed twice). No CSRF token — same reasoning
-  as the brute-force point above.
+  from themself), import/export price source (API vs. fixed pence/kWh, one
+  `<select>` + one `<input>` per side, no JS toggling — the fixed-price input
+  is simply ignored server-side when mode is `api`), and an optional password
+  change (blank = unchanged, 8-char minimum, must be confirmed twice). No
+  CSRF token — same reasoning as the brute-force point above.
 
 Auth is a native PHP session (`src/Auth.php`, `session_start()` +
 `$_SESSION['authed']`) — no token store, no "remember me," nothing custom.
@@ -196,6 +210,45 @@ much to assume one). Put it behind HTTPS at the host level; don't rely on
 this app for that.
 
 ## Decisions made while building (things the spec left open)
+
+**Either side of midnight: tomorrow-first, today-as-fallback.** User-requested
+change from the original "always target tomorrow" behaviour. `runScheduler()`
+tries tomorrow, and on any `OctopusFetchException` (almost always "not
+published yet" — Agile publishes ~16:00) retries the whole fetch for today
+instead. This is what makes "Run now" actually useful for daytime testing
+(previously it just failed with "not published yet" any time before ~16:00,
+which was most of the day), and means a missed cron run gets caught up
+automatically next time cron *does* fire, rather than silently doing nothing
+until the following evening. The fallback can't itself hit the "not
+published" failure — today's rates were "tomorrow" as of yesterday's publish,
+so by definition they're already complete by the time today exists.
+
+One cosmetic side effect worth knowing about: `schedule_groups.for_date` only
+updates when a push actually happens — if a same-day fallback push and a
+later proper tomorrow-targeted push produce byte-identical groups (a real
+possibility, since FoxESS's own schedule payload has no date field, just
+recurring hour/minute windows), the second run's diff-against-`getLatestSchedule()`
+sees no change and skips, leaving `for_date` on the dashboard one day
+"behind" even though the inverter's actual applied schedule is correct
+either way. Not worth solving — it's a label, not a functional bug.
+
+**Export price failures don't block a push; import price failures do.**
+`PriceProvider::resolveImport()`/`resolveExport()` share the same API-vs-fixed
+logic, but `Runner.php` treats their failures very differently: import is on
+the critical path (`ScheduleBuilder` needs it) so an `OctopusFetchException`
+there aborts the run exactly like before this feature existed. Export is
+display-only right now — nothing in `ScheduleBuilder` reads it — so its
+failure is caught, logged as a WARN, and stored as `NULL` for that run rather
+than blocking the actual charge/discharge push. If export price ever starts
+feeding scheduling decisions (see roadmap), this asymmetry needs revisiting.
+
+**Export defaults to fixed 12p, import defaults to live Agile.** Matches
+reality for most FoxESS+Agile owners: dynamic import, flat export rate. Both
+are fully overridable independently via `settings.php` — flip either mode
+without touching the other. The Agile Outgoing product/tariff codes
+(`AGILE-OUTGOING-19-05-13` / `E-1R-AGILE-OUTGOING-19-05-13-C` for London) are
+confirmed live and wired up in `config.php`, but only get called if someone
+actually switches export to `api` mode.
 
 **FoxESS scheduler endpoint: v1, not v0 or v3.** Cross-checked the live
 FoxESS OpenAPI docs, the `foxesscommunity.com` forums, and existing

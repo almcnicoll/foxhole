@@ -4,6 +4,10 @@ return [
     'octopus' => [
         'product_code' => 'AGILE-24-10-01',        // confirm current live product code
         'tariff_code'  => 'E-1R-AGILE-24-10-01-C',  // region-specific GSP letter suffix, e.g. -C for London (A-P, not X — see CLAUDE.md)
+        // Only used when export_price_mode (settings.php) is 'api' instead of the
+        // default 'fixed' — Octopus's half-hourly outgoing (export/sale) tariff.
+        'export_product_code' => 'AGILE-OUTGOING-19-05-13',
+        'export_tariff_code'  => 'E-1R-AGILE-OUTGOING-19-05-13-C',
     ],
     'foxess' => [
         // api_key / device_sn are no longer set here — enter them via settings.php,
