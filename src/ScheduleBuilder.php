@@ -135,6 +135,114 @@ class ScheduleBuilder
     }
 
     /**
+     * Overlays Octopus "Fill your boots" / "Power down" overrides (Store::getOverridesForDate)
+     * onto an already-built schedule. Works in plain minutes-of-day rather than the half-hour
+     * rate-slot grid the rest of this class uses — override times are free-form <input type="time">
+     * values, not tied to Octopus's slot boundaries. Doesn't support a window spanning midnight
+     * (native time inputs can't express one anyway — max is 23:59).
+     *
+     * @param array $groups periodsToGroups()-shaped groups (no SelfUse entries — gaps are implicit SelfUse)
+     * @param string[] $explanations same length/order as $groups
+     * @param array $overrides rows from Store::getOverridesForDate()
+     * @return array{groups: array, explanations: string[]}
+     */
+    public function applyOverrides(array $groups, array $explanations, array $overrides, DateTimeZone $timezone): array
+    {
+        if (!$overrides) {
+            return ['groups' => $groups, 'explanations' => $explanations];
+        }
+
+        $intervals = [];
+        foreach ($groups as $i => $g) {
+            $intervals[] = [
+                'start' => $g['startHour'] * 60 + $g['startMinute'],
+                'end' => $g['endHour'] * 60 + $g['endMinute'],
+                'workMode' => $g['workMode'],
+                'explanation' => $explanations[$i] ?? '',
+            ];
+        }
+
+        foreach ($overrides as $override) {
+            $label = $override['kind'] === 'fill_your_boots' ? 'Fill your boots' : 'Power down';
+            $eventMode = $override['kind'] === 'fill_your_boots' ? 'ForceCharge' : 'ForceDischarge';
+            $prepMode = $eventMode === 'ForceCharge' ? 'ForceDischarge' : 'ForceCharge';
+
+            $windows = [];
+            if ($override['prep_start'] !== null && $override['prep_end'] !== null) {
+                $windows[] = [$override['prep_start'], $override['prep_end'], $prepMode, true];
+            }
+            $windows[] = [$override['event_start'], $override['event_end'], $eventMode, false];
+
+            foreach ($windows as [$startStr, $endStr, $mode, $isPrep]) {
+                $start = self::toMinutes($startStr);
+                $end = self::toMinutes($endStr);
+                if ($end <= $start) {
+                    continue; // invalid/empty window, ignore rather than corrupt the schedule
+                }
+                $modeLabel = $mode === 'ForceCharge' ? 'charging' : 'discharging';
+                $explanation = $isPrep
+                    ? sprintf('%s override: %s %s–%s to prepare.', $label, $modeLabel, $startStr, $endStr)
+                    : sprintf('%s override: %s %s–%s for Octopus\'s %s window.', $label, $modeLabel, $startStr, $endStr, $label);
+
+                $intervals = $this->subtractInterval($intervals, $start, $end);
+                $intervals[] = ['start' => $start, 'end' => $end, 'workMode' => $mode, 'explanation' => $explanation];
+            }
+        }
+
+        usort($intervals, fn($a, $b) => $a['start'] <=> $b['start']);
+
+        $chargeKw = (float) ($this->batteryConfig['max_charge_kw'] ?? 0);
+        $dischargeKw = (float) ($this->batteryConfig['max_discharge_kw'] ?? 0);
+        $minSocOnGrid = (int) ($this->batteryConfig['min_soc_on_grid'] ?? 0);
+        $reserveSoc = (int) ($this->batteryConfig['reserve_soc'] ?? 0);
+
+        $newGroups = [];
+        $newExplanations = [];
+        foreach ($intervals as $iv) {
+            $isCharge = $iv['workMode'] === 'ForceCharge';
+            $newGroups[] = [
+                'enable' => 1,
+                'startHour' => intdiv($iv['start'], 60),
+                'startMinute' => $iv['start'] % 60,
+                'endHour' => intdiv($iv['end'], 60),
+                'endMinute' => $iv['end'] % 60,
+                'workMode' => $iv['workMode'],
+                'minSocOnGrid' => $minSocOnGrid,
+                'fdSoc' => $isCharge ? 100 : $reserveSoc,
+                'fdPwr' => (int) round(($isCharge ? $chargeKw : $dischargeKw) * 1000),
+            ];
+            $newExplanations[] = $iv['explanation'];
+        }
+
+        return ['groups' => $newGroups, 'explanations' => $newExplanations];
+    }
+
+    private static function toMinutes(string $hhmm): int
+    {
+        [$h, $m] = explode(':', $hhmm);
+        return ((int) $h) * 60 + (int) $m;
+    }
+
+    /** Trims/splits each interval around [$cutStart, $cutEnd), dropping any portion that falls inside it. */
+    private function subtractInterval(array $intervals, int $cutStart, int $cutEnd): array
+    {
+        $out = [];
+        foreach ($intervals as $iv) {
+            if ($iv['end'] <= $cutStart || $iv['start'] >= $cutEnd) {
+                $out[] = $iv;
+                continue;
+            }
+            if ($iv['start'] < $cutStart) {
+                $out[] = ['start' => $iv['start'], 'end' => $cutStart] + $iv;
+            }
+            if ($iv['end'] > $cutEnd) {
+                $out[] = ['start' => $cutEnd, 'end' => $iv['end']] + $iv;
+            }
+        }
+        return $out;
+    }
+
+    /**
      * Maximal contiguous runs of $chargeCandidates (the full eligible set, not the capped
      * selection) that actually got at least one slot into $chargeIndexes, ranked
      * cheapest-first by the average rate of the slots that were actually selected within

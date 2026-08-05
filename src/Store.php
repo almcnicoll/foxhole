@@ -70,6 +70,18 @@ function db(?string $overridePath = null): PDO
         explanation TEXT,
         pushed_at TEXT NOT NULL
     )');
+    // One row per (date, kind) — a date-linked exception to the normal schedule, not
+    // history, so it's fine as a plain upsertable table rather than the disposable
+    // replace-all pattern rate_slots/schedule_groups use.
+    $pdo->exec("CREATE TABLE IF NOT EXISTS overrides (
+        for_date TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        event_start TEXT NOT NULL,
+        event_end TEXT NOT NULL,
+        prep_start TEXT,
+        prep_end TEXT,
+        PRIMARY KEY (for_date, kind)
+    )");
 
     return $pdo;
 }
@@ -183,6 +195,45 @@ function getLatestSchedule(): array
         'groups' => $groups,
         'explanations' => array_column($rows, 'explanation'),
     ];
+}
+
+/**
+ * $kind is 'fill_your_boots' or 'power_down'. $eventStart/$eventEnd/$prepStart/$prepEnd
+ * are 'H:i' strings (native <input type="time"> format); prep is optional (null = no
+ * prep period). Upserts on (for_date, kind) so re-saving the same override just updates it.
+ */
+function saveOverride(string $forDate, string $kind, string $eventStart, string $eventEnd, ?string $prepStart, ?string $prepEnd): void
+{
+    $stmt = db()->prepare('INSERT INTO overrides (for_date, kind, event_start, event_end, prep_start, prep_end) VALUES (:for_date, :kind, :event_start, :event_end, :prep_start, :prep_end)
+        ON CONFLICT(for_date, kind) DO UPDATE SET event_start = excluded.event_start, event_end = excluded.event_end, prep_start = excluded.prep_start, prep_end = excluded.prep_end');
+    $stmt->execute([
+        'for_date' => $forDate,
+        'kind' => $kind,
+        'event_start' => $eventStart,
+        'event_end' => $eventEnd,
+        'prep_start' => $prepStart,
+        'prep_end' => $prepEnd,
+    ]);
+}
+
+function deleteOverride(string $forDate, string $kind): void
+{
+    $stmt = db()->prepare('DELETE FROM overrides WHERE for_date = ? AND kind = ?');
+    $stmt->execute([$forDate, $kind]);
+}
+
+/** @return array<int, array{for_date: string, kind: string, event_start: string, event_end: string, prep_start: ?string, prep_end: ?string}> */
+function getOverridesForDate(string $forDate): array
+{
+    $stmt = db()->prepare('SELECT * FROM overrides WHERE for_date = ? ORDER BY kind');
+    $stmt->execute([$forDate]);
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+/** Overrides are date-linked by design (CLAUDE.md) — anything before today can never match a run again. */
+function pruneOldOverrides(string $today): void
+{
+    db()->prepare('DELETE FROM overrides WHERE for_date < ?')->execute([$today]);
 }
 
 function verifySystemPassword(string $attempt): bool

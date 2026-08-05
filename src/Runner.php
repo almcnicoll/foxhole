@@ -84,11 +84,22 @@ function runScheduler(bool $dryRun): array
         }
 
         $costBasis = (new CostBasisProvider($config['cost_basis']))->getCostBasis(count($slots));
-        $schedule = (new ScheduleBuilder($config['strategy'], $config['battery']))->build($slots, $exportSlots, $costBasis);
+        $scheduleBuilder = new ScheduleBuilder($config['strategy'], $config['battery']);
+        $schedule = $scheduleBuilder->build($slots, $exportSlots, $costBasis);
         $now = new DateTimeImmutable('now', $timezone);
 
         // Rates are worth recording even in a dry run — it's what powers the dashboard.
         saveRateSlots($slots, $exportSlots, $now);
+
+        // Any "Fill your boots" / "Power down" override saved for this exact date (override.php)
+        // gets carved into the schedule here — after the price logic built its plan, before
+        // either the dry-run preview or the real push, so both reflect it identically.
+        $overridesForTarget = getOverridesForDate($targetDate->format('Y-m-d'));
+        if ($overridesForTarget) {
+            $overlaid = $scheduleBuilder->applyOverrides($schedule['groups'], $schedule['explanations'], $overridesForTarget, $timezone);
+            $schedule['groups'] = $overlaid['groups'];
+            $schedule['explanations'] = $overlaid['explanations'];
+        }
 
         if ($dryRun) {
             $message = 'Dry run for ' . $targetDate->format('Y-m-d') . ': ' . count($schedule['groups']) . ' group(s), not pushed. ' . $schedule['summary'];
@@ -153,6 +164,67 @@ function runScheduler(bool $dryRun): array
         alertOnFailure($config, 'FoxESS scheduler: unexpected error', $e->getMessage());
         return ['ok' => false, 'dryRun' => $dryRun, 'message' => $message, 'schedule' => null];
     }
+}
+
+/**
+ * Called by override.php right after saving an override. Rebuilds the schedule from
+ * the *last-fetched* rate slots (no new Octopus call — this isn't a real run, just a
+ * re-overlay) and, if that rebuild's date has overrides, pushes the overlaid result
+ * to FoxESS immediately. Always rebuilds from scratch rather than overlaying onto
+ * getLatestSchedule() — that's already-overridden output from the last push, so
+ * re-overlaying onto it would permanently lose whatever it trimmed the first time.
+ *
+ * @return array{ok: bool, message: string}
+ */
+function reapplyOverrides(): array
+{
+    $logger = new Logger(__DIR__ . '/../logs/scheduler.log');
+    $config = require __DIR__ . '/../config.php';
+    $timezone = new DateTimeZone($config['strategy']['timezone'] ?? 'Europe/London');
+
+    $rows = getLatestRateSlots();
+    if (!$rows) {
+        return ['ok' => true, 'message' => 'No rates fetched yet, so there is nothing to overlay onto yet — this will apply automatically once a run has fetched rates for that date.'];
+    }
+
+    $targetDate = $rows[0]['from']->setTimezone($timezone)->format('Y-m-d');
+    $overrides = getOverridesForDate($targetDate);
+    if (!$overrides) {
+        return ['ok' => true, 'message' => "Saved. The currently active schedule is for $targetDate, which has no override — nothing to push now."];
+    }
+
+    $importSlots = array_map(fn($r) => ['from' => $r['from'], 'to' => $r['to'], 'rate' => $r['import_rate']], $rows);
+    $exportSlots = $rows[0]['export_rate'] !== null
+        ? array_map(fn($r) => ['from' => $r['from'], 'to' => $r['to'], 'rate' => $r['export_rate']], $rows)
+        : null;
+
+    $costBasis = (new CostBasisProvider($config['cost_basis']))->getCostBasis(count($importSlots));
+    $scheduleBuilder = new ScheduleBuilder($config['strategy'], $config['battery']);
+    $base = $scheduleBuilder->build($importSlots, $exportSlots, $costBasis);
+    $overlaid = $scheduleBuilder->applyOverrides($base['groups'], $base['explanations'], $overrides, $timezone);
+
+    $apiKey = getSetting('foxess_api_key', '');
+    $deviceSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('foxess_device_sns', '')))));
+    if ($apiKey === '' || !$deviceSns) {
+        return ['ok' => false, 'message' => 'Saved, but not pushed — FoxESS is not configured yet (settings.php).'];
+    }
+
+    $clients = [];
+    foreach ($deviceSns as $sn) {
+        $clients[$sn] = new FoxessClient($apiKey, $sn, $config['foxess']['base_url']);
+    }
+    $pushResult = pushToDevices($clients, $overlaid['groups'], $logger);
+    if ($pushResult['failures']) {
+        $message = sprintf('Saved, but the push failed for %d/%d inverter(s): %s', count($pushResult['failures']), count($deviceSns), implode('; ', $pushResult['failures']));
+        $logger->error($message);
+        return ['ok' => false, 'message' => $message];
+    }
+
+    $now = new DateTimeImmutable('now', $timezone);
+    saveSchedule($targetDate, $overlaid['groups'], $overlaid['explanations'], $now);
+    setSetting('schedule_summary', $base['summary']);
+    $logger->info("Override applied and pushed for $targetDate.");
+    return ['ok' => true, 'message' => "Saved and pushed to today's active schedule ($targetDate)."];
 }
 
 /**

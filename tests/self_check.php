@@ -324,6 +324,31 @@ check(
     'charge selection is unaffected by a zero discharge cap',
 );
 
+// --- ScheduleBuilder: applyOverrides overlays a Power down event+prep window onto an existing plan ---
+$baseGroups = [
+    ['enable' => 1, 'startHour' => 6, 'startMinute' => 0, 'endHour' => 10, 'endMinute' => 0, 'workMode' => 'ForceCharge', 'minSocOnGrid' => 15, 'fdSoc' => 100, 'fdPwr' => 3000],
+];
+$baseExplanations = ['Charging 06:00–10:00 (avg 10.00p/kWh) — below your 24.50p cost basis.'];
+$londonTz = new DateTimeZone('Europe/London');
+
+check(
+    (new ScheduleBuilder($strategy, $battery))->applyOverrides($baseGroups, $baseExplanations, [], $londonTz) === ['groups' => $baseGroups, 'explanations' => $baseExplanations],
+    'no overrides for the date leaves the schedule untouched',
+);
+
+$powerDown = [['for_date' => '2026-01-05', 'kind' => 'power_down', 'event_start' => '08:00', 'event_end' => '09:00', 'prep_start' => '07:00', 'prep_end' => '08:00']];
+$overlay = (new ScheduleBuilder($strategy, $battery))->applyOverrides($baseGroups, $baseExplanations, $powerDown, $londonTz);
+$overlayModes = array_map(fn($g) => $g['workMode'], $overlay['groups']);
+check($overlayModes === ['ForceCharge', 'ForceCharge', 'ForceDischarge', 'ForceCharge'], 'power_down splits the 06:00-10:00 charge period around its prep(charge)+event(discharge) window: got ' . implode(',', $overlayModes));
+check($overlay['groups'][2]['startHour'] === 8 && $overlay['groups'][2]['endHour'] === 9, 'the event window (08:00-09:00) becomes its own group');
+check(str_contains($overlay['explanations'][2], 'Power down override'), 'the event group is explained as a Power down override');
+check($overlay['groups'][3]['startHour'] === 9 && $overlay['groups'][3]['endHour'] === 10, 'the remainder of the original charge period after the event survives, trimmed to 09:00-10:00');
+
+$boots = [['for_date' => '2026-01-05', 'kind' => 'fill_your_boots', 'event_start' => '12:00', 'event_end' => '13:00', 'prep_start' => null, 'prep_end' => null]];
+$overlay2 = (new ScheduleBuilder($strategy, $battery))->applyOverrides([], [], $boots, $londonTz);
+check(count($overlay2['groups']) === 1 && $overlay2['groups'][0]['workMode'] === 'ForceCharge', 'fill_your_boots with no prep window adds a single ForceCharge event group');
+check($overlay2['groups'][0]['fdSoc'] === 100 && $overlay2['groups'][0]['fdPwr'] === 3000, 'override group power/SoC fields are set from battery config, same as a normal group');
+
 // --- Runner: pushToDevices() attempts every device and reports per-device failures ---
 // Stubs override pushSchedule() directly (public, not final) rather than hitting the
 // network — this must never make a real FoxESS call.
@@ -386,6 +411,21 @@ saveRateSlots(buildSlots(array_fill(0, 2, 15.0)), null, $fetchedAt);
 $noExportSlots = getLatestRateSlots();
 check(count($noExportSlots) === 2, 'saving new rate slots replaces the old batch, not appends');
 check($noExportSlots[0]['export_rate'] === null, 'a null export batch stores null export prices rather than stale ones');
+
+check(getOverridesForDate('2026-01-05') === [], 'no overrides for a date that has none');
+saveOverride('2026-01-05', 'power_down', '08:00', '09:00', '07:00', '08:00');
+$storedOverride = getOverridesForDate('2026-01-05');
+check(count($storedOverride) === 1 && $storedOverride[0]['event_start'] === '08:00' && $storedOverride[0]['prep_start'] === '07:00', 'override round-trips through save/get');
+saveOverride('2026-01-05', 'power_down', '10:00', '11:00', null, null);
+$storedOverride2 = getOverridesForDate('2026-01-05');
+check(count($storedOverride2) === 1 && $storedOverride2[0]['event_start'] === '10:00' && $storedOverride2[0]['prep_start'] === null, 're-saving the same (date, kind) upserts rather than duplicating, and can clear prep back to null');
+deleteOverride('2026-01-05', 'power_down');
+check(getOverridesForDate('2026-01-05') === [], 'delete removes the override');
+saveOverride('2020-01-01', 'fill_your_boots', '08:00', '09:00', null, null);
+saveOverride('2026-01-05', 'fill_your_boots', '08:00', '09:00', null, null);
+pruneOldOverrides('2026-01-01');
+check(getOverridesForDate('2020-01-01') === [], 'pruneOldOverrides removes dates before the given cutoff');
+check(count(getOverridesForDate('2026-01-05')) === 1, 'pruneOldOverrides leaves current/future dates alone');
 
 // --- PriceProvider: fixed mode (default + override), api mode without a configured product/tariff ---
 $priceLogger = new Logger(sys_get_temp_dir() . '/foxhole_self_check_' . getmypid() . '.log');
