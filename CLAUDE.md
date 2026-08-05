@@ -32,6 +32,8 @@ run-now.php           # manual trigger for the same pipeline (login-only, POST-o
 index.php             # dashboard (password-walled)
 login.php / logout.php
 settings.php          # FoxESS credentials + system password form (password-walled)
+assets/
+  style.css            # the only stylesheet — every page links this, no per-page CSS
 src/
   Logger.php           # timestamped file logger, rotates past 2MB
   Exceptions.php        # OctopusFetchException / ScheduleBuildException / FoxessPushException
@@ -182,7 +184,13 @@ directly, by design (see above).
 
 ## Web UI & auth
 
-No JS framework, inline CSS via `src/Layout.php`:
+No JS framework, one shared stylesheet (`assets/style.css`, linked by
+`src/Layout.php` — not inlined, not per-page) styled with CSS custom
+properties for the royal-purple accent palette, light/dark aware via
+`@media (prefers-color-scheme: dark)`. Functional colours (charge/discharge/
+self-use row tints, success/warning/error alerts, SoC red/amber/green) stay
+their own hues regardless of theme — they carry meaning, so they're not
+tinted purple along with everything else.
 
 - **`login.php`** — single password field, checked via
   `Store::verifySystemPassword()`. No password has been set until someone
@@ -201,20 +209,43 @@ No JS framework, inline CSS via `src/Layout.php`:
   exactly 48) via the `.slot-columns` flex layout in `Layout.php`.
   Deliberately merges prices and schedule into a single view rather than
   further-separate tables — that merge *is* the "quick glance" the UI exists
-  for. A "Why these decisions?" section (day summary from
-  `settings.schedule_summary` + each group's stored explanation) renders
-  *above* the slot tables, not below — user-requested, so the reasoning
-  reads before the data it explains rather than after. Also has the "Run
-  now" button (a plain POST form to `run-now.php`) and, after that redirects
-  back, a result banner read from `?ran=1&ok=…&msg=…` — no session
-  flash-message plumbing, just query-string state, which is enough for a
-  once-in-a-while manual action. Top-right of the page header: one battery
-  indicator per configured device serial (`renderBatteryStatus()`, native
-  `<progress>` element — no chart library, no custom SVG, "native platform
-  feature" was enough), passed into `renderHeader()`'s new optional
-  `$headerExtra` slot rather than hardcoded into the shared header, so other
-  pages can use the same slot later without index.php-specific code leaking
-  into `Layout.php`.
+  for. Each row also gets a `row-{mode}` class (subtle background tint —
+  green/red/grey for charge/discharge/self-use) alongside the existing
+  per-cell `.badge`, and the Import/Export cells get a `.currency` class
+  (monospace, right-aligned). A "Today's energy plan" section — `<h3>`, not
+  `<h2>`; day summary from `settings.schedule_summary` + each group's stored
+  explanation — renders *above* the slot tables, and the "Run now" button
+  renders *below* it (both user-requested orderings; the button used to sit
+  above everything). After a run redirects back, a result banner reads
+  `?ran=1&ok=…&msg=…` — no session flash-message plumbing, just query-string
+  state, which is enough for a once-in-a-while manual action. It's styled as
+  `.alert-success`/`.alert-warning`/`.alert-error`: warning isn't a field
+  `runScheduler()` actually returns, it's inferred in `index.php` from the
+  message text containing "unchanged" (a successful no-op push reads as
+  informational, not a full success) — a small heuristic, not a new
+  Runner.php return value, since the message text already carries this
+  distinction and duplicating it as a real field would be redundant.
+
+  Top-right of the page header: one battery indicator per configured device
+  serial (`renderBatteryStatus()`, native `<progress>` element — no chart
+  library, no custom SVG, "native platform feature" was enough), passed into
+  `renderHeader()`'s optional `$headerExtra` slot rather than hardcoded into
+  the shared header, so other pages can use the same slot later without
+  index.php-specific code leaking into `Layout.php`. Fill colour is a
+  `soc-red`/`soc-amber`/`soc-green` class computed server-side in PHP, not
+  pure CSS — there's no CSS-only way to threshold a `<progress>` element's
+  own value into colour bands, so `renderBatteryStatus()` does the
+  arithmetic and `style.css` just maps each class to a colour via
+  `::-webkit-progress-value`/`::-moz-progress-bar` (the two vendor
+  pseudo-elements that actually control fill colour — there's no
+  unprefixed standard one). Bands split `config.battery.min_soc_on_grid`
+  (the bottom of "red") to 100% (the top of "green") into equal thirds —
+  `min_soc_on_grid` specifically, not `reserve_soc`: both represent some
+  kind of floor and happen to be equal in the current config, but
+  `min_soc_on_grid` is described as the general system floor while
+  `reserve_soc` is specifically about how far force-discharge is allowed to
+  drain the battery, which reads as the more apt "minimum SoC" for a
+  general-purpose indicator.
 - **`settings.php`** — FoxESS `api_key`/`device_sns` (pre-filled from
   `Store`, plain text — the user themself set them, no reason to hide them
   from themself; `device_sns` is a `<textarea>`, one serial per line — see

@@ -1,0 +1,124 @@
+/* Foxhole — shared stylesheet for every page (src/Layout.php links this). */
+
+:root {
+  color-scheme: light dark;
+
+  /* Royal purple accent, plus the semantic/functional colours below it —
+     those carry meaning (charge/discharge/self-use, success/warning/error)
+     and deliberately stay their own hues rather than being tinted purple. */
+  --color-bg: #ffffff;
+  --color-text: #1a1a1a;
+  --color-primary: #6b46c1;
+  --color-primary-dark: #4c1d95;
+  --color-primary-light: #f3ecfd;
+  --color-border: #8883;
+  --color-muted: #6b6b76;
+
+  --color-success: #1a7f37;
+  --color-success-bg: #eaf7ee;
+  --color-warning: #9a6700;
+  --color-warning-bg: #fff8e6;
+  --color-error: #cf222e;
+  --color-error-bg: #fdeeee;
+
+  --row-ForceCharge: #1a7f371a;
+  --row-ForceDischarge: #cf222e1a;
+  --row-SelfUse: #8888881a;
+
+  --soc-red: #cf222e;
+  --soc-amber: #b28500;
+  --soc-green: #1a7f37;
+
+  --currency-font: ui-monospace, 'Cascadia Code', 'Segoe UI Mono', Consolas, 'Liberation Mono', Menlo, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #16131d;
+    --color-text: #e8e6ef;
+    --color-primary: #a78bfa;
+    --color-primary-dark: #7c3aed;
+    --color-primary-light: #2a2140;
+    --color-border: #ffffff33;
+    --color-muted: #a8a3b8;
+    --color-success-bg: #16321f;
+    --color-warning-bg: #3a2c05;
+    --color-error-bg: #3a1518;
+  }
+}
+
+body {
+  font-family: system-ui, sans-serif;
+  max-width: 1080px;
+  margin: 2rem auto;
+  padding: 0 1rem;
+  line-height: 1.4;
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+
+a { color: var(--color-primary); }
+
+nav { display: flex; gap: 1rem; margin-bottom: 1.5rem; font-size: 0.9rem; }
+nav a { text-decoration: none; }
+
+h1, h2, h3 { color: var(--color-primary-dark); }
+h1 { font-size: 1.3rem; }
+h3 { font-size: 1rem; }
+
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.9rem; }
+th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--color-border); }
+th { background: var(--color-primary-dark); color: #fff; }
+
+.currency { font-family: var(--currency-font); text-align: right; }
+
+tr.row-ForceCharge { background: var(--row-ForceCharge); }
+tr.row-ForceDischarge { background: var(--row-ForceDischarge); }
+tr.row-SelfUse { background: var(--row-SelfUse); }
+
+.badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 1rem; font-size: 0.8rem; }
+.badge-ForceCharge { background: #1a7f371a; color: #1a7f37; }
+.badge-ForceDischarge { background: #cf222e1a; color: #cf222e; }
+.badge-SelfUse { background: #6666661a; color: #666; }
+
+form { display: flex; flex-direction: column; gap: 0.8rem; max-width: 360px; }
+label { font-size: 0.85rem; font-weight: 600; }
+input, select, textarea { padding: 0.4rem; font-size: 1rem; font-family: inherit; }
+button { padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; background: var(--color-primary); color: #fff; border: none; border-radius: 4px; }
+button:hover { background: var(--color-primary-dark); }
+fieldset { display: flex; flex-direction: column; gap: 0.6rem; border: 1px solid var(--color-border); border-radius: 6px; padding: 0.8rem; }
+
+.error { color: var(--color-error); }
+.notice { color: var(--color-success); }
+.muted { color: var(--color-muted); font-size: 0.85rem; }
+
+.alert { padding: 0.6rem 0.9rem; border-radius: 6px; border: 1px solid; margin: 0.8rem 0; }
+.alert-success { background: var(--color-success-bg); border-color: var(--color-success); color: var(--color-success); }
+.alert-warning { background: var(--color-warning-bg); border-color: var(--color-warning); color: var(--color-warning); }
+.alert-error { background: var(--color-error-bg); border-color: var(--color-error); color: var(--color-error); }
+
+.page-header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }
+.page-header h1 { margin: 0; }
+
+.battery-status { display: flex; gap: 1.2rem; flex-wrap: wrap; }
+.battery-item { display: flex; align-items: center; gap: 0.5rem; font-size: 0.85rem; }
+.battery-item progress { width: 140px; height: 3em; }
+
+/* <progress> fill colour per SoC band — set server-side (see renderBatteryStatus()) since
+   there's no CSS way to threshold a progress element's own value into colour bands. */
+progress.soc-red::-webkit-progress-value { background: var(--soc-red); }
+progress.soc-red::-moz-progress-bar { background: var(--soc-red); }
+progress.soc-amber::-webkit-progress-value { background: var(--soc-amber); }
+progress.soc-amber::-moz-progress-bar { background: var(--soc-amber); }
+progress.soc-green::-webkit-progress-value { background: var(--soc-green); }
+progress.soc-green::-moz-progress-bar { background: var(--soc-green); }
+
+.slot-columns { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+.slot-columns table { flex: 1; min-width: 320px; }
+
+.full-width {
+	width: 100%;
+}
+.text-center {
+	text-align: center;
+}

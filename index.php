@@ -10,6 +10,7 @@ requireLogin();
 
 $config = file_exists(__DIR__ . '/config.php') ? require __DIR__ . '/config.php' : [];
 $timezone = new DateTimeZone($config['strategy']['timezone'] ?? 'Europe/London');
+$minSoc = (float) ($config['battery']['min_soc_on_grid'] ?? 0);
 
 $slots = getLatestRateSlots();
 $schedule = getLatestSchedule();
@@ -49,29 +50,42 @@ function slotWorkMode(int $slotMinutes, array $groups): string
 function renderSlotTable(array $slotsForColumn, DateTimeZone $timezone, array $groups): void
 {
     ?>
-    <table>
-      <thead><tr><th>Time</th><th>Import (p/kWh)</th><th>Export (p/kWh)</th><th>Mode</th></tr></thead>
-      <tbody>
-      <?php foreach ($slotsForColumn as $slot):
+<table>
+    <thead>
+        <tr>
+            <th>Time</th>
+            <th>Import (p/kWh)</th>
+            <th>Export (p/kWh)</th>
+            <th>Mode</th>
+        </tr>
+    </thead>
+    <tbody>
+        <?php foreach ($slotsForColumn as $slot):
           $localFrom = $slot['from']->setTimezone($timezone);
           $localTo = $slot['to']->setTimezone($timezone);
           $slotMinutes = ((int) $localFrom->format('G')) * 60 + (int) $localFrom->format('i');
           $mode = slotWorkMode($slotMinutes, $groups);
       ?>
-        <tr>
-          <td><?= htmlspecialchars($localFrom->format('H:i')) ?>–<?= htmlspecialchars($localTo->format('H:i')) ?></td>
-          <td><?= htmlspecialchars(number_format($slot['import_rate'], 2)) ?></td>
-          <td><?= $slot['export_rate'] !== null ? htmlspecialchars(number_format($slot['export_rate'], 2)) : '—' ?></td>
-          <td><span class="badge badge-<?= htmlspecialchars($mode) ?>"><?= htmlspecialchars($mode) ?></span></td>
+        <tr class="row-<?= htmlspecialchars($mode) ?>">
+            <td><?= htmlspecialchars($localFrom->format('H:i')) ?>–<?= htmlspecialchars($localTo->format('H:i')) ?></td>
+            <td class="currency"><?= htmlspecialchars(number_format($slot['import_rate'], 2)) ?></td>
+            <td class="currency">
+                <?= $slot['export_rate'] !== null ? htmlspecialchars(number_format($slot['export_rate'], 2)) : '—' ?>
+            </td>
+            <td><span class="badge badge-<?= htmlspecialchars($mode) ?>"><?= htmlspecialchars($mode) ?></span></td>
         </tr>
-      <?php endforeach; ?>
-      </tbody>
-    </table>
-    <?php
+        <?php endforeach; ?>
+    </tbody>
+</table>
+<?php
 }
 
-/** @param array<string, ?float> $batterySocs device serial => percent, or null if unavailable */
-function renderBatteryStatus(array $batterySocs): string
+/**
+ * @param array<string, ?float> $batterySocs device serial => percent, or null if unavailable
+ * @param float $minSoc config's battery.min_soc_on_grid — the bottom of the "red" band;
+ *        100% is always the top of "green". The range between is split into equal thirds.
+ */
+function renderBatteryStatus(array $batterySocs, float $minSoc): string
 {
     if (!$batterySocs) {
         return '';
@@ -86,52 +100,62 @@ function renderBatteryStatus(array $batterySocs): string
             $items .= "<div class=\"battery-item\"><span class=\"battery-label\">$label:</span><span class=\"muted\">unavailable</span></div>";
         } else {
             $pct = (int) round($soc);
-            $items .= "<div class=\"battery-item\"><span class=\"battery-label\">$label</span><progress value=\"$pct\" max=\"100\"></progress><span>$pct%</span></div>";
+            $third = max(0.001, (100 - $minSoc) / 3); // avoid div-by-zero if min_soc_on_grid is ever set to 100
+            $band = $soc <= $minSoc + $third ? 'red' : ($soc <= $minSoc + 2 * $third ? 'amber' : 'green');
+            $items .= "<div class=\"battery-item\"><span class=\"battery-label\">$label</span><progress class=\"soc-$band\" value=\"$pct\" max=\"100\"></progress><span>$pct%</span></div>";
         }
     }
     return "<div class=\"battery-status\">$items</div>";
 }
 
-renderHeader('Dashboard', headerExtra: renderBatteryStatus($batterySocs));
+renderHeader('Dashboard', headerExtra: renderBatteryStatus($batterySocs, $minSoc));
 
 $ran = $_GET['ran'] ?? null;
 $ranOk = ($_GET['ok'] ?? null) === '1';
 $ranMsg = (string) ($_GET['msg'] ?? '');
+// "Warning" isn't a distinct field Runner returns — a successful no-op run (nothing had
+// changed, so nothing was pushed) reads as informational rather than a full success.
+$ranClass = !$ranOk ? 'alert-error' : (str_contains($ranMsg, 'unchanged') ? 'alert-warning' : 'alert-success');
 ?>
 
 <?php if ($ran): ?>
-  <p class="<?= $ranOk ? 'notice' : 'error' ?>"><?= htmlspecialchars($ranMsg) ?></p>
+<p class="alert <?= $ranClass ?>"><?= htmlspecialchars($ranMsg) ?></p>
+<?php endif; ?>
+
+<?php if (!$slots): ?>
+<p class="muted">No rates fetched yet — run.php hasn't completed a successful fetch.</p>
+<form method="post" action="run-now.php">
+    <div class="full-width text-center">
+        <button type="submit">Run now</button>
+    </div>
+</form>
+<?php else: ?>
+<p class="muted">
+    Rates last fetched <?= htmlspecialchars($slots[0]['fetched_at']->setTimezone($timezone)->format('D j M, H:i')) ?>.
+    <?php if ($schedule['pushed_at']): ?>
+    Schedule for <?= htmlspecialchars((string) $schedule['for_date']) ?> pushed
+    <?= htmlspecialchars($schedule['pushed_at']->setTimezone($timezone)->format('D j M, H:i')) ?>.
+    <?php else: ?>
+    No schedule pushed yet.
+    <?php endif; ?>
+</p>
+
+<?php if ($schedule['explanations']): ?>
+<h3>Today's energy plan</h3>
+<?php $summary = getSetting('schedule_summary'); ?>
+<?php if ($summary): ?><p class="muted"><?= htmlspecialchars($summary) ?></p><?php endif; ?>
+<ul>
+    <?php foreach ($schedule['explanations'] as $explanation): ?>
+    <li><?= htmlspecialchars((string) $explanation) ?></li>
+    <?php endforeach; ?>
+</ul>
 <?php endif; ?>
 
 <form method="post" action="run-now.php">
-  <button type="submit">Run now</button>
+    <button type="submit">Run now</button>
 </form>
 
-<?php if (!$slots): ?>
-  <p class="muted">No rates fetched yet — run.php hasn't completed a successful fetch.</p>
-<?php else: ?>
-  <p class="muted">
-    Rates last fetched <?= htmlspecialchars($slots[0]['fetched_at']->setTimezone($timezone)->format('D j M, H:i')) ?>.
-    <?php if ($schedule['pushed_at']): ?>
-      Schedule for <?= htmlspecialchars((string) $schedule['for_date']) ?> pushed
-      <?= htmlspecialchars($schedule['pushed_at']->setTimezone($timezone)->format('D j M, H:i')) ?>.
-    <?php else: ?>
-      No schedule pushed yet.
-    <?php endif; ?>
-  </p>
-
-  <?php if ($schedule['explanations']): ?>
-    <h2>Why these decisions?</h2>
-    <?php $summary = getSetting('schedule_summary'); ?>
-    <?php if ($summary): ?><p class="muted"><?= htmlspecialchars($summary) ?></p><?php endif; ?>
-    <ul>
-      <?php foreach ($schedule['explanations'] as $explanation): ?>
-        <li><?= htmlspecialchars((string) $explanation) ?></li>
-      <?php endforeach; ?>
-    </ul>
-  <?php endif; ?>
-
-  <?php
+<?php
   $leftSlots = [];
   $rightSlots = [];
   foreach ($slots as $slot) {
@@ -142,10 +166,10 @@ $ranMsg = (string) ($_GET['msg'] ?? '');
       }
   }
   ?>
-  <div class="slot-columns">
+<div class="slot-columns">
     <?php renderSlotTable($leftSlots, $timezone, $schedule['groups']); ?>
     <?php renderSlotTable($rightSlots, $timezone, $schedule['groups']); ?>
-  </div>
+</div>
 <?php endif; ?>
 
 <?php
