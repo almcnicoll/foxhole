@@ -375,9 +375,17 @@ check($failDevice->calls === 1 && $okDevice->calls === 1, 'every device is attem
 check(count($pushResult['failures']) === 1, 'exactly the one failing device is reported');
 check(str_contains($pushResult['failures'][0], 'SN-FAIL'), 'a failure is labelled with the device serial number that failed');
 check(str_contains($pushResult['failures'][0], 'simulated failure'), 'the underlying error message is preserved');
+check($pushResult['failedSns'] === ['SN-FAIL'], 'failedSns lists just the serial numbers that failed, for retry tracking');
+check($pushResult['failureMessages'] === ['SN-FAIL' => 'simulated failure'], 'failureMessages exposes the raw per-device error, keyed by serial');
 
 $allOkResult = pushToDevices(['SN-OK' => $okDevice], [], $pushLogger);
 check($allOkResult['failures'] === [], 'no failures reported when every device succeeds');
+check($allOkResult['failedSns'] === [], 'failedSns is empty when every device succeeds');
+
+// --- Runner: isOfflineFailure() distinguishes a routine offline inverter from a real failure ---
+check(isOfflineFailure('FoxESS /op/v1/device/scheduler/enable error 41935: Device offline, Please connect and retry'), 'a FoxESS "Device offline" error is recognised as routine (battery-less inverter after dark, see CLAUDE.md)');
+check(!isOfflineFailure('FoxESS /op/v1/device/scheduler/enable error 41811: User permissions do not allow this operation'), 'a permissions error is not treated as a routine offline failure');
+check(!isOfflineFailure('cURL error fetching Octopus rates: Could not resolve host'), 'an unrelated cURL error is not treated as a routine offline failure');
 
 // --- Store: settings/password/rates/schedule persistence ---
 // Points the whole module at a throwaway file (see Store::db()'s "sticky path"

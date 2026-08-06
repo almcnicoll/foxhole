@@ -155,7 +155,7 @@ $ranOk = ($_GET['ok'] ?? null) === '1';
 $ranMsg = (string) ($_GET['msg'] ?? '');
 // "Warning" isn't a distinct field Runner returns — a successful no-op run (nothing had
 // changed, so nothing was pushed) reads as informational rather than a full success.
-$ranClass = !$ranOk ? 'alert-error' : (str_contains($ranMsg, 'unchanged') ? 'alert-warning' : 'alert-success');
+$ranClass = !$ranOk ? 'alert-error' : ((str_contains($ranMsg, 'unchanged') || str_contains($ranMsg, 'pending')) ? 'alert-warning' : 'alert-success');
 ?>
 
 <?php if ($ran): ?>

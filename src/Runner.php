@@ -156,9 +156,16 @@ function runScheduler(bool $dryRun): array
 
         // Compared against the last *actually pushed* (i.e. spliced) groups, not the raw
         // per-date plan — the splice boundary moves every run even when nothing about the
-        // underlying prices changed, so diffing raw plans would misfire the skip.
+        // underlying prices changed, so diffing raw plans would misfire the skip. A device
+        // that didn't receive that content stays in "pending_device_sns" until it does —
+        // without this, a run that recomputes the same content as last time would read as
+        // a no-op and a device that failed earlier (e.g. a battery-less inverter offline
+        // overnight — see CLAUDE.md) would never get retried once it's reachable again.
         $lastPushed = json_decode(getSetting('last_pushed_groups_json', '') ?: 'null', true);
-        if ($pushGroups == $lastPushed) {
+        $pendingSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('pending_device_sns', '')))));
+        $contentChanged = $pushGroups != $lastPushed;
+
+        if (!$contentChanged && !$pendingSns) {
             $message = 'Schedule for ' . $targetDate->format('Y-m-d') . ' unchanged from last run, skipped FoxESS push.';
             $logger->info($message);
             return ['ok' => true, 'dryRun' => false, 'message' => $message, 'schedule' => $schedule];
@@ -173,26 +180,50 @@ function runScheduler(bool $dryRun): array
             throw new FoxessPushException('No FoxESS device serial numbers configured — set them at settings.php');
         }
 
+        // A changed schedule goes to every device; an unchanged one only retries whichever
+        // devices are still pending from an earlier failed attempt.
+        $devicesToPush = $contentChanged ? $deviceSns : array_values(array_intersect($deviceSns, $pendingSns));
         $clients = [];
-        foreach ($deviceSns as $sn) {
+        foreach ($devicesToPush as $sn) {
             $clients[$sn] = new FoxessClient($apiKey, $sn, $config['foxess']['base_url']);
         }
         $pushResult = pushToDevices($clients, $pushGroups, $logger);
-        if ($pushResult['failures']) {
-            throw new FoxessPushException(sprintf(
-                'Push failed for %d/%d inverter(s): %s',
-                count($pushResult['failures']),
-                count($deviceSns),
-                implode('; ', $pushResult['failures']),
-            ));
-        }
+        $stillPending = $pushResult['failedSns'];
+        setSetting('pending_device_sns', implode("\n", $stillPending));
 
         // Raw per-date plan (unspliced) — what the next run splices against, and what the
-        // dashboard shows for that date.
+        // dashboard shows for that date. Saved regardless of per-device outcome, so a
+        // retry-only run above still has today's plan to splice against.
         saveSchedule($targetDate->format('Y-m-d'), $schedule['groups'], $schedule['explanations'], $now);
         pruneOldSchedules($today->format('Y-m-d'));
         setSetting('last_pushed_groups_json', json_encode($pushGroups));
         setSetting('schedule_summary', $schedule['summary']);
+
+        if ($stillPending) {
+            // "Device offline" is expected/routine for a battery-less inverter after dark —
+            // it has no power to stay connected once solar generation stops. That alone
+            // isn't worth an ERROR/alert-email; a genuine failure (auth, permissions, ...)
+            // still is. Either way the device stays pending and gets retried next run (above).
+            $hardFailureSns = array_values(array_filter(
+                $stillPending,
+                fn($sn) => !isOfflineFailure($pushResult['failureMessages'][$sn]),
+            ));
+            $message = sprintf(
+                'Pushed schedule for %s to %d/%d inverter(s); still pending: %s.',
+                $targetDate->format('Y-m-d'),
+                count($devicesToPush) - count($stillPending),
+                count($deviceSns),
+                implode(', ', $stillPending),
+            );
+            if ($hardFailureSns) {
+                $logger->error($message . ' Failure detail: ' . implode('; ', $pushResult['failures']));
+                alertOnFailure($config, 'FoxESS scheduler: push incomplete', $message);
+                return ['ok' => false, 'dryRun' => false, 'message' => $message, 'schedule' => $schedule];
+            }
+            $logger->info($message . ' (offline — expected to retry next run)');
+            return ['ok' => true, 'dryRun' => false, 'message' => $message, 'schedule' => $schedule];
+        }
+
         $message = sprintf(
             'Pushed schedule for %s to %d inverter(s): %d group(s), %d FoxESS API call(s) this run. %s',
             $targetDate->format('Y-m-d'),
@@ -287,16 +318,18 @@ function reapplyOverrides(): array
  * Pushes the same schedule to every configured device, attempting all of them
  * even if an earlier one fails — one bad inverter shouldn't stop the others
  * from getting a real, working update. The caller decides whether any
- * failures should count as an overall run failure (currently: yes, always —
- * see runScheduler()).
+ * failures should count as an overall run failure — see runScheduler(), which
+ * treats an offline device (isOfflineFailure()) differently from a real one.
  *
  * @param array<string, FoxessClient> $clients device serial number => client
- * @return array{callCount: int, failures: string[]}
+ * @return array{callCount: int, failures: string[], failedSns: string[], failureMessages: array<string, string>}
  */
 function pushToDevices(array $clients, array $groups, Logger $logger): array
 {
     $callCount = 0;
     $failures = [];
+    $failedSns = [];
+    $failureMessages = [];
     foreach ($clients as $sn => $client) {
         try {
             $client->pushSchedule($groups);
@@ -304,10 +337,18 @@ function pushToDevices(array $clients, array $groups, Logger $logger): array
         } catch (FoxessPushException $e) {
             $logger->error("Push to $sn failed: " . $e->getMessage());
             $failures[] = "$sn: " . $e->getMessage();
+            $failedSns[] = $sn;
+            $failureMessages[$sn] = $e->getMessage();
         }
         $callCount += $client->callCount();
     }
-    return ['callCount' => $callCount, 'failures' => $failures];
+    return ['callCount' => $callCount, 'failures' => $failures, 'failedSns' => $failedSns, 'failureMessages' => $failureMessages];
+}
+
+/** errno 41935 ("Device offline") is routine for a battery-less inverter after dark — see CLAUDE.md. */
+function isOfflineFailure(string $message): bool
+{
+    return str_contains($message, 'Device offline');
 }
 
 function alertOnFailure(array $config, string $subject, string $message): void
