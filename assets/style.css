@@ -28,6 +28,15 @@
   --row-ForceDischarge: #1a7f371a;
   --row-SelfUse: #8888881a;
 
+  /* Same hues as the row/badge tints above, but stronger — a badge is a small bordered
+     swatch with black text sitting right on it, so a faint wash still reads clearly; a
+     half-hour-wide, full-height, borderless band in the price chart needs more contrast
+     to be visible at all against the page background (measured: the row-tint alpha alone
+     was only a ~5% RGB shift from white — imperceptible at a glance). */
+  --chart-band-ForceCharge: #cf222e40;
+  --chart-band-ForceDischarge: #1a7f3740;
+  --chart-band-SelfUse: #88888826;
+
   --soc-red: #cf222e;
   --soc-amber: #b28500;
   --soc-green: #1a7f37;

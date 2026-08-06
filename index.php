@@ -137,7 +137,7 @@ function renderPriceChart(array $slots, array $solarForecast, array $groups, Dat
         }
         $mode = slotWorkMode($startMin, $groups);
         $bands .= sprintf(
-            '<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="var(--row-%s)" />',
+            '<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="var(--chart-band-%s)" />',
             $x($startMin),
             $marginTop,
             $x($endMin) - $x($startMin),
