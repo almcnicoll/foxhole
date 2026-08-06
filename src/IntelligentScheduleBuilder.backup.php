@@ -2,6 +2,12 @@
 
 require_once __DIR__ . '/Exceptions.php';
 
+// BACKUP — snapshot of IntelligentScheduleBuilder.php before the discharge-logic rework
+// that removed the "discharge to offset expensive import" fallback and added a real
+// clear-space-ahead-of-arbitrage-windows rule (see the live class + CLAUDE.md for why).
+// Not required anywhere, not wired into Runner.php — reference/rollback only. Class
+// renamed so this can never collide if both files were ever accidentally required together.
+//
 // Toggled via the `intelligent_scheduler_enabled` setting (settings.php, on by default) —
 // see Runner.php's runScheduler(). run.php can override it per-run with --classic/--intelligent.
 // See roadmap.MD's "Solar-generation-aware scheduling" / "Load-aware scheduling" /
@@ -25,27 +31,18 @@ require_once __DIR__ . '/Exceptions.php';
 //     Only that much is force-charged, cheapest slots first (plus a separate,
 //     unbounded-by-need arbitrage rule — buying below the best export rate is always
 //     worth it regardless of how full the battery already is).
-//   - Discharge is deliberately NOT driven by import price alone — SelfUse already
-//     draws from the battery to cover load before importing, proportional to actual
-//     need, so forcing a discharge purely because import is expensive has no upside
-//     and just empties the battery faster than necessary (see CLAUDE.md — this was a
-//     real reported bug: the battery ran dry mid-peak and the user ended up buying the
-//     same expensive electricity anyway). Discharge only happens for two reasons, both
-//     with a concrete financial payoff:
-//       1. Selling at a genuinely high/variable export rate, ranked by export price —
-//          only when the export rate actually varies today (a flat rate has no "best
-//          time to sell").
-//       2. Clearing space ahead of a genuine arbitrage opportunity: a future slot whose
-//          import price undercuts the best export rate is worth buying regardless of
-//          the battery's current state, but only if there's room to store it. Sized to
-//          the real shortfall (via max_charge_kw vs max_discharge_kw), not a blind
-//          full drain — see findArbitrageWindows()/build().
-//   - Either way, a candidate is only kept if a forward simulation (including the
-//     charge decisions above) shows the battery would still be at/above the reserve
-//     floor afterwards — for sell candidates, the least price-desirable one is dropped
-//     and the simulation re-run until that holds, or nothing's left to drop; clear-space
-//     reservations are sized against this same simulation up front, not evicted.
-class IntelligentScheduleBuilder
+//   - Discharge candidates are ranked by price exactly like ScheduleBuilder, but a
+//     candidate is only kept if a forward simulation (including the charge decisions
+//     above) shows the battery would still be at/above the reserve floor afterwards —
+//     the least price-desirable candidate is dropped and the simulation re-run until
+//     that holds, or nothing's left to drop.
+//
+// Dropped relative to ScheduleBuilder, to keep a first version tractable: the "reserve
+// a discharge slot ahead of each cheap charging window" heuristic. With a real energy
+// simulation, forcing a charge into an already-full battery just curtails/exports the
+// extra instead of storing it — mildly wasteful on the rare day that happens, not a
+// broken schedule. Worth revisiting if that turns out to matter in practice.
+class IntelligentScheduleBuilderBackup
 {
     public function __construct(
         private readonly array $strategyConfig,
@@ -154,81 +151,31 @@ class IntelligentScheduleBuilder
         sort($chargeIndexes);
         $chargeSet = array_flip($chargeIndexes);
 
+        // Projected SoC at the *start* of each slot, charge decisions included — this is
+        // what discharge feasibility gets checked against below.
+        $plannedSocBefore = [];
+        $soc = $startingSocKwh;
+        for ($i = 0; $i < $n; $i++) {
+            $plannedSocBefore[$i] = $soc;
+            $soc = isset($chargeSet[$i])
+                ? min($capacityKwh, $soc + $chargeEnergyKwh)
+                : max($minSocOnGridKwh, min($capacityKwh, $soc + $netKwh[$i]));
+        }
+
         $dischargeCapConfig = max(0, (int) ($this->strategyConfig['expensive_slots_to_export'] ?? 0));
-
-        // Reusable trajectory walk: given the fixed charge decisions above plus whatever
-        // clear-space reservations have been committed so far, project SoC just before
-        // slot $target. Used both to size each reservation and, once discharge is fully
-        // decided, doesn't need re-running — the feasibility trim below has its own copy
-        // because it also has to consider sell candidates, which this doesn't.
-        $preChargeIndexes = []; // reserved index => the charge index it's clearing space for
-        $simulateSocBefore = function (int $target) use ($startingSocKwh, $chargeSet, &$preChargeIndexes, $netKwh, $chargeEnergyKwh, $dischargeEnergyKwh, $capacityKwh, $minSocOnGridKwh, $reserveKwh): float {
-            $soc = $startingSocKwh;
-            for ($i = 0; $i < $target; $i++) {
-                if (isset($chargeSet[$i])) {
-                    $soc = min($capacityKwh, $soc + $chargeEnergyKwh);
-                } elseif (isset($preChargeIndexes[$i])) {
-                    $soc = max($reserveKwh, $soc - $dischargeEnergyKwh); // forced discharge — reserve is its floor, same as the feasibility trim below
-                } else {
-                    $soc = max($minSocOnGridKwh, min($capacityKwh, $soc + $netKwh[$i]));
-                }
-            }
-            return $soc;
-        };
-
-        // Clear space ahead of each arbitrage charging window (import below the best
-        // export rate — a guaranteed-value buy regardless of current battery state, but
-        // only if there's room to store it), cheapest window first. Sized to the real
-        // shortfall via each rate's own energy conversion, not a blind full drain — see
-        // the class doc comment. Shares the same budget sell candidates use below.
-        $arbitrageChargeIndexes = array_values(array_intersect($chargeIndexes, $arbitrageCandidates));
-        sort($arbitrageChargeIndexes);
-        $budget = $dischargeCapConfig;
-        foreach ($this->findArbitrageWindows($arbitrageChargeIndexes, $importRates) as $window) {
-            if ($budget <= 0) {
-                break;
-            }
-            $socBeforeWindow = $simulateSocBefore($window['start']);
-            $demandKwh = $window['slotCount'] * $chargeEnergyKwh;
-            $shortfallKwh = max(0.0, $socBeforeWindow + $demandKwh - $capacityKwh);
-            if ($shortfallKwh <= 0.0) {
-                continue; // already enough room, nothing to clear
-            }
-            // Never plan to discharge below reserve just to make room — cap the slots
-            // requested by how much headroom actually exists above it, same floor the
-            // feasibility trim enforces for sell candidates.
-            $availableAboveReserve = max(0.0, $socBeforeWindow - $reserveKwh);
-            $slotsNeeded = $dischargeEnergyKwh > 0 ? (int) min(ceil($shortfallKwh / $dischargeEnergyKwh), floor($availableAboveReserve / $dischargeEnergyKwh)) : 0;
-
-            $idx = $window['start'] - 1;
-            $reserved = 0;
-            while ($reserved < $slotsNeeded && $budget > 0 && $idx >= 0 && !isset($chargeSet[$idx]) && !isset($preChargeIndexes[$idx])) {
-                $preChargeIndexes[$idx] = $window['start'];
-                $reserved++;
-                $budget--;
-                $idx--;
+        $dischargeSortRates = $exportIsVariable ? $exportRates : $importRates;
+        $dischargeCandidates = [];
+        for ($i = 0; $i < $n; $i++) {
+            if (!isset($chargeSet[$i])) {
+                $dischargeCandidates[$i] = $dischargeSortRates[$i];
             }
         }
+        arsort($dischargeCandidates); // most desirable to discharge first, keys preserved
+        $selected = array_slice(array_keys($dischargeCandidates), 0, $dischargeCapConfig);
 
-        // Remaining budget, if any, goes to selling at the export peak — only when
-        // export price actually varies (a flat rate has no "best time to sell").
-        $sellCandidates = [];
-        if ($exportIsVariable) {
-            for ($i = 0; $i < $n; $i++) {
-                if (!isset($chargeSet[$i]) && !isset($preChargeIndexes[$i])) {
-                    $sellCandidates[$i] = $exportRates[$i];
-                }
-            }
-        }
-        arsort($sellCandidates); // most desirable to sell first, keys preserved
-        $remainingBudget = max(0, $dischargeCapConfig - count($preChargeIndexes));
-        $selected = array_slice(array_keys($sellCandidates), 0, $remainingBudget);
-
-        // Feasibility trim: walk the day once with charges + clear-space reservations
-        // (fixed, already sized against $simulateSocBefore above) + tentative sell
-        // candidates applied in time order; if the battery would go below reserve, drop
-        // the least price-desirable *sell* candidate and re-check — reservations aren't
-        // evicted, since they were sized specifically to stay feasible. Bounded by count($selected).
+        // Feasibility trim: walk the day once with charges + all tentative discharges
+        // applied in time order; if the battery would go below reserve anywhere, drop
+        // the least price-desirable tentative slot and re-check. Bounded by count($selected).
         while ($selected) {
             $soc = $startingSocKwh;
             $selectedSet = array_flip($selected);
@@ -236,8 +183,6 @@ class IntelligentScheduleBuilder
             for ($i = 0; $i < $n; $i++) {
                 if (isset($chargeSet[$i])) {
                     $soc = min($capacityKwh, $soc + $chargeEnergyKwh);
-                } elseif (isset($preChargeIndexes[$i])) {
-                    $soc = max($reserveKwh, $soc - $dischargeEnergyKwh);
                 } elseif (isset($selectedSet[$i])) {
                     if ($soc - $dischargeEnergyKwh < $reserveKwh) {
                         $violated = true;
@@ -253,8 +198,8 @@ class IntelligentScheduleBuilder
             }
             array_pop($selected); // arsort order preserved by the slice above — last = worst-ranked
         }
-        $dischargeIndexes = [...array_keys($preChargeIndexes), ...$selected];
-        sort($dischargeIndexes);
+        sort($selected);
+        $dischargeIndexes = $selected;
 
         $modes = array_fill(0, $n, 'SelfUse');
         foreach ($chargeIndexes as $i) {
@@ -268,7 +213,7 @@ class IntelligentScheduleBuilder
 
         return [
             'groups' => $this->periodsToGroups($periods, $chargeKw, $dischargeKw, $minSocOnGrid, $reserveSoc),
-            'explanations' => $this->explainPeriods($periods, $importRates, $exportRates, $neededTopUpKwh, $preChargeIndexes, $importSlots, $timezone, $bestExportRate),
+            'explanations' => $this->explainPeriods($periods, $importRates, $exportRates, $exportIsVariable, $neededTopUpKwh),
             'summary' => sprintf(
                 'Solar forecast: %.1fkWh today, assumed usage %.1fkWh — projected %.1fkWh needed from the grid to reach full before the %s peak (%sp/kWh). Battery starting at %.0f%% (%.1fkWh).',
                 array_sum($solarKwh),
@@ -328,39 +273,6 @@ class IntelligentScheduleBuilder
         return [...$pre, ...$post];
     }
 
-    /**
-     * Maximal contiguous runs of $arbitrageChargeIndexes (already-selected arbitrage
-     * charge slots — import below the best export rate), ranked cheapest-average-import-
-     * rate first so the shared clear-space budget goes to the best opportunities first.
-     * Mirrors ScheduleBuilder's findChargingWindows(), scoped to arbitrage-selected slots.
-     *
-     * @return array<int, array{start: int, slotCount: int}>
-     */
-    private function findArbitrageWindows(array $arbitrageChargeIndexes, array $importRates): array
-    {
-        $windows = [];
-        $windowStart = null;
-        $prev = null;
-        foreach ($arbitrageChargeIndexes as $i) {
-            if ($prev !== null && $i !== $prev + 1) {
-                $windows[] = [$windowStart, $prev];
-                $windowStart = null;
-            }
-            $windowStart ??= $i;
-            $prev = $i;
-        }
-        if ($windowStart !== null) {
-            $windows[] = [$windowStart, $prev];
-        }
-
-        $result = [];
-        foreach ($windows as [$start, $end]) {
-            $result[] = ['start' => $start, 'slotCount' => $end - $start + 1, 'avgRate' => $this->average($importRates, range($start, $end))];
-        }
-        usort($result, fn($a, $b) => $a['avgRate'] <=> $b['avgRate']);
-        return $result;
-    }
-
     private static function indexOfMax(array $values): int
     {
         $maxIndex = 0;
@@ -414,23 +326,9 @@ class IntelligentScheduleBuilder
         return $groups;
     }
 
-    /**
-     * @param array $preChargeIndexes reserved index => the charge index it's clearing space for
-     *        (see build()) — a ForceDischarge period explains as a clear-space reservation if
-     *        any slot within it is one, otherwise as a sell-at-the-export-peak period (the only
-     *        other source of discharge — see the class doc comment).
-     * @return string[] one sentence per non-SelfUse period, same order periodsToGroups() emits groups in
-     */
-    private function explainPeriods(
-        array $periods,
-        array $importRates,
-        ?array $exportRates,
-        float $neededTopUpKwh,
-        array $preChargeIndexes,
-        array $importSlots,
-        DateTimeZone $timezone,
-        ?float $bestExportRate,
-    ): array {
+    /** @return string[] one sentence per non-SelfUse period, same order periodsToGroups() emits groups in */
+    private function explainPeriods(array $periods, array $importRates, ?array $exportRates, bool $exportIsVariable, float $neededTopUpKwh): array
+    {
         $explanations = [];
         foreach ($periods as $period) {
             if ($period['mode'] === 'SelfUse') {
@@ -446,29 +344,16 @@ class IntelligentScheduleBuilder
                     number_format($avg, 2),
                     $neededTopUpKwh,
                 );
-                continue;
-            }
-
-            // A period is usually a single reserved slot, but don't assume it — use
-            // whichever slot in the (possibly merged) period has a reservation.
-            $targetIndex = null;
-            foreach ($indexes as $i) {
-                if (isset($preChargeIndexes[$i])) {
-                    $targetIndex = $preChargeIndexes[$i];
-                    break;
-                }
-            }
-            if ($targetIndex !== null) {
-                $explanations[] = sprintf(
-                    'Discharging %s — clearing space so the %sp import at %s (cheaper than today\'s %sp export) can be bought and stored.',
-                    $range,
-                    number_format($importRates[$targetIndex], 2),
-                    $importSlots[$targetIndex]['from']->setTimezone($timezone)->format('H:i'),
-                    number_format($bestExportRate, 2),
-                );
             } else {
-                $avg = $this->average($exportRates, $indexes);
-                $explanations[] = sprintf('Selling %s (avg %sp/kWh) — projected spare battery capacity that won\'t dip below reserve.', $range, number_format($avg, 2));
+                $rates = $exportIsVariable ? $exportRates : $importRates;
+                $avg = $this->average($rates, $indexes);
+                $label = $exportIsVariable ? 'Selling' : 'Discharging';
+                $explanations[] = sprintf(
+                    '%s %s (avg %sp/kWh) — projected spare battery capacity that won\'t dip below reserve.',
+                    $label,
+                    $range,
+                    number_format($avg, 2),
+                );
             }
         }
         return $explanations;
