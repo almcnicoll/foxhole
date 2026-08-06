@@ -8,6 +8,7 @@ require_once __DIR__ . '/../src/Exceptions.php';
 require_once __DIR__ . '/../src/CostBasisProvider.php';
 require_once __DIR__ . '/../src/ScheduleBuilder.php';
 require_once __DIR__ . '/../src/IntelligentScheduleBuilder.php';
+require_once __DIR__ . '/../src/UsageEstimator.php';
 require_once __DIR__ . '/../src/Logger.php';
 require_once __DIR__ . '/../src/Store.php';
 require_once __DIR__ . '/../src/OctopusClient.php';
@@ -640,6 +641,71 @@ $coversExportPeak = (bool) array_filter($dischargeGroups2, fn($g) => $g['startHo
 check($coversExportPeak, 'the 05:00 export-peak slot (30p vs. a flat 12p elsewhere) is among the discharge groups: got ' . json_encode(array_map(fn($g) => "{$g['startHour']}:{$g['startMinute']}", $dischargeGroups2)));
 
 check(count($sunny['groups']) === count($sunny['explanations']), 'groups and explanations arrays stay the same length');
+
+// --- UsageEstimator: day-length-based seasonal interpolation (see roadmap.MD) ---
+$usageTz = new DateTimeZone('Europe/London');
+
+/** Only 'from'/'to' need fractional seconds to be treated as a dawn/dusk marker — see UsageEstimator. */
+function makeSolarBucket(DateTimeImmutable $from, DateTimeImmutable $to, int $wattHours): array
+{
+    return ['from' => $from, 'to' => $to, 'watt_hours' => $wattHours, 'fetched_at' => $from];
+}
+
+// Day length at exactly the summer bound (16.6h) -> the summer figure is used as-is. Only
+// the dawn/dusk instants themselves carry fractional seconds — every other boundary is a
+// clean hour, matching the real API's shape (see UsageEstimator's detection logic).
+$summerDawn = new DateTimeImmutable('2026-06-21 06:00:01', $usageTz);
+$summerDusk = new DateTimeImmutable('2026-06-21 22:36:01', $usageTz); // dawn + 16h36m = 16.6h
+$summerForecast = [
+    makeSolarBucket($summerDawn, new DateTimeImmutable('2026-06-21 07:00:00', $usageTz), 200),
+    makeSolarBucket(new DateTimeImmutable('2026-06-21 22:00:00', $usageTz), $summerDusk, 100),
+];
+$summerDaily = UsageEstimator::estimateDailyKwh(300.0, 700.0, $summerDawn, $usageTz, $summerForecast);
+check(abs($summerDaily - 300.0 / 30.44) < 0.01, "day length at the summer bound (16.6h) uses the summer figure as-is: got $summerDaily");
+
+// Day length at exactly the winter bound (7.7h) -> the winter figure is used as-is.
+$winterDawn = new DateTimeImmutable('2026-12-21 08:00:01', $usageTz);
+$winterDusk = new DateTimeImmutable('2026-12-21 15:42:01', $usageTz); // dawn + 7h42m = 7.7h
+$winterForecast = [
+    makeSolarBucket($winterDawn, new DateTimeImmutable('2026-12-21 09:00:00', $usageTz), 100),
+    makeSolarBucket(new DateTimeImmutable('2026-12-21 15:00:00', $usageTz), $winterDusk, 20),
+];
+$winterDaily = UsageEstimator::estimateDailyKwh(300.0, 700.0, $winterDawn, $usageTz, $winterForecast);
+check(abs($winterDaily - 700.0 / 30.44) < 0.01, "day length at the winter bound (7.7h) uses the winter figure as-is: got $winterDaily");
+
+// A day length beyond the summer bound still clamps to the summer figure, not extrapolated past it.
+$longDawn = new DateTimeImmutable('2026-06-21 04:00:01', $usageTz);
+$longDusk = new DateTimeImmutable('2026-06-22 00:00:01', $usageTz); // dawn + 20h, well beyond the 16.6h bound
+$longForecast = [
+    makeSolarBucket($longDawn, new DateTimeImmutable('2026-06-21 05:00:00', $usageTz), 200),
+    makeSolarBucket(new DateTimeImmutable('2026-06-21 23:00:00', $usageTz), $longDusk, 50),
+];
+$longDaily = UsageEstimator::estimateDailyKwh(300.0, 700.0, $longDawn, $usageTz, $longForecast);
+check(abs($longDaily - 300.0 / 30.44) < 0.01, "a day length beyond the summer bound clamps to the summer figure rather than extrapolating: got $longDaily");
+
+// No solar data at all -> falls back to a day-of-year estimate, still within the summer/winter range,
+// and clearly higher in midwinter than midsummer.
+$noSolarSummer = UsageEstimator::estimateDailyKwh(300.0, 700.0, new DateTimeImmutable('2026-06-21', $usageTz), $usageTz, []);
+$noSolarWinter = UsageEstimator::estimateDailyKwh(300.0, 700.0, new DateTimeImmutable('2026-12-21', $usageTz), $usageTz, []);
+check(
+    $noSolarSummer >= 300.0 / 30.44 - 0.01 && $noSolarSummer <= 700.0 / 30.44 + 0.01,
+    "with no solar data, the day-of-year fallback still lands within the summer-winter range: got $noSolarSummer",
+);
+check($noSolarWinter > $noSolarSummer, "the day-of-year fallback estimates higher usage in December than June: got $noSolarWinter vs $noSolarSummer");
+
+// A forecast spanning two days picks the target date's own dawn/dusk pair, not always the first day's.
+$day1Dawn = new DateTimeImmutable('2026-03-01 07:00:01', $usageTz);
+$day1Dusk = new DateTimeImmutable('2026-03-01 17:00:01', $usageTz); // an unremarkable 10h day length, day 1 — should be ignored
+$day2Dawn = new DateTimeImmutable('2026-03-02 06:58:01', $usageTz);
+$day2Dusk = new DateTimeImmutable('2026-03-02 23:34:01', $usageTz); // exactly the summer bound (16h36m), day 2 — should be picked up
+$twoDayForecast = [
+    makeSolarBucket($day1Dawn, new DateTimeImmutable('2026-03-01 08:00:00', $usageTz), 200),
+    makeSolarBucket(new DateTimeImmutable('2026-03-01 16:00:00', $usageTz), $day1Dusk, 40),
+    makeSolarBucket($day2Dawn, new DateTimeImmutable('2026-03-02 07:00:00', $usageTz), 220),
+    makeSolarBucket(new DateTimeImmutable('2026-03-02 23:00:00', $usageTz), $day2Dusk, 60),
+];
+$day2Daily = UsageEstimator::estimateDailyKwh(300.0, 700.0, $day2Dawn, $usageTz, $twoDayForecast);
+check(abs($day2Daily - 300.0 / 30.44) < 0.01, "a multi-day forecast uses the target date's own dawn/dusk pair, not the first day's: got $day2Daily");
 
 if ($failures > 0) {
     fwrite(STDERR, "\n$failures/$checks checks failed\n");

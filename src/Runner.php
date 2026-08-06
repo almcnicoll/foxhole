@@ -8,6 +8,7 @@ require_once __DIR__ . '/PriceProvider.php';
 require_once __DIR__ . '/CostBasisProvider.php';
 require_once __DIR__ . '/ScheduleBuilder.php';
 require_once __DIR__ . '/IntelligentScheduleBuilder.php';
+require_once __DIR__ . '/UsageEstimator.php';
 require_once __DIR__ . '/FoxessClient.php';
 require_once __DIR__ . '/SolarForecastClient.php';
 
@@ -137,22 +138,45 @@ function runScheduler(bool $dryRun, ?bool $forceIntelligent = null): array
             // CLAUDE.md's "Running" section); IntelligentScheduleBuilder falls back to
             // assuming the reserve floor when SoC is null, same as it does if every
             // device is unreachable below.
+            //
+            // Multi-device installs (settings.php's device_sns) share one modelled
+            // "battery" — config.battery is one combined capacity, and the same schedule
+            // gets pushed to every device — so a single device's reading shouldn't stand
+            // in for the whole thing. Average whichever devices actually respond, rather
+            // than taking the first success. A reading of exactly 0% is excluded entirely
+            // (not averaged in, not even as a low value) — a real battery never actually
+            // reads that low, so 0% means "no battery attached to this inverter" (a
+            // battery-less inverter reports it that way), not "empty". One real install
+            // here has exactly that device, and averaging its permanent 0% in against a
+            // real battery elsewhere on the same account produced a nonsense low starting
+            // point for the simulation.
             $currentSocPercent = null;
             if (!$dryRun) {
                 $socApiKey = getSetting('foxess_api_key', '');
                 $socDeviceSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('foxess_device_sns', '')))));
+                $socReadings = [];
                 foreach ($socDeviceSns as $sn) {
                     try {
-                        $currentSocPercent = (new FoxessClient($socApiKey, $sn, $config['foxess']['base_url']))->getBatterySoc();
-                        if ($currentSocPercent !== null) {
-                            break;
+                        $soc = (new FoxessClient($socApiKey, $sn, $config['foxess']['base_url']))->getBatterySoc();
+                        if ($soc !== null && $soc > 0.0) {
+                            $socReadings[] = $soc;
                         }
                     } catch (FoxessPushException $e) {
-                        $logger->warn("Battery SoC read from $sn failed, trying next device if any: " . $e->getMessage());
+                        $logger->warn("Battery SoC read from $sn failed, excluding from average: " . $e->getMessage());
                     }
                 }
+                if ($socReadings) {
+                    $currentSocPercent = array_sum($socReadings) / count($socReadings);
+                }
             }
-            $intelligentBuilder = new IntelligentScheduleBuilder($config['strategy'], $config['battery'], $config['usage'] ?? []);
+            $usageConfig = ['avg_daily_kwh' => UsageEstimator::estimateDailyKwh(
+                (float) getSetting('usage_summer_kwh_month', '300'),
+                (float) getSetting('usage_winter_kwh_month', '700'),
+                $targetDate,
+                $timezone,
+                getLatestSolarForecast(),
+            )];
+            $intelligentBuilder = new IntelligentScheduleBuilder($config['strategy'], $config['battery'], $usageConfig);
             $schedule = $intelligentBuilder->build($slots, $exportSlots, $costBasis, getLatestSolarForecast() ?: null, $currentSocPercent);
         } else {
             $schedule = $scheduleBuilder->build($slots, $exportSlots, $costBasis);

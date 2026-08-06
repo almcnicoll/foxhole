@@ -24,6 +24,9 @@ $schedule = $slots
 
 // Live battery state, one call per configured inverter — best-effort, the rest of the
 // dashboard is all local DB reads and shouldn't break if FoxESS is slow or unreachable.
+// A reading of exactly 0% is omitted entirely, not shown as 0% or "unavailable" — a real
+// battery never actually reads that low, so it means "no battery attached to this
+// inverter" (see Runner.php), not something worth a row on the dashboard.
 $apiKey = getSetting('foxess_api_key', '');
 $deviceSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('foxess_device_sns', '')))));
 $batterySocs = []; // device serial => percent (0-100) or null if unavailable
@@ -31,7 +34,11 @@ if ($apiKey !== '' && $deviceSns) {
     $baseUrl = $config['foxess']['base_url'] ?? 'https://www.foxesscloud.com';
     foreach ($deviceSns as $sn) {
         try {
-            $batterySocs[$sn] = (new FoxessClient($apiKey, $sn, $baseUrl))->getBatterySoc();
+            $soc = (new FoxessClient($apiKey, $sn, $baseUrl))->getBatterySoc();
+            if ($soc === 0.0) {
+                continue;
+            }
+            $batterySocs[$sn] = $soc;
         } catch (FoxessPushException $e) {
             $batterySocs[$sn] = null;
         }

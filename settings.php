@@ -71,6 +71,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     $intelligentSchedulerEnabled = isset($_POST['intelligent_scheduler_enabled']);
 
+    $usageSummerKwhMonth = trim((string) ($_POST['usage_summer_kwh_month'] ?? ''));
+    $usageWinterKwhMonth = trim((string) ($_POST['usage_winter_kwh_month'] ?? ''));
+    if (!is_numeric($usageSummerKwhMonth) || (float) $usageSummerKwhMonth < 0) {
+        $errors[] = 'Summer usage must be a non-negative number.';
+    }
+    if (!is_numeric($usageWinterKwhMonth) || (float) $usageWinterKwhMonth < 0) {
+        $errors[] = 'Winter usage must be a non-negative number.';
+    }
+
     if (!$errors) {
         setSetting('foxess_api_key', $apiKey);
         setSetting('foxess_device_sns', implode("\n", $deviceSns));
@@ -87,6 +96,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
         setSetting('intelligent_scheduler_enabled', $intelligentSchedulerEnabled ? '1' : '0');
+        setSetting('usage_summer_kwh_month', (string) (float) $usageSummerKwhMonth);
+        setSetting('usage_winter_kwh_month', (string) (float) $usageWinterKwhMonth);
         if ($newPassword !== '') {
             setSystemPassword($newPassword);
         }
@@ -112,6 +123,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     // Default on — see CLAUDE.md's ScheduleBuilder extension point note.
     $intelligentSchedulerEnabled = getSetting('intelligent_scheduler_enabled', '1') === '1';
+    // Defaults are a plausible typical UK household, not this install's real figures —
+    // update them to match your own bills for an accurate estimate.
+    $usageSummerKwhMonth = getSetting('usage_summer_kwh_month', '300');
+    $usageWinterKwhMonth = getSetting('usage_winter_kwh_month', '700');
 }
 
 // Generated on first view rather than requiring an explicit setup step — same
@@ -192,6 +207,19 @@ renderHeader('Settings');
         <label for="solar_kwp">Installed capacity (kWp)</label>
         <input type="number" step="any" min="0" id="solar_kwp" name="solar_kwp"
             value="<?= htmlspecialchars($solarValues['kwp']) ?>">
+    </fieldset>
+
+    <fieldset>
+        <legend>Estimated usage</legend>
+        <p class="muted">There's no real usage history to draw on, so the intelligent scheduler estimates a daily
+            figure by interpolating between these two using day length (longer days lean towards summer, shorter
+            towards winter) — check a few recent bills for your own monthly averages.</p>
+        <label for="usage_summer_kwh_month">Summer usage (kWh/month, longest day)</label>
+        <input type="number" step="any" min="0" id="usage_summer_kwh_month" name="usage_summer_kwh_month"
+            value="<?= htmlspecialchars($usageSummerKwhMonth) ?>">
+        <label for="usage_winter_kwh_month">Winter usage (kWh/month, shortest day)</label>
+        <input type="number" step="any" min="0" id="usage_winter_kwh_month" name="usage_winter_kwh_month"
+            value="<?= htmlspecialchars($usageWinterKwhMonth) ?>">
     </fieldset>
 
     <fieldset>
