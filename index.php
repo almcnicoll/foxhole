@@ -70,6 +70,32 @@ function renderSolarForecast(array $forecast, DateTimeZone $timezone): void
     ?>
 <h3>Solar forecast</h3>
 <p class="muted">Estimated generation, fetched <?= htmlspecialchars($forecast[0]['fetched_at']->setTimezone($timezone)->format('D j M, H:i')) ?> — not yet used to shape the schedule.</p>
+<?php
+  // Two columns like the price table below — split by calendar day (today's remaining
+  // buckets, then tomorrow's) rather than an hour cutoff, since that's the natural,
+  // already-present split in solar's ~2-day forecast (unlike price data, which is always
+  // exactly one day).
+  $firstDate = $forecast[0]['from']->setTimezone($timezone)->format('Y-m-d');
+  $todayBuckets = [];
+  $laterBuckets = [];
+  foreach ($forecast as $slot) {
+      if ($slot['from']->setTimezone($timezone)->format('Y-m-d') === $firstDate) {
+          $todayBuckets[] = $slot;
+      } else {
+          $laterBuckets[] = $slot;
+      }
+  }
+?>
+<div class="slot-columns">
+    <?php renderSolarTable($todayBuckets, $timezone); ?>
+    <?php renderSolarTable($laterBuckets, $timezone); ?>
+</div>
+<?php
+}
+
+function renderSolarTable(array $bucketsForColumn, DateTimeZone $timezone): void
+{
+    ?>
 <table>
     <thead>
         <tr>
@@ -78,7 +104,7 @@ function renderSolarForecast(array $forecast, DateTimeZone $timezone): void
         </tr>
     </thead>
     <tbody>
-        <?php foreach ($forecast as $slot):
+        <?php foreach ($bucketsForColumn as $slot):
           if ($slot['from'] == $slot['to']) {
               continue; // zero-width sunrise/sunset marker from SolarForecastClient, nothing to show
           }
@@ -101,10 +127,13 @@ function renderSolarForecast(array $forecast, DateTimeZone $timezone): void
  * day, midnight to midnight, with a "now" marker and the schedule mode tinted behind each
  * half-hour — same colours as the data table's row/badge tints (var(--row-*), see style.css)
  * so the chart and table read as one system. Hand-rolled inline SVG rather than a charting
- * library: SVG is a native browser feature (this app has no JS at all otherwise), it can
- * reference the page's own CSS custom properties directly (dark mode "for free", same as
- * every other themed element), and there's nothing here — two axes, a handful of polylines,
- * some background rects — that actually needs a dependency.
+ * library: SVG is a native browser feature, it can reference the page's own CSS custom
+ * properties directly (dark mode "for free", same as every other themed element), and
+ * there's nothing here — two axes, a handful of polylines, some background rects — that
+ * actually needs a dependency. One small inline <script> at the end (this app's only JS)
+ * drives the point tooltips — not the native SVG <title> a first version relied on, since
+ * that turned out not to reliably show in real Chrome despite hit-testing/hover working
+ * correctly (confirmed live) — likely because the hit target's fill is fully transparent.
  *
  * @param array $slots getLatestRateSlots()-shaped rows for the displayed day
  * @param array $solarForecast getLatestSolarForecast()-shaped rows (any date range — filtered to $slots' day below)
@@ -172,13 +201,45 @@ function renderPriceChart(array $slots, array $solarForecast, array $groups, Dat
         $grid .= sprintf('<text x="%.1f" y="%.1f" fill="var(--color-muted)" font-size="10" text-anchor="middle">%02d:00</text>', $x($h * 60), $height - 4, $h);
     }
 
+    // Each series gets a small hoverable marker per point alongside its polyline. Two
+    // circles per point, not one: the visible dot (.chart-dot) stays small at rest so it
+    // doesn't clutter the line, but a small dot is a poor mouse target — a larger invisible
+    // one (.chart-hit) sits underneath to actually catch the hover, and grows the visible
+    // dot via a CSS sibling selector (style.css) so growth is centred on the same point
+    // rather than the hit area itself visibly resizing.
+    //
+    // The tooltip itself is a small custom one (script at the bottom of this function),
+    // not the native SVG <title> a first version relied on — confirmed in real Chrome
+    // (via Claude in Chrome) that :hover/pointer-events on .chart-hit fire correctly (the
+    // dot visibly grows) but Chrome never shows the native title tooltip for it, most
+    // likely because the hit circle's fill is fully transparent rather than a real (if
+    // faint) colour. <title> is kept alongside data-tooltip anyway, harmless and still
+    // gives assistive tech an accessible name even where the visual tooltip doesn't fire.
+    $marker = fn(float $px, float $py, string $color, string $title) => sprintf(
+        '<circle class="chart-hit" cx="%.1f" cy="%.1f" r="8" fill="transparent" data-tooltip="%s"><title>%s</title></circle><circle class="chart-dot" cx="%.1f" cy="%.1f" r="2" fill="%s" />',
+        $px,
+        $py,
+        htmlspecialchars($title),
+        htmlspecialchars($title),
+        $px,
+        $py,
+        $color,
+    );
+
     $importPoints = [];
     $exportPoints = [];
+    $importMarkers = '';
+    $exportMarkers = '';
     foreach ($slots as $slot) {
         $px = $x($minutesOf($slot['from']));
-        $importPoints[] = sprintf('%.1f,%.1f', $px, $yPrice($slot['import_rate']));
+        $time = $slot['from']->setTimezone($timezone)->format('H:i');
+        $importY = $yPrice($slot['import_rate']);
+        $importPoints[] = sprintf('%.1f,%.1f', $px, $importY);
+        $importMarkers .= $marker($px, $importY, 'var(--color-error)', sprintf('Import: %sp/kWh at %s', number_format($slot['import_rate'], 2), $time));
         if ($slot['export_rate'] !== null) {
-            $exportPoints[] = sprintf('%.1f,%.1f', $px, $yPrice($slot['export_rate']));
+            $exportY = $yPrice($slot['export_rate']);
+            $exportPoints[] = sprintf('%.1f,%.1f', $px, $exportY);
+            $exportMarkers .= $marker($px, $exportY, 'var(--color-success)', sprintf('Export: %sp/kWh at %s', number_format($slot['export_rate'], 2), $time));
         }
     }
 
@@ -186,6 +247,7 @@ function renderPriceChart(array $slots, array $solarForecast, array $groups, Dat
     // the day $slots belongs to, and plot each bucket at its own midpoint since buckets
     // aren't a fixed half-hour grid like price slots (hourly, plus odd sunrise/sunset ones).
     $solarPoints = [];
+    $solarMarkers = '';
     if ($kwMax > 0 && $solarForecast) {
         $dayStart = $slots[0]['from']->setTimezone($timezone)->setTime(0, 0);
         $dayEnd = $dayStart->modify('+1 day');
@@ -198,8 +260,11 @@ function renderPriceChart(array $slots, array $solarForecast, array $groups, Dat
             if ($mid < $dayStart || $mid >= $dayEnd) {
                 continue;
             }
-            $kw = ($bucket['watt_hours'] / 1000) / ($durationSeconds / 3600);
-            $solarPoints[] = sprintf('%.1f,%.1f', $x($minutesOf($mid)), $yKw(min($kw, $kwMax)));
+            $kw = min(($bucket['watt_hours'] / 1000) / ($durationSeconds / 3600), $kwMax);
+            $px = $x($minutesOf($mid));
+            $py = $yKw($kw);
+            $solarPoints[] = sprintf('%.1f,%.1f', $px, $py);
+            $solarMarkers .= $marker($px, $py, 'var(--color-solar)', sprintf('Solar: %skW at %s', number_format($kw, 2), $mid->format('H:i')));
         }
     }
 
@@ -224,12 +289,43 @@ function renderPriceChart(array $slots, array $solarForecast, array $groups, Dat
         <?php if ($solarPoints): ?><polyline points="<?= implode(' ', $solarPoints) ?>" fill="none" stroke="var(--color-solar)" stroke-width="2" /><?php endif; ?>
     </g>
     <?= $grid ?>
+    <?php /* Markers sit outside the clipped group, deliberately — the first/last point of
+    every series lands exactly on the clip boundary, and clip-path silently eats half their
+    hit-circle there (confirmed live: elementFromPoint missed it), breaking hover for
+    exactly those points. */ ?>
+    <g><?= $importMarkers . $exportMarkers . $solarMarkers ?></g>
     <g font-size="10" fill="var(--color-muted)">
         <line x1="<?= $marginLeft ?>" y1="12" x2="<?= $marginLeft + 16 ?>" y2="12" stroke="var(--color-error)" stroke-width="2" /><text x="<?= $marginLeft + 20 ?>" y="15">Import price</text>
         <line x1="<?= $marginLeft + 110 ?>" y1="12" x2="<?= $marginLeft + 126 ?>" y2="12" stroke="var(--color-success)" stroke-width="2" /><text x="<?= $marginLeft + 130 ?>" y="15">Export price</text>
         <?php if ($kwMax > 0): ?><line x1="<?= $marginLeft + 220 ?>" y1="12" x2="<?= $marginLeft + 236 ?>" y2="12" stroke="var(--color-solar)" stroke-width="2" /><text x="<?= $marginLeft + 240 ?>" y="15">Solar forecast</text><?php endif; ?>
     </g>
 </svg>
+<script>
+(function () {
+    var svg = document.currentScript.previousElementSibling;
+    var tooltip = document.getElementById('chart-tooltip');
+    if (!tooltip) {
+        tooltip = document.createElement('div');
+        tooltip.id = 'chart-tooltip';
+        tooltip.className = 'chart-tooltip';
+        document.body.appendChild(tooltip);
+    }
+    svg.addEventListener('mousemove', function (e) {
+        var target = e.target.closest && e.target.closest('.chart-hit');
+        if (!target) {
+            tooltip.style.display = 'none';
+            return;
+        }
+        tooltip.textContent = target.dataset.tooltip;
+        tooltip.style.left = (e.clientX + 12) + 'px';
+        tooltip.style.top = (e.clientY + 12) + 'px';
+        tooltip.style.display = 'block';
+    });
+    svg.addEventListener('mouseleave', function () {
+        tooltip.style.display = 'none';
+    });
+})();
+</script>
 <?php
 }
 

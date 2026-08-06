@@ -124,6 +124,37 @@ th {
     margin: 1rem 0;
 }
 
+/* Chart data points: a small dot at rest, an invisible larger circle underneath actually
+   catches the hover (a 2-unit dot is too small a target to reliably hover itself), and
+   grows the dot via this sibling selector so growth stays centred on the point. */
+.price-chart .chart-hit {
+    pointer-events: all;
+}
+.price-chart .chart-dot {
+    pointer-events: none;
+    transition: r 0.12s ease;
+}
+.price-chart .chart-hit:hover + .chart-dot {
+    r: 5;
+}
+
+/* Custom point tooltip (see the <script> at the end of renderPriceChart()) — positioned
+   via JS (left/top, following the cursor), everything else is styling. */
+.chart-tooltip {
+    display: none;
+    position: fixed;
+    z-index: 1000;
+    background: var(--color-bg);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+    border-radius: 4px;
+    padding: 0.3rem 0.5rem;
+    font-size: 0.8rem;
+    white-space: nowrap;
+    pointer-events: none;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+}
+
 tr.row-ForceCharge {
     background: var(--row-ForceCharge);
 }
