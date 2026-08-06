@@ -80,7 +80,16 @@ class IntelligentScheduleBuilder
         $dischargeKw = (float) ($this->batteryConfig['max_discharge_kw'] ?? 0);
         $minSocOnGrid = (int) ($this->batteryConfig['min_soc_on_grid'] ?? 0);
         $reserveSoc = (int) ($this->batteryConfig['reserve_soc'] ?? 0);
+        // Two different floors, per CLAUDE.md's own distinction (they're both 15-21%
+        // in practice, not 0 — easy to conflate since they're usually equal): reserveKwh
+        // (reserve_soc) is specifically how far a *forced* discharge is allowed to drain
+        // the battery, so it only bounds the discharge-feasibility check below. Everything
+        // else — the natural/unforced solar-minus-load trajectory that sizes how much
+        // top-up is needed, and the non-charge/non-discharge slots in the planned
+        // trajectory — floors at minSocOnGridKwh (min_soc_on_grid), the inverter's general
+        // system floor, since nothing is force-draining the battery in those slots.
         $reserveKwh = $capacityKwh * $reserveSoc / 100;
+        $minSocOnGridKwh = $capacityKwh * $minSocOnGrid / 100;
         $chargeEnergyKwh = $chargeKw * 0.5;
         $dischargeEnergyKwh = $dischargeKw * 0.5;
         $startingSocPercent = $currentSocPercent ?? (float) $reserveSoc;
@@ -98,7 +107,7 @@ class IntelligentScheduleBuilder
         $soc = $startingSocKwh;
         $projectedMaxBeforePeak = $soc;
         for ($i = 0; $i < $peakImportIndex; $i++) {
-            $soc = max($reserveKwh, min($capacityKwh, $soc + $netKwh[$i]));
+            $soc = max($minSocOnGridKwh, min($capacityKwh, $soc + $netKwh[$i]));
             $projectedMaxBeforePeak = max($projectedMaxBeforePeak, $soc);
         }
         $neededTopUpKwh = max(0.0, $capacityKwh - $projectedMaxBeforePeak);
@@ -144,7 +153,7 @@ class IntelligentScheduleBuilder
             $plannedSocBefore[$i] = $soc;
             $soc = isset($chargeSet[$i])
                 ? min($capacityKwh, $soc + $chargeEnergyKwh)
-                : max($reserveKwh, min($capacityKwh, $soc + $netKwh[$i]));
+                : max($minSocOnGridKwh, min($capacityKwh, $soc + $netKwh[$i]));
         }
 
         $dischargeCapConfig = max(0, (int) ($this->strategyConfig['expensive_slots_to_export'] ?? 0));
@@ -175,7 +184,7 @@ class IntelligentScheduleBuilder
                     }
                     $soc -= $dischargeEnergyKwh;
                 } else {
-                    $soc = max($reserveKwh, min($capacityKwh, $soc + $netKwh[$i]));
+                    $soc = max($minSocOnGridKwh, min($capacityKwh, $soc + $netKwh[$i]));
                 }
             }
             if (!$violated) {

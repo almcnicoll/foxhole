@@ -583,6 +583,33 @@ check(
 $dischargeGroups = array_filter($lowSoc['groups'], fn($g) => $g['workMode'] === 'ForceDischarge');
 check(count($dischargeGroups) === 0, 'a battery barely above reserve with nothing charged gets no discharge slots forced: got ' . count($dischargeGroups));
 
+// The natural (unforced) trajectory must floor at min_soc_on_grid, not reserve_soc — those
+// are two different config values (CLAUDE.md: min_soc_on_grid is the general system floor,
+// reserve_soc is specifically how far a *forced* discharge may drain it). Use a battery
+// where they differ: min_soc_on_grid 50% (5kWh of 10kWh) is well above reserve_soc 10%
+// (1kWh). A full day of load-only drain (no solar, no charging) should settle at the
+// *higher* min_soc_on_grid floor by the time a discharge candidate is evaluated — if the
+// natural trajectory wrongly floored at reserve_soc instead, it would already be sitting
+// at 1kWh with no room left, and the discharge below would be (wrongly) rejected as
+// infeasible instead of accepted.
+$floorTestStrategy = ['cheap_slots_to_charge' => 0, 'expensive_slots_to_export' => 1, 'timezone' => 'Europe/London']; // caps force exactly one discharge candidate, no charging, so the tie-break rules don't complicate the arithmetic
+$floorTestBattery = ['capacity_kwh' => 10.0, 'max_charge_kw' => 4.0, 'max_discharge_kw' => 4.0, 'min_soc_on_grid' => 50, 'reserve_soc' => 10];
+$floorTestBuilder = new IntelligentScheduleBuilder($floorTestStrategy, $floorTestBattery, ['avg_daily_kwh' => 48.0]); // 1kWh/slot load, no solar
+$floorTestRates = array_fill(0, 48, 20.0);
+$floorTestRates[20] = 100.0; // sole discharge candidate and the day's peak, at 10:00
+$floorTestSlots = makeIntelligentSlots($floorTestRates, $intelligentTz, '2026-06-01');
+$floorTestCostBasis = array_fill(0, 48, 0.0); // nothing ever qualifies to charge
+$floorTest = $floorTestBuilder->build($floorTestSlots, null, $floorTestCostBasis, null, 100.0); // battery starts full
+check(
+    !array_filter($floorTest['groups'], fn($g) => $g['workMode'] === 'ForceCharge'),
+    'sanity check: nothing charges in the min_soc_on_grid-vs-reserve_soc scenario (cost basis is 0, below every rate)',
+);
+$floorTestDischarge = array_filter($floorTest['groups'], fn($g) => $g['workMode'] === 'ForceDischarge');
+check(
+    count($floorTestDischarge) === 1,
+    'a discharge candidate 10 hours into a load-only drain is feasible against the min_soc_on_grid floor (5kWh), not the lower reserve_soc floor (1kWh): got ' . count($floorTestDischarge) . ' discharge group(s)',
+);
+
 // High starting SoC with a variable export rate: discharge should include the export peak.
 $highSoc = $intelligentBuilder->build($intelligentImportSlots, $intelligentExportSlots, $intelligentCostBasis, null, 90.0);
 $dischargeGroups2 = array_values(array_filter($highSoc['groups'], fn($g) => $g['workMode'] === 'ForceDischarge'));
