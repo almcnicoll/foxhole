@@ -20,9 +20,12 @@
   --color-warning-bg: #fff8e6;
   --color-error: #cf222e;
   --color-error-bg: #fdeeee;
+  --color-solar: #daa520;
 
-  --row-ForceCharge: #1a7f371a;
-  --row-ForceDischarge: #cf222e1a;
+  /* Green = discharging/exporting (saving money), red = charging/importing (costs money) —
+     mode colouring is about cost direction, not charge-vs-discharge as such. */
+  --row-ForceCharge: #cf222e1a;
+  --row-ForceDischarge: #1a7f371a;
   --row-SelfUse: #8888881a;
 
   --soc-red: #cf222e;
@@ -72,13 +75,15 @@ th { background: var(--color-primary-dark); color: #fff; }
 
 .currency { font-family: var(--currency-font); text-align: right; }
 
+.price-chart { display: block; width: 100%; height: auto; margin: 1rem 0; }
+
 tr.row-ForceCharge { background: var(--row-ForceCharge); }
 tr.row-ForceDischarge { background: var(--row-ForceDischarge); }
 tr.row-SelfUse { background: var(--row-SelfUse); }
 
 .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 1rem; font-size: 0.8rem; }
-.badge-ForceCharge { background: #1a7f371a; color: #1a7f37; }
-.badge-ForceDischarge { background: #cf222e1a; color: #cf222e; }
+.badge-ForceCharge { background: #cf222e1a; color: #cf222e; }
+.badge-ForceDischarge { background: #1a7f371a; color: #1a7f37; }
 .badge-SelfUse { background: #6666661a; color: #666; }
 
 form { display: flex; flex-direction: column; gap: 0.8rem; /*max-width: 360px;*/ }

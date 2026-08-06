@@ -14,6 +14,7 @@ $minSoc = (float) ($config['battery']['min_soc_on_grid'] ?? 0);
 
 $slots = getLatestRateSlots();
 $solarForecast = getSetting('solar_enabled', '0') === '1' ? getLatestSolarForecast() : [];
+$installedKwp = (float) getSetting('solar_kwp', '0');
 // Rate slots are only ever fetched for one date at a time (see Store::saveRateSlots) —
 // show that same date's own plan, not a spliced view (splicing is a push-time-only
 // concern, see Runner.php's runScheduler()).
@@ -84,6 +85,144 @@ function renderSolarForecast(array $forecast, DateTimeZone $timezone): void
         <?php endforeach; ?>
     </tbody>
 </table>
+<?php
+}
+
+/**
+ * Full-width chart above the price/solar tables: import/export price (left axis, fixed
+ * -20..50p/kWh) and solar forecast (right axis, fixed 0..installed kWp) over one calendar
+ * day, midnight to midnight, with a "now" marker and the schedule mode tinted behind each
+ * half-hour — same colours as the data table's row/badge tints (var(--row-*), see style.css)
+ * so the chart and table read as one system. Hand-rolled inline SVG rather than a charting
+ * library: SVG is a native browser feature (this app has no JS at all otherwise), it can
+ * reference the page's own CSS custom properties directly (dark mode "for free", same as
+ * every other themed element), and there's nothing here — two axes, a handful of polylines,
+ * some background rects — that actually needs a dependency.
+ *
+ * @param array $slots getLatestRateSlots()-shaped rows for the displayed day
+ * @param array $solarForecast getLatestSolarForecast()-shaped rows (any date range — filtered to $slots' day below)
+ * @param array $groups schedule groups for the displayed day (same shape slotWorkMode() expects)
+ */
+function renderPriceChart(array $slots, array $solarForecast, array $groups, DateTimeZone $timezone, float $installedKwp, bool $isToday): void
+{
+    if (!$slots) {
+        return;
+    }
+
+    $width = 1000;
+    $height = 320;
+    $marginLeft = 46;
+    $marginRight = 54;
+    $marginTop = 30;
+    $marginBottom = 24;
+    $plotWidth = $width - $marginLeft - $marginRight;
+    $plotHeight = $height - $marginTop - $marginBottom;
+    $priceMin = -20.0;
+    $priceMax = 50.0;
+    $kwMax = $installedKwp > 0 ? $installedKwp : 0.0;
+
+    $x = fn(int $minutes) => $marginLeft + ($minutes / 1440) * $plotWidth;
+    $yPrice = fn(float $p) => $marginTop + (1 - ($p - $priceMin) / ($priceMax - $priceMin)) * $plotHeight;
+    $yKw = fn(float $kw) => $marginTop + (1 - ($kwMax > 0 ? $kw / $kwMax : 0)) * $plotHeight;
+    $minutesOf = fn(DateTimeImmutable $t) => ((int) $t->setTimezone($timezone)->format('G')) * 60 + (int) $t->setTimezone($timezone)->format('i');
+
+    // One background rect per half-hour slot we actually have data for (a partial day just
+    // leaves a gap — see CLAUDE.md's "Partial-day data is normal" — rather than guessing).
+    $bands = '';
+    foreach ($slots as $slot) {
+        $startMin = $minutesOf($slot['from']);
+        $endMin = $minutesOf($slot['to']);
+        if ($endMin <= $startMin) {
+            $endMin = 24 * 60; // a slot ending at local midnight formats as 0, i.e. end of day
+        }
+        $mode = slotWorkMode($startMin, $groups);
+        $bands .= sprintf(
+            '<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="var(--row-%s)" />',
+            $x($startMin),
+            $marginTop,
+            $x($endMin) - $x($startMin),
+            $plotHeight,
+            htmlspecialchars($mode),
+        );
+    }
+
+    // Left axis (price) gridlines/labels at fixed 10p increments across the fixed -20..50 range.
+    $grid = '';
+    for ($p = $priceMin; $p <= $priceMax + 0.01; $p += 10) {
+        $gy = $yPrice($p);
+        $grid .= sprintf('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="var(--color-border)" />', $marginLeft, $gy, $marginLeft + $plotWidth, $gy);
+        $grid .= sprintf('<text x="%.1f" y="%.1f" fill="var(--color-muted)" font-size="10" text-anchor="end" dominant-baseline="middle">%dp</text>', $marginLeft - 6, $gy, (int) round($p));
+    }
+    // Right axis (kW) labels only — the price gridlines above already mark the horizontal
+    // divisions; a second, differently-scaled set of gridlines for kW would just clutter.
+    if ($kwMax > 0) {
+        foreach ([0, $kwMax / 2, $kwMax] as $kwMark) {
+            $grid .= sprintf('<text x="%.1f" y="%.1f" fill="var(--color-muted)" font-size="10" text-anchor="start" dominant-baseline="middle">%.1fkW</text>', $marginLeft + $plotWidth + 6, $yKw($kwMark), $kwMark);
+        }
+    }
+    // Time-of-day labels, every 3 hours.
+    for ($h = 0; $h <= 21; $h += 3) {
+        $grid .= sprintf('<text x="%.1f" y="%.1f" fill="var(--color-muted)" font-size="10" text-anchor="middle">%02d:00</text>', $x($h * 60), $height - 4, $h);
+    }
+
+    $importPoints = [];
+    $exportPoints = [];
+    foreach ($slots as $slot) {
+        $px = $x($minutesOf($slot['from']));
+        $importPoints[] = sprintf('%.1f,%.1f', $px, $yPrice($slot['import_rate']));
+        if ($slot['export_rate'] !== null) {
+            $exportPoints[] = sprintf('%.1f,%.1f', $px, $yPrice($slot['export_rate']));
+        }
+    }
+
+    // Solar forecast is stored across ~2 days (see SolarForecastClient) — filter to just
+    // the day $slots belongs to, and plot each bucket at its own midpoint since buckets
+    // aren't a fixed half-hour grid like price slots (hourly, plus odd sunrise/sunset ones).
+    $solarPoints = [];
+    if ($kwMax > 0 && $solarForecast) {
+        $dayStart = $slots[0]['from']->setTimezone($timezone)->setTime(0, 0);
+        $dayEnd = $dayStart->modify('+1 day');
+        foreach ($solarForecast as $bucket) {
+            $durationSeconds = $bucket['to']->getTimestamp() - $bucket['from']->getTimestamp();
+            if ($durationSeconds <= 0) {
+                continue; // zero-width sunrise/sunset marker
+            }
+            $mid = (new DateTimeImmutable('@' . ($bucket['from']->getTimestamp() + intdiv($durationSeconds, 2))))->setTimezone($timezone);
+            if ($mid < $dayStart || $mid >= $dayEnd) {
+                continue;
+            }
+            $kw = ($bucket['watt_hours'] / 1000) / ($durationSeconds / 3600);
+            $solarPoints[] = sprintf('%.1f,%.1f', $x($minutesOf($mid)), $yKw(min($kw, $kwMax)));
+        }
+    }
+
+    // "Now" only makes sense when the displayed day is today — the chart still shows
+    // tomorrow's forecast, once fetched, with no "now" line at all.
+    $nowLine = '';
+    if ($isToday) {
+        $now = new DateTimeImmutable('now', $timezone);
+        $nowX = $x(((int) $now->format('G')) * 60 + (int) $now->format('i'));
+        $nowLine = sprintf('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="var(--color-primary)" stroke-width="1.5" stroke-dasharray="4,3" />', $nowX, $marginTop, $nowX, $marginTop + $plotHeight);
+    }
+    ?>
+<svg class="price-chart" viewBox="0 0 <?= $width ?> <?= $height ?>" role="img" aria-label="Import and export price, and solar forecast, over the day">
+    <defs>
+        <clipPath id="price-chart-plot"><rect x="<?= $marginLeft ?>" y="<?= $marginTop ?>" width="<?= $plotWidth ?>" height="<?= $plotHeight ?>" /></clipPath>
+    </defs>
+    <g clip-path="url(#price-chart-plot)">
+        <?= $bands ?>
+        <?= $nowLine ?>
+        <polyline points="<?= implode(' ', $importPoints) ?>" fill="none" stroke="var(--color-error)" stroke-width="2" />
+        <?php if ($exportPoints): ?><polyline points="<?= implode(' ', $exportPoints) ?>" fill="none" stroke="var(--color-success)" stroke-width="2" /><?php endif; ?>
+        <?php if ($solarPoints): ?><polyline points="<?= implode(' ', $solarPoints) ?>" fill="none" stroke="var(--color-solar)" stroke-width="2" /><?php endif; ?>
+    </g>
+    <?= $grid ?>
+    <g font-size="10" fill="var(--color-muted)">
+        <line x1="<?= $marginLeft ?>" y1="12" x2="<?= $marginLeft + 16 ?>" y2="12" stroke="var(--color-error)" stroke-width="2" /><text x="<?= $marginLeft + 20 ?>" y="15">Import price</text>
+        <line x1="<?= $marginLeft + 110 ?>" y1="12" x2="<?= $marginLeft + 126 ?>" y2="12" stroke="var(--color-success)" stroke-width="2" /><text x="<?= $marginLeft + 130 ?>" y="15">Export price</text>
+        <?php if ($kwMax > 0): ?><line x1="<?= $marginLeft + 220 ?>" y1="12" x2="<?= $marginLeft + 236 ?>" y2="12" stroke="var(--color-solar)" stroke-width="2" /><text x="<?= $marginLeft + 240 ?>" y="15">Solar forecast</text><?php endif; ?>
+    </g>
+</svg>
 <?php
 }
 
@@ -194,6 +333,11 @@ $ranClass = !$ranOk ? 'alert-error' : ((str_contains($ranMsg, 'unchanged') || st
 <form method="post" action="run-now.php">
     <button type="submit">Run now</button>
 </form>
+
+<?php
+  $isToday = $slots[0]['from']->setTimezone($timezone)->format('Y-m-d') === (new DateTimeImmutable('today', $timezone))->format('Y-m-d');
+  renderPriceChart($slots, $solarForecast, $schedule['groups'], $timezone, $installedKwp, $isToday);
+?>
 
 <?php
   $leftSlots = [];
