@@ -15,7 +15,15 @@ if (PHP_SAPI !== 'cli') {
 require_once __DIR__ . '/src/Runner.php';
 
 $dryRun = in_array('--dry-run', $argv, true);
-$result = runScheduler($dryRun);
+$forceClassic = in_array('--classic', $argv, true);
+$forceIntelligent = in_array('--intelligent', $argv, true);
+if ($forceClassic && $forceIntelligent) {
+    fwrite(STDERR, "--classic and --intelligent are mutually exclusive.\n");
+    exit(1);
+}
+// Neither flag: use the intelligent_scheduler_enabled setting, same as run-now.php.
+$modeOverride = $forceClassic ? false : ($forceIntelligent ? true : null);
+$result = runScheduler($dryRun, $modeOverride);
 
 if ($result['ok'] && $dryRun) {
     echo json_encode($result['schedule'], JSON_PRETTY_PRINT) . PHP_EOL;

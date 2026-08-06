@@ -7,6 +7,7 @@ require_once __DIR__ . '/OctopusClient.php';
 require_once __DIR__ . '/PriceProvider.php';
 require_once __DIR__ . '/CostBasisProvider.php';
 require_once __DIR__ . '/ScheduleBuilder.php';
+require_once __DIR__ . '/IntelligentScheduleBuilder.php';
 require_once __DIR__ . '/FoxessClient.php';
 require_once __DIR__ . '/SolarForecastClient.php';
 
@@ -16,9 +17,14 @@ require_once __DIR__ . '/SolarForecastClient.php';
  * — same logic, gated by two different trust mechanisms. Never exits; callers
  * decide what to do with the result (exit code for cron, a message for the UI).
  *
+ * @param ?bool $forceIntelligent overrides the `intelligent_scheduler_enabled` setting for
+ *        this run only — true/false forces that mode regardless of the stored setting, null
+ *        (the default, and what run-now.php always passes) reads the setting as normal. This
+ *        is how run.php's --classic/--intelligent CLI flags work; there's no UI equivalent —
+ *        the setting itself is what the dashboard's "Run now" and cron both read.
  * @return array{ok: bool, dryRun: bool, message: string, schedule: ?array}
  */
-function runScheduler(bool $dryRun): array
+function runScheduler(bool $dryRun, ?bool $forceIntelligent = null): array
 {
     $logger = new Logger(__DIR__ . '/../logs/scheduler.log');
     $config = [];
@@ -113,8 +119,44 @@ function runScheduler(bool $dryRun): array
         }
 
         $costBasis = (new CostBasisProvider($config['cost_basis']))->getCostBasis(count($slots));
+
+        // $scheduleBuilder is always constructed — even in intelligent mode — because
+        // applyOverrides()/spliceForPush() below are pure group/interval transforms that
+        // only need battery config, not any of ScheduleBuilder's own price-selection
+        // state, so both scheduler modes share this one instance for those two steps
+        // rather than IntelligentScheduleBuilder duplicating them.
         $scheduleBuilder = new ScheduleBuilder($config['strategy'], $config['battery']);
-        $schedule = $scheduleBuilder->build($slots, $exportSlots, $costBasis);
+
+        $useIntelligent = $forceIntelligent ?? (getSetting('intelligent_scheduler_enabled', '1') === '1');
+        $logger->info('Scheduler mode: ' . ($useIntelligent ? 'intelligent' : 'classic') . ($forceIntelligent !== null ? ' (forced via CLI flag)' : ' (from settings)'));
+
+        if ($useIntelligent) {
+            // Real battery SoC makes the projected-energy simulation meaningfully more
+            // accurate, but reading it means touching FoxESS credentials — skipped for a
+            // dry run so `--dry-run` keeps working with no FoxESS config at all (see
+            // CLAUDE.md's "Running" section); IntelligentScheduleBuilder falls back to
+            // assuming the reserve floor when SoC is null, same as it does if every
+            // device is unreachable below.
+            $currentSocPercent = null;
+            if (!$dryRun) {
+                $socApiKey = getSetting('foxess_api_key', '');
+                $socDeviceSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('foxess_device_sns', '')))));
+                foreach ($socDeviceSns as $sn) {
+                    try {
+                        $currentSocPercent = (new FoxessClient($socApiKey, $sn, $config['foxess']['base_url']))->getBatterySoc();
+                        if ($currentSocPercent !== null) {
+                            break;
+                        }
+                    } catch (FoxessPushException $e) {
+                        $logger->warn("Battery SoC read from $sn failed, trying next device if any: " . $e->getMessage());
+                    }
+                }
+            }
+            $intelligentBuilder = new IntelligentScheduleBuilder($config['strategy'], $config['battery'], $config['usage'] ?? []);
+            $schedule = $intelligentBuilder->build($slots, $exportSlots, $costBasis, getLatestSolarForecast() ?: null, $currentSocPercent);
+        } else {
+            $schedule = $scheduleBuilder->build($slots, $exportSlots, $costBasis);
+        }
         $now = new DateTimeImmutable('now', $timezone);
 
         // Rates are worth recording even in a dry run — it's what powers the dashboard.

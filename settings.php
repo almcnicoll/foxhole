@@ -59,6 +59,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
+    $intelligentSchedulerEnabled = isset($_POST['intelligent_scheduler_enabled']);
+
     if (!$errors) {
         setSetting('foxess_api_key', $apiKey);
         setSetting('foxess_device_sns', implode("\n", $deviceSns));
@@ -74,6 +76,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 setSetting("solar_{$field}", (string) (float) $solarValues[$field]);
             }
         }
+        setSetting('intelligent_scheduler_enabled', $intelligentSchedulerEnabled ? '1' : '0');
         if ($newPassword !== '') {
             setSystemPassword($newPassword);
         }
@@ -97,6 +100,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     foreach ($solarFields as $field) {
         $solarValues[$field] = getSetting("solar_{$field}", '');
     }
+    // Default on — see CLAUDE.md's ScheduleBuilder extension point note.
+    $intelligentSchedulerEnabled = getSetting('intelligent_scheduler_enabled', '1') === '1';
 }
 
 renderHeader('Settings');
@@ -129,8 +134,17 @@ renderHeader('Settings');
   </fieldset>
 
   <fieldset>
+    <legend>Scheduler</legend>
+    <label for="intelligent_scheduler_enabled">
+      <input type="checkbox" id="intelligent_scheduler_enabled" name="intelligent_scheduler_enabled" <?= $intelligentSchedulerEnabled ? 'checked' : '' ?>>
+      Use the intelligent scheduler
+    </label>
+    <p class="muted">Simulates battery charge through the day using the solar forecast below, an estimated usage profile, and import/export price, instead of a flat price-threshold rule. Uncheck to fall back to the simpler price-only scheduler. <code>run.php</code> can also override this per-run with <code>--classic</code> or <code>--intelligent</code>.</p>
+  </fieldset>
+
+  <fieldset>
     <legend>Solar forecast</legend>
-    <p class="muted">Retrieved from <a href="https://forecast.solar" target="_blank" rel="noopener">Forecast.Solar</a> (free, no API key) and shown on the dashboard — not yet used to change the schedule itself.</p>
+    <p class="muted">Retrieved from <a href="https://forecast.solar" target="_blank" rel="noopener">Forecast.Solar</a> (free, no API key) and shown on the dashboard. Feeds the intelligent scheduler above when enabled.</p>
     <label for="solar_enabled">
       <input type="checkbox" id="solar_enabled" name="solar_enabled" <?= $solarEnabled ? 'checked' : '' ?>>
       Enabled

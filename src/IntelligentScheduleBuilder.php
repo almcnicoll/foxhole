@@ -2,7 +2,8 @@
 
 require_once __DIR__ . '/Exceptions.php';
 
-// EXPERIMENTAL — not wired into Runner.php's production pipeline, not committed.
+// Toggled via the `intelligent_scheduler_enabled` setting (settings.php, on by default) —
+// see Runner.php's runScheduler(). run.php can override it per-run with --classic/--intelligent.
 // See roadmap.MD's "Solar-generation-aware scheduling" / "Load-aware scheduling" /
 // "Live battery SoC awareness" items: this combines all three into one scheduler,
 // instead of ScheduleBuilder's plain price-threshold-with-flat-caps heuristic.

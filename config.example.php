@@ -26,6 +26,13 @@ return [
         'expensive_slots_to_export' => 4,  // number of half-hour slots to force-discharge/export
         'timezone' => 'Europe/London',
     ],
+    'usage' => [
+        // Rough household load estimate for the intelligent scheduler (settings.php) —
+        // there's no real usage history in this app, so this is a flat daily estimate,
+        // not measured. Optionally replace 'avg_daily_kwh' with a 24-length 'hourly_kwh'
+        // array (index 0-23, kWh per hour) if a real day-shape is worth modelling later.
+        'avg_daily_kwh' => 10.0,
+    ],
     'cost_basis' => [
         // What you actually pay for electricity — used as the "worth charging below this" threshold.
         // Only ever charge from the grid when the Agile rate is cheaper than this. Not a real tariff
