@@ -27,8 +27,9 @@ open.
 ```
 config.php            # non-secret tunables, gitignored — copy of config.example.php
 config.example.php    # template, safe to commit
-run.php               # cron entry point (CLI-only, supports --dry-run)
+run.php               # cron entry point (CLI-only, supports --dry-run/--classic/--intelligent)
 run-now.php           # manual trigger for the same pipeline (login-only, POST-only)
+cron.php              # web-triggerable cron alternative (secret-token-gated, GET) for hosts with no CLI cron
 index.php             # dashboard (password-walled)
 login.php / logout.php
 settings.php          # FoxESS credentials + system password form (password-walled)
@@ -37,7 +38,7 @@ assets/
 src/
   Logger.php           # timestamped file logger, rotates past 2MB
   Exceptions.php        # OctopusFetchException / ScheduleBuildException / FoxessPushException
-  Runner.php             # runScheduler(): the fetch -> build -> (push) pipeline, shared by run.php and run-now.php
+  Runner.php             # runScheduler(): the fetch -> build -> (push) pipeline, shared by run.php, run-now.php, and cron.php
   Store.php             # SQLite connection + settings/rates/schedule/password persistence
   Auth.php              # session-based login gate, built on Store's password check
   Layout.php             # shared HTML header/footer for the web pages
@@ -152,7 +153,7 @@ on-screen message for the UI).
     `notify.alert_email` — both happen inside `runScheduler()` itself, so
     they're identical regardless of which entry point called it.
 
-**Two entry points, two trust gates, same pipeline:**
+**Three entry points, three trust gates, same pipeline:**
 
 - **`run.php`** — CLI-only (`PHP_SAPI !== 'cli'` check, first thing in the
   file, before `$argv` is even read, since `$argv` doesn't exist outside
@@ -161,8 +162,9 @@ on-screen message for the UI).
   (`in_array('--dry-run', null)` — `$argv` is `null` under FastCGI — throws a
   `TypeError` on PHP 8). The deeper issue: without the guard, that URL was
   reachable with **no authentication at all** and would trigger a real push
-  to the inverter. It's a thin wrapper now — parse `--dry-run`, call
-  `runScheduler()`, translate the result to stdout/stderr and an exit code.
+  to the inverter. It's a thin wrapper now — parse `--dry-run`/
+  `--classic`/`--intelligent`, call `runScheduler()`, translate the result to
+  stdout/stderr and an exit code.
 - **`run-now.php`** — the "Run now" button on the dashboard. Gated by
   `requireLogin()` instead of the CLI check (same session/password system as
   the rest of the UI), and POST-only (a GET — a stray link, a crawler,
@@ -172,15 +174,32 @@ on-screen message for the UI).
   reasoning as `settings.php` below — but this one has real-world
   consequences (an actual inverter push) that a settings change doesn't, so
   it's the first thing to add a token to if this ever gets hardened.
+- **`cron.php`** — user-requested alternative to `run.php` for hosts where
+  cron can't invoke the PHP CLI at all (only "hit a URL" scheduling is
+  available). Gated by a random per-install secret (`settings table's
+  cron_token`, 48 hex chars, generated on first view of `settings.php` and
+  shown/regeneratable there) checked with `hash_equals()` against a
+  `?token=…` query parameter — a scripted cron client can't do the
+  session/password login `run-now.php` uses, so the token *is* the
+  authentication. Deliberately GET, not POST-only like `run-now.php`: that
+  restriction exists specifically to stop an unauthenticated stray
+  hit/crawler/prefetch, which isn't a concern here since nothing happens
+  without the correct secret. Always a real run, like `run-now.php`. Known,
+  accepted caveat of any secret-in-a-URL design: the token can end up in
+  host access logs, so treat it like the system password — regenerate if it
+  ever leaks, don't paste it anywhere public.
 
 **Cron setup** (spec §10's crontab line assumes raw cron access; on Plesk-
 style panel hosting, "Scheduled Tasks" in the domain's control panel does the
 same job — action type "Run a PHP script" or "Run a command", pointing at
 `php /path/to/run.php` on whatever schedule you pick, typically ~17:00 UK
-time to clear Octopus's ~16:00 publish time with some buffer). To trigger a
-run outside that schedule, use the dashboard's "Run now" button — that's the
-supported way now; there's still no browser-based way to hit `run.php`
-directly, by design (see above).
+time to clear Octopus's ~16:00 publish time with some buffer). If the host's
+scheduler genuinely can't invoke the PHP CLI (only a "call this URL"
+scheduler, e.g. a plain `wget`/`curl` cron job), use `cron.php?token=…`
+instead — see above. To trigger a run outside that schedule, use the
+dashboard's "Run now" button — that's the supported interactive way; there's
+still no *unauthenticated* browser-based way to hit `run.php` directly, by
+design (see above).
 
 ## Web UI & auth
 
