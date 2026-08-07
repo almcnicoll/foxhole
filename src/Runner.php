@@ -227,6 +227,18 @@ function runScheduler(bool $dryRun, ?bool $forceIntelligent = null): array
         // without this, a run that recomputes the same content as last time would read as
         // a no-op and a device that failed earlier (e.g. a battery-less inverter offline
         // overnight — see CLAUDE.md) would never get retried once it's reachable again.
+        // Recorded regardless of whether anything below actually gets pushed to FoxESS —
+        // this is what index.php shows as "today's plan"/"pushed at", and it must not go
+        // missing just because the resolved schedule happens to match what's already
+        // active on the inverter (the common case: a "Run now" click, or an every-3h
+        // cron tick, that legitimately has nothing new to say). Otherwise the dashboard
+        // has no record for today's date at all and reads as "nothing has run", even
+        // though the correct schedule from a prior run is still in effect. Saved before
+        // the unchanged/skip check below, not after, so a skipped push doesn't skip this.
+        saveSchedule($targetDate->format('Y-m-d'), $schedule['groups'], $schedule['explanations'], $now);
+        pruneOldSchedules($today->format('Y-m-d'));
+        setSetting('schedule_summary', $schedule['summary']);
+
         $lastPushed = json_decode(getSetting('last_pushed_groups_json', '') ?: 'null', true);
         $pendingSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('pending_device_sns', '')))));
         $contentChanged = $pushGroups != $lastPushed;
@@ -257,13 +269,9 @@ function runScheduler(bool $dryRun, ?bool $forceIntelligent = null): array
         $stillPending = $pushResult['failedSns'];
         setSetting('pending_device_sns', implode("\n", $stillPending));
 
-        // Raw per-date plan (unspliced) — what the next run splices against, and what the
-        // dashboard shows for that date. Saved regardless of per-device outcome, so a
-        // retry-only run above still has today's plan to splice against.
-        saveSchedule($targetDate->format('Y-m-d'), $schedule['groups'], $schedule['explanations'], $now);
-        pruneOldSchedules($today->format('Y-m-d'));
+        // saveSchedule()/schedule_summary already recorded above, before the unchanged-skip
+        // check, so only the push-tracking setting is left to update here.
         setSetting('last_pushed_groups_json', json_encode($pushGroups));
-        setSetting('schedule_summary', $schedule['summary']);
 
         if ($stillPending) {
             // "Device offline" is expected/routine for a battery-less inverter after dark —
