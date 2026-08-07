@@ -359,8 +359,40 @@ function reapplyOverrides(): array
         : null;
 
     $costBasis = (new CostBasisProvider($config['cost_basis']))->getCostBasis(count($importSlots));
+    // $scheduleBuilder is always constructed for applyOverrides() below (a pure
+    // group/interval transform, same reasoning as runScheduler()) but the base schedule
+    // it overlays onto must come from whichever builder run-now/cron actually use —
+    // this used to always call ScheduleBuilder::build() regardless of the
+    // intelligent_scheduler_enabled setting, so saving an override produced a
+    // classic-heuristic schedule even when the rest of the app was running intelligent.
     $scheduleBuilder = new ScheduleBuilder($config['strategy'], $config['battery']);
-    $base = $scheduleBuilder->build($importSlots, $exportSlots, $costBasis);
+    if (getSetting('intelligent_scheduler_enabled', '1') === '1') {
+        $socApiKey = getSetting('foxess_api_key', '');
+        $socDeviceSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('foxess_device_sns', '')))));
+        $socReadings = [];
+        foreach ($socDeviceSns as $sn) {
+            try {
+                $soc = (new FoxessClient($socApiKey, $sn, $config['foxess']['base_url']))->getBatterySoc();
+                if ($soc !== null && $soc > 0.0) {
+                    $socReadings[] = $soc;
+                }
+            } catch (FoxessPushException $e) {
+                $logger->warn("Battery SoC read from $sn failed, excluding from average: " . $e->getMessage());
+            }
+        }
+        $currentSocPercent = $socReadings ? array_sum($socReadings) / count($socReadings) : null;
+        $usageConfig = ['avg_daily_kwh' => UsageEstimator::estimateDailyKwh(
+            (float) getSetting('usage_summer_kwh_month', '300'),
+            (float) getSetting('usage_winter_kwh_month', '700'),
+            $rows[0]['from']->setTimezone($timezone),
+            $timezone,
+            getLatestSolarForecast(),
+        )];
+        $base = (new IntelligentScheduleBuilder($config['strategy'], $config['battery'], $usageConfig))
+            ->build($importSlots, $exportSlots, $costBasis, getLatestSolarForecast() ?: null, $currentSocPercent);
+    } else {
+        $base = $scheduleBuilder->build($importSlots, $exportSlots, $costBasis);
+    }
     $overlaid = $scheduleBuilder->applyOverrides($base['groups'], $base['explanations'], $overrides, $timezone);
 
     $apiKey = getSetting('foxess_api_key', '');
