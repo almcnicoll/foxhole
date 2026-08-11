@@ -243,11 +243,14 @@ function runScheduler(bool $dryRun, ?bool $forceIntelligent = null): array
         $pendingSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('pending_device_sns', '')))));
         $contentChanged = $pushGroups != $lastPushed;
 
-        if (!$contentChanged && !$pendingSns) {
-            $message = 'Schedule for ' . $targetDate->format('Y-m-d') . ' unchanged from last run, skipped FoxESS push.';
-            $logger->info($message);
-            return ['ok' => true, 'dryRun' => false, 'message' => $message, 'schedule' => $schedule];
-        }
+        // Temporarily disabled (user request, 2026-08-11): every run now pushes to the
+        // inverters regardless of whether the schedule changed. Uncomment to restore the
+        // "skip an unchanged push" optimisation.
+        // if (!$contentChanged && !$pendingSns) {
+        //     $message = 'Schedule for ' . $targetDate->format('Y-m-d') . ' unchanged from last run, skipped FoxESS push.';
+        //     $logger->info($message);
+        //     return ['ok' => true, 'dryRun' => false, 'message' => $message, 'schedule' => $schedule];
+        // }
 
         $apiKey = getSetting('foxess_api_key', '');
         if ($apiKey === '') {
@@ -260,7 +263,10 @@ function runScheduler(bool $dryRun, ?bool $forceIntelligent = null): array
 
         // A changed schedule goes to every device; an unchanged one only retries whichever
         // devices are still pending from an earlier failed attempt.
-        $devicesToPush = $contentChanged ? $deviceSns : array_values(array_intersect($deviceSns, $pendingSns));
+        // Temporarily disabled alongside the skip-check above (2026-08-11) — every run pushes
+        // to every configured device now, so this always resolves to the full list.
+        // $devicesToPush = $contentChanged ? $deviceSns : array_values(array_intersect($deviceSns, $pendingSns));
+        $devicesToPush = $deviceSns;
         $clients = [];
         foreach ($devicesToPush as $sn) {
             $clients[$sn] = new FoxessClient($apiKey, $sn, $config['foxess']['base_url']);
