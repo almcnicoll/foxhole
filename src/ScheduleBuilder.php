@@ -155,9 +155,15 @@ class ScheduleBuilder
         $intervals = $this->groupsToIntervals($groups, $explanations);
 
         foreach ($overrides as $override) {
-            $label = $override['kind'] === 'fill_your_boots' ? 'Fill your boots' : 'Power down';
-            $eventMode = $override['kind'] === 'fill_your_boots' ? 'ForceCharge' : 'ForceDischarge';
-            $prepMode = $eventMode === 'ForceCharge' ? 'ForceDischarge' : 'ForceCharge';
+            $isPowerDown = $override['kind'] === 'power_down';
+            $label = $isPowerDown ? 'Power down' : 'Fill your boots';
+            // Fill-your-boots events force-charge (there's surplus cheap/free energy to use).
+            // Power-down events switch to SelfUse rather than force-discharging: selling the
+            // battery down during a power-down window works against the point of it — it
+            // should be held in reserve for the house's own usage instead, not sold back with
+            // the risk of needing to buy grid power again once the event ends.
+            $eventMode = $isPowerDown ? 'SelfUse' : 'ForceCharge';
+            $prepMode = $isPowerDown ? 'ForceCharge' : 'ForceDischarge';
 
             $windows = [];
             if ($override['prep_start'] !== null && $override['prep_end'] !== null) {
@@ -171,7 +177,11 @@ class ScheduleBuilder
                 if ($end <= $start) {
                     continue; // invalid/empty window, ignore rather than corrupt the schedule
                 }
-                $modeLabel = $mode === 'ForceCharge' ? 'charging' : 'discharging';
+                $modeLabel = match ($mode) {
+                    'ForceCharge' => 'charging',
+                    'ForceDischarge' => 'discharging',
+                    default => 'switching to self-use (reserving battery capacity)',
+                };
                 $explanation = $isPrep
                     ? sprintf('%s override: %s %s–%s to prepare.', $label, $modeLabel, $startStr, $endStr)
                     : sprintf('%s override: %s %s–%s for Octopus\'s %s window.', $label, $modeLabel, $startStr, $endStr, $label);
@@ -241,7 +251,15 @@ class ScheduleBuilder
         $explanations = [];
         foreach ($intervals as $iv) {
             $end = $iv['end'] === 24 * 60 ? 0 : $iv['end'];
-            $isCharge = $iv['workMode'] === 'ForceCharge';
+            // fdSoc/fdPwr only mean anything for the two Force modes — a SelfUse override
+            // (see applyOverrides()'s power-down handling) still needs an explicit group so
+            // it can carry its own explanation and reliably override whatever plan slot was
+            // there before, but there's no force ceiling/floor or power limit to set.
+            [$fdSoc, $fdPwr] = match ($iv['workMode']) {
+                'ForceCharge' => [100, $chargeKw],
+                'ForceDischarge' => [$reserveSoc, $dischargeKw],
+                default => [$minSocOnGrid, 0.0],
+            };
             $groups[] = [
                 'enable' => 1,
                 'startHour' => intdiv($iv['start'], 60),
@@ -250,8 +268,8 @@ class ScheduleBuilder
                 'endMinute' => $end % 60,
                 'workMode' => $iv['workMode'],
                 'minSocOnGrid' => $minSocOnGrid,
-                'fdSoc' => $isCharge ? 100 : $reserveSoc,
-                'fdPwr' => (int) round(($isCharge ? $chargeKw : $dischargeKw) * 1000),
+                'fdSoc' => $fdSoc,
+                'fdPwr' => (int) round($fdPwr * 1000),
             ];
             $explanations[] = $iv['explanation'];
         }

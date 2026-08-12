@@ -341,9 +341,10 @@ check(
 $powerDown = [['for_date' => '2026-01-05', 'kind' => 'power_down', 'event_start' => '08:00', 'event_end' => '09:00', 'prep_start' => '07:00', 'prep_end' => '08:00']];
 $overlay = (new ScheduleBuilder($strategy, $battery))->applyOverrides($baseGroups, $baseExplanations, $powerDown, $londonTz);
 $overlayModes = array_map(fn($g) => $g['workMode'], $overlay['groups']);
-check($overlayModes === ['ForceCharge', 'ForceCharge', 'ForceDischarge', 'ForceCharge'], 'power_down splits the 06:00-10:00 charge period around its prep(charge)+event(discharge) window: got ' . implode(',', $overlayModes));
+check($overlayModes === ['ForceCharge', 'ForceCharge', 'SelfUse', 'ForceCharge'], 'power_down splits the 06:00-10:00 charge period around its prep(charge)+event(self-use) window: got ' . implode(',', $overlayModes));
 check($overlay['groups'][2]['startHour'] === 8 && $overlay['groups'][2]['endHour'] === 9, 'the event window (08:00-09:00) becomes its own group');
 check(str_contains($overlay['explanations'][2], 'Power down override'), 'the event group is explained as a Power down override');
+check($overlay['groups'][2]['fdPwr'] === 0, 'the self-use event group has no force power limit');
 check($overlay['groups'][3]['startHour'] === 9 && $overlay['groups'][3]['endHour'] === 10, 'the remainder of the original charge period after the event survives, trimmed to 09:00-10:00');
 
 $boots = [['for_date' => '2026-01-05', 'kind' => 'fill_your_boots', 'event_start' => '12:00', 'event_end' => '13:00', 'prep_start' => null, 'prep_end' => null]];
