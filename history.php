@@ -148,35 +148,49 @@ function renderHistoryChart(array $buckets, string $view): void
     }
     $width = 1000;
     $height = 320;
-    $marginLeft = 60;
-    $marginRight = 20;
+    $marginLeft = 58;
+    $marginRight = 58;
     $marginTop = 30;
     $marginBottom = 36;
     $plotWidth = $width - $marginLeft - $marginRight;
     $plotHeight = $height - $marginTop - $marginBottom;
-
-    $allValues = [];
-    foreach ($buckets as $b) {
-        if ($b['generation_kwh'] !== null) {
-            $allValues[] = $b['generation_kwh'];
-        }
-        if ($b['forecast_kwh'] !== null) {
-            $allValues[] = $b['forecast_kwh'];
-        }
-    }
-    $max = $allValues ? max($allValues) : 0.0;
-    $max = $max > 0 ? $max * 1.1 : 1.0; // 10% headroom so the tallest point isn't glued to the top edge
-
     $count = count($buckets);
-    $x = fn(int $i) => $marginLeft + ($count > 1 ? ($i / ($count - 1)) * $plotWidth : $plotWidth / 2);
-    $y = fn(float $kwh) => $marginTop + (1 - $kwh / $max) * $plotHeight;
+    $baselineY = $marginTop + $plotHeight;
 
+    // Two independent scales, like the dashboard's price (left) / solar kW (right) chart —
+    // generation and forecast are the same unit (kWh) but not the same *magnitude* (a
+    // forecast for the whole site vs. actual metered generation can differ a lot in scale
+    // depending on time of year/inverter mix), so sharing one axis either squashes one
+    // series flat or blows the other off the top. Each series is scaled to its own max.
+    $genValues = array_values(array_filter(array_column($buckets, 'generation_kwh'), fn($v) => $v !== null));
+    $foreValues = array_values(array_filter(array_column($buckets, 'forecast_kwh'), fn($v) => $v !== null));
+    $hasGeneration = (bool) $genValues;
+    $hasForecast = (bool) $foreValues;
+    $maxGen = $genValues ? max($genValues) : 0.0;
+    $maxGen = $maxGen > 0 ? $maxGen * 1.1 : 1.0; // 10% headroom so the tallest point/bar isn't glued to the top edge
+    $maxFore = $foreValues ? max($foreValues) : 0.0;
+    $maxFore = $maxFore > 0 ? $maxFore * 1.1 : 1.0;
+
+    $x = fn(int $i) => $marginLeft + ($count > 1 ? ($i / ($count - 1)) * $plotWidth : $plotWidth / 2);
+    $bucketLeft = fn(int $i) => $marginLeft + ($i / $count) * $plotWidth;
+    $bucketWidth = $plotWidth / $count;
+    $yGen = fn(float $kwh) => $marginTop + (1 - $kwh / $maxGen) * $plotHeight;
+    $yFore = fn(float $kwh) => $marginTop + (1 - $kwh / $maxFore) * $plotHeight;
+
+    // Left axis (generation) gets full gridlines, same as the dashboard's price axis.
     $grid = '';
     for ($i = 0; $i <= 4; $i++) {
-        $val = $max * $i / 4;
-        $gy = $y($val);
+        $val = $maxGen * $i / 4;
+        $gy = $yGen($val);
         $grid .= sprintf('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="var(--color-border)" />', $marginLeft, $gy, $marginLeft + $plotWidth, $gy);
-        $grid .= sprintf('<text x="%.1f" y="%.1f" fill="var(--color-muted)" font-size="10" text-anchor="end" dominant-baseline="middle">%s kWh</text>', $marginLeft - 6, $gy, number_format($val, 1));
+        $grid .= sprintf('<text x="%.1f" y="%.1f" fill="var(--color-muted)" font-size="10" text-anchor="end" dominant-baseline="middle">%s</text>', $marginLeft - 6, $gy, number_format($val, 1));
+    }
+    // Right axis (forecast) gets labels only, no gridlines of its own — same as the
+    // dashboard's kW axis — and only appears at all if this period has any forecast data.
+    if ($hasForecast) {
+        foreach ([0, $maxFore / 2, $maxFore] as $mark) {
+            $grid .= sprintf('<text x="%.1f" y="%.1f" fill="var(--color-muted)" font-size="10" text-anchor="start" dominant-baseline="middle">%s</text>', $marginLeft + $plotWidth + 6, $yFore($mark), number_format($mark, 1));
+        }
     }
 
     // Thin out x-axis labels once there are more buckets than can be read without
@@ -198,33 +212,70 @@ function renderHistoryChart(array $buckets, string $view): void
         '<circle class="chart-hit" cx="%.1f" cy="%.1f" r="8" fill="transparent" data-tooltip="%s"><title>%s</title></circle><circle class="chart-dot" cx="%.1f" cy="%.1f" r="2" fill="%s" />',
         $px, $py, htmlspecialchars($title), htmlspecialchars($title), $px, $py, $color,
     );
+    $bar = fn(float $left, float $top, float $w, float $h, string $color, string $title) => sprintf(
+        '<rect class="chart-hit chart-bar" x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="%s" data-tooltip="%s"><title>%s</title></rect>',
+        $left, $top, $w, max(0.0, $h), $color, htmlspecialchars($title), htmlspecialchars($title),
+    );
 
-    $genPoints = [];
-    $forePoints = [];
-    $genMarkers = '';
-    $foreMarkers = '';
-    foreach ($buckets as $i => $b) {
-        $px = $x($i);
-        if ($b['generation_kwh'] !== null) {
-            $py = $y($b['generation_kwh']);
-            $genPoints[] = sprintf('%.1f,%.1f', $px, $py);
-            $genMarkers .= $marker($px, $py, 'var(--color-generation)', sprintf('Generated: %s kWh (%s)', number_format($b['generation_kwh'], 2), $b['label']));
+    $body = '';
+    if ($view === 'day') {
+        // Line plot, matching the dashboard's price/solar chart exactly — a day's hourly
+        // buckets read naturally as a continuous curve.
+        $genPoints = [];
+        $forePoints = [];
+        $markers = '';
+        foreach ($buckets as $i => $b) {
+            $px = $x($i);
+            if ($b['generation_kwh'] !== null) {
+                $py = $yGen($b['generation_kwh']);
+                $genPoints[] = sprintf('%.1f,%.1f', $px, $py);
+                $markers .= $marker($px, $py, 'var(--color-generation)', sprintf('Generated: %s kWh (%s)', number_format($b['generation_kwh'], 2), $b['label']));
+            }
+            if ($b['forecast_kwh'] !== null) {
+                $py = $yFore($b['forecast_kwh']);
+                $forePoints[] = sprintf('%.1f,%.1f', $px, $py);
+                $markers .= $marker($px, $py, 'var(--color-solar)', sprintf('Forecast: %s kWh (%s)', number_format($b['forecast_kwh'], 2), $b['label']));
+            }
         }
-        if ($b['forecast_kwh'] !== null) {
-            $py = $y($b['forecast_kwh']);
-            $forePoints[] = sprintf('%.1f,%.1f', $px, $py);
-            $foreMarkers .= $marker($px, $py, 'var(--color-solar)', sprintf('Forecast: %s kWh (%s)', number_format($b['forecast_kwh'], 2), $b['label']));
+        if ($genPoints) {
+            $body .= sprintf('<polyline points="%s" fill="none" stroke="var(--color-generation)" stroke-width="2" />', implode(' ', $genPoints));
+        }
+        if ($forePoints) {
+            $body .= sprintf('<polyline points="%s" fill="none" stroke="var(--color-solar)" stroke-width="2" stroke-dasharray="5,4" />', implode(' ', $forePoints));
+        }
+        $body .= '<g>' . $markers . '</g>';
+    } else {
+        // Bar plot for week/month/year — two bars per bucket, side by side, each measured
+        // against its own axis. Their relative heights are only meaningful within their
+        // own series (a tall generation bar and a short forecast bar next to it doesn't
+        // mean generation beat forecast — check the axis each is scaled to).
+        $groupWidth = $bucketWidth * 0.7;
+        $barWidth = $groupWidth / 2 - 1;
+        foreach ($buckets as $i => $b) {
+            $groupLeft = $bucketLeft($i) + ($bucketWidth - $groupWidth) / 2;
+            if ($b['generation_kwh'] !== null) {
+                $top = $yGen($b['generation_kwh']);
+                $title = sprintf('Generated: %s kWh (%s)', number_format($b['generation_kwh'], 2), $b['label']);
+                $body .= $bar($groupLeft, $top, $barWidth, $baselineY - $top, 'var(--color-generation)', $title);
+            }
+            if ($b['forecast_kwh'] !== null) {
+                $top = $yFore($b['forecast_kwh']);
+                $title = sprintf('Forecast: %s kWh (%s)', number_format($b['forecast_kwh'], 2), $b['label']);
+                $body .= $bar($groupLeft + $barWidth + 2, $top, $barWidth, $baselineY - $top, 'var(--color-solar)', $title);
+            }
         }
     }
     ?>
-<svg class="price-chart" viewBox="0 0 <?= $width ?> <?= $height ?>" role="img" aria-label="Actual and forecast generation over the selected period">
+<svg class="price-chart" viewBox="0 0 <?= $width ?> <?= $height ?>" role="img" aria-label="Actual generation (left axis) and solar forecast (right axis) over the selected period">
     <?= $grid ?>
-    <?php if ($genPoints): ?><polyline points="<?= implode(' ', $genPoints) ?>" fill="none" stroke="var(--color-generation)" stroke-width="2" /><?php endif; ?>
-    <?php if ($forePoints): ?><polyline points="<?= implode(' ', $forePoints) ?>" fill="none" stroke="var(--color-solar)" stroke-width="2" stroke-dasharray="5,4" /><?php endif; ?>
-    <g><?= $genMarkers . $foreMarkers ?></g>
+    <?= $body ?>
     <g font-size="10" fill="var(--color-muted)">
-        <line x1="<?= $marginLeft ?>" y1="12" x2="<?= $marginLeft + 16 ?>" y2="12" stroke="var(--color-generation)" stroke-width="2" /><text x="<?= $marginLeft + 20 ?>" y="15">Generation</text>
-        <line x1="<?= $marginLeft + 110 ?>" y1="12" x2="<?= $marginLeft + 126 ?>" y2="12" stroke="var(--color-solar)" stroke-width="2" stroke-dasharray="5,4" /><text x="<?= $marginLeft + 130 ?>" y="15">Forecast</text>
+        <?php if ($hasGeneration): ?>
+        <line x1="<?= $marginLeft ?>" y1="12" x2="<?= $marginLeft + 16 ?>" y2="12" stroke="var(--color-generation)" stroke-width="2" /><text x="<?= $marginLeft + 20 ?>" y="15">Generation (left axis)</text>
+        <?php endif; ?>
+        <?php if ($hasForecast): ?>
+        <line x1="<?= $marginLeft + 170 ?>" y1="12" x2="<?= $marginLeft + 186 ?>" y2="12" stroke="var(--color-solar)" stroke-width="2"<?= $view === 'day' ? ' stroke-dasharray="5,4"' : '' ?> /><text x="<?= $marginLeft + 190 ?>" y="15">Forecast (right axis)</text>
+        <?php endif; ?>
     </g>
 </svg>
 <script>

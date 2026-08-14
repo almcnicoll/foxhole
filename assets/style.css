@@ -138,6 +138,12 @@ th {
 .price-chart .chart-hit:hover + .chart-dot {
     r: 5;
 }
+.price-chart .chart-bar {
+    transition: opacity 0.12s ease;
+}
+.price-chart .chart-bar:hover {
+    opacity: 0.75;
+}
 
 /* Custom point tooltip (see the <script> at the end of renderPriceChart()) — positioned
    via JS (left/top, following the cursor), everything else is styling. */
