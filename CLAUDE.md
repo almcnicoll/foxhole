@@ -44,6 +44,7 @@ src/
   Store.php             # SQLite connection + settings/rates/schedule/password persistence
   Auth.php              # session-based login gate, built on Store's password check
   Layout.php             # shared HTML header/footer for the web pages
+  AssetVersion.php       # ASSET_VERSION cache-busting constant, see "Asset versioning"
   OctopusClient.php     # fetches half-hourly rates from api.octopus.energy (fetch/parse only, no storage)
   PriceProvider.php     # resolves import/export prices, per-side API-vs-fixed (settings.php)
   CostBasisProvider.php # resolves the "worth charging below this" reference price
@@ -736,6 +737,34 @@ either if you're reimplementing this call:
 The webhook URL contains a bearer-style secret (anyone with it can trigger a deploy), so
 treat `.deploy-webhook-url` like `config.php` — never commit it, never paste its contents
 into a chat, PR, issue, or log.
+
+## Asset versioning
+
+`src/AssetVersion.php` defines a single constant, `ASSET_VERSION`, appended as a `?v=...`
+query string to every `<link>`/`<script>` tag that points at a **locally-served** static
+asset — currently just `assets/style.css` via `src/Layout.php`. This is cache-busting: a
+browser (or an intermediate cache) that already has an older copy of `style.css` cached
+has no other reason to ever re-fetch it, since the URL never otherwise changes between
+deploys. This was found live: a stale cached `style.css` from before `--color-generation`
+existed left the history chart's generation bars rendering as plain black (a browser's
+fallback for an unresolved CSS `var()`), while `--color-solar`, present in that older
+cached copy too, kept working fine.
+
+**`ASSET_VERSION` is a hand-maintained constant, not derived from `filemtime()` or
+similar — bump it (a plain increment is fine) yourself, every time `assets/style.css`
+actually changes, or whenever a locally-served JS file is added or changed.** This is
+deliberate: the live host deploys via a Plesk git-pull webhook (see "Deploying" above),
+and nothing about that pipeline guarantees a file's mtime reflects when its *content* last
+changed rather than just when the last deploy happened to touch the filesystem — a
+hand-bumped version is correct by construction instead of depending on that. If you add a
+new locally-served CSS or JS file (as opposed to an inline `<style>`/`<script>`, which
+needs no cache-busting — it's part of the HTML response itself), append `?v=<?=
+ASSET_VERSION ?>` to it too, and add it to this section's list.
+
+Third-party CDN assets (e.g. `history.php`'s DataTables/jQuery `<link>`/`<script>` tags)
+do **not** use `ASSET_VERSION` — their version is already baked into the CDN URL path
+(`.../1.13.11/...`), and appending our own query string would only defeat that CDN's own
+shared cache for no benefit.
 
 ## Extension points
 
