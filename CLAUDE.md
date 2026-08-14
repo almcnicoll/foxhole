@@ -33,6 +33,8 @@ cron.php              # web-triggerable cron alternative (secret-token-gated, GE
 index.php             # dashboard (password-walled)
 login.php / logout.php
 settings.php          # FoxESS credentials + system password form (password-walled)
+history.php            # generation-vs-forecast history, day/week/month/year (password-walled)
+history-fetch.php      # manual trigger for the generation history backfill/catch-up (login-only, POST-only)
 assets/
   style.css            # the only stylesheet — every page links this, no per-page CSS
 src/
@@ -47,6 +49,7 @@ src/
   CostBasisProvider.php # resolves the "worth charging below this" reference price
   ScheduleBuilder.php   # rates + cost basis -> FoxESS scheduler groups
   FoxessClient.php      # signs + sends requests to the FoxESS OpenAPI
+  HistoryFetcher.php    # backfills/catches up historic_generation from FoxESS's report/query endpoint
 tests/
   self_check.php        # standalone assert-style test for ScheduleBuilder/CostBasisProvider/Store
 logs/
@@ -556,6 +559,102 @@ override `FoxessClient::pushSchedule()` directly — `pushSchedule` is public
 and not `final`, so this needs no changes to `FoxessClient` and never touches
 the network.
 
+**Generation history: `report/query`, not `history/query` — hourly kWh, not raw power.**
+User-requested addition: keep an actual-generation-vs-forecast record over time, viewable
+by day/week/month/year. FoxESS's OpenAPI has two endpoints that could plausibly supply
+this — researched live (community docs, since FoxESS's own docs are thin here, same
+caveat as everywhere else in this file): `/op/v0/device/history/query` returns raw power
+samples at 5-minute resolution and needs the caller to integrate kW→kWh by hand;
+`/op/v0/device/report/query` (`dimension=day`) returns the total FoxESS's own app already
+computes — up to 24 **hourly** kWh values, one call per device per day. Used the report
+endpoint: the brief cared about summed energy, not sample-level granularity ("half-hour
+would be sufficient, but work with whatever resolution works best from the API"), and
+hourly-already-summed is both simpler and more reliable than reimplementing kW→kWh
+integration ourselves. This is also why the history page's day view is hourly (24 rows),
+not half-hourly (48) — that's the API's native resolution, not a choice this app made.
+`FoxessClient::getGenerationReport()` wraps this endpoint; note its request body uses
+`sn` (singular), unlike the scheduler endpoints' `deviceSN` or `real/query`'s `sns` array
+— confirmed against `TonyM1958/FoxESS-Cloud` (the same community reference this file
+already leans on for the scheduler endpoint and SoC field names).
+
+**Storage is a genuinely accumulating table, unlike everything else in this app.**
+`historic_generation` (`src/Store.php`) is deliberately *not* replace-on-every-fetch like
+`rate_slots`/`schedule_groups`/`solar_forecast` — see "Data storage" above for why those
+three are disposable. This table exists specifically to answer "what happened over time",
+so it's append/upsert-only, one row per local clock hour, kept indefinitely. Generation
+and forecast share the row (`generation_kwh`, `forecast_kwh`, both nullable) but are
+written independently by different callers on different schedules — `upsertHistoricGeneration()`/
+`upsertHistoricForecast()` each touch only their own column, so writing one never clobbers
+the other. A separate table from `solar_forecast` on purpose even though they overlap in
+spirit: `solar_forecast` stays latest-fetch-only because it answers "what's the plan right
+now" for the dashboard; duplicating the data into a second, real history table was simpler
+than making one table serve both jobs.
+
+**Backfill walks backward, oldest-first *of each batch*, and stops permanently once it
+hits the data horizon.** `HistoryFetcher::fetchGenerationHistory()` is called from
+`Runner.php` on every real (non-dry-run) scheduled run, and from `history-fetch.php`'s
+"Fetch history now" button (dashboard-adjacent, login-gated, POST-only — same pattern as
+`run-now.php`). Two bounded passes per call, so one invocation stays fast:
+- *Forward catch-up*: from the latest stored day through today (today's not-yet-elapsed
+  hours are never written — see `storeDay()` — so a run partway through the day only
+  trusts hours strictly before the current local hour, same reasoning as the "partial-day
+  data" handling elsewhere in this file).
+- *Backward backfill*: one day further back than anything stored, up to
+  `HISTORY_BACKWARD_BACKFILL_MAX_DAYS_PER_CALL` (20) per call. The moment FoxESS reports no
+  data at all for a day, that's recorded as `settings.history_backfill_exhausted_before`
+  and never probed again — this is the literal reading of "historic data won't change so
+  once we have data up to point x we never need to go back earlier than that". A single
+  cron day (or button click) only advances the boundary by one call's worth of days;
+  mash the button (or just wait) to walk further back faster.
+
+**A day, once stored, is never re-fetched — so a transient per-device error must never get
+silently written as an undercount.** With two configured inverters, each day's fetch is
+per-device; `combineDeviceGenerationResults()` (`src/HistoryFetcher.php`, unit-tested in
+isolation) distinguishes three outcomes per device — real data, `null` ("FoxESS has
+nothing for this device on this day" — the normal case for a second inverter added to the
+account after an older one), and a thrown request error — and only the error case blocks
+the whole day from being written at all (retried next call). A device reporting `null`
+contributes 0 rather than blocking, which is what lets an older, single-inverter
+install's backfill walk back past the date a second inverter joined the account. Only when
+*every* device comes back `null` does the day itself count as "no data" — the actual
+backfill-horizon signal.
+
+**Forecast history is captured prospectively, never backfilled.** Forecast.Solar (see
+`SolarForecastClient`) only exposes *historic* forecasts on a paid tier, so there's nothing
+to fetch retroactively. Instead, every time `Runner.php` fetches (or already has) a live
+solar forecast, it also upserts each bucket into `historic_generation.forecast_kwh` — the
+record of "what did we predict" builds up one real forecast fetch at a time, going
+forward only. This is why `forecast_kwh` reads null for any date before this feature
+shipped, or any date the app happened not to be running with solar forecasting enabled —
+that's expected, not a bug to chase.
+
+**A plausibility ceiling guards against a known FoxESS firmware quirk.** Community
+references (`TonyM1958/FoxESS-Cloud`'s `fix_values` workaround) document a 32-bit
+energy-total overflow that occasionally corrupts `chargeEnergyToTal`/`dischargeEnergyToTal`
+into absurd values. Not confirmed to affect `generation` specifically, but given this table
+is never re-fetched once written, `HISTORY_MAX_PLAUSIBLE_HOURLY_KWH` (50 kWh — far beyond
+any residential single-hour output) silently zeroes anything above it rather than risk a
+permanent corrupted spike. Cheap insurance, not a precise fix for a fully-understood bug.
+
+**History page uses DataTables — the one deliberate exception to this app's
+zero-JS-dependency norm.** `history.php` loads jQuery + DataTables from a CDN, scoped to
+that page only (every other page stays exactly as dependency-free as before). Explicitly
+requested by name, and it *is* the standard tool for a sortable/searchable/paginated table
+— hand-rolling that would be reinventing a well-established wheel for no benefit. CDN
+rather than vendored: this is a single-user hobby app on shared hosting with no build
+step, so a `<script src="https://...">` is the lowest-ceremony way to add a library that
+needs no configuration of its own here. `assets/style.css` has a small dark-mode override
+block for DataTables' own chrome (search box, pagination buttons) since its stock skin is
+light-only and would otherwise clash with this app's dark mode.
+
+**Chart/day-view resolution and date navigation are timezone-safe by construction, same as
+everywhere else in this app.** `history.php`'s date navigation uses `<input type="date">`
+(a calendar date only, no time-of-day component — nothing for a browser timezone to even
+shift) and resolves `?date=`/period boundaries entirely against `strategy.timezone` from
+`config.php`, never the browser's or server's local zone. See the "Either side of
+midnight"/override-related notes elsewhere in this file for the same principle applied to
+schedule times.
+
 **`data/` and `logs/` get a deny-all `.htaccess`.** Necessary now in a way it
 wasn't for the old JSON files: `data/scheduler.sqlite` holds the FoxESS API
 key and the password hash, and on the flat "whole directory is the docroot"
@@ -594,6 +693,49 @@ above) — never point it at the real database.
 There's no live-fire test against a real FoxESS device in this repo — that
 needs real credentials and touches a physical inverter, so it's a manual
 step for whoever deploys this, not something to script here.
+
+## Deploying
+
+The live host pulls from git via a Plesk "Git" webhook — hitting the webhook URL tells
+Plesk to pull and deploy the latest commit on the tracked branch. **After every `git push`
+to this repo (from an interactive session or an autonomous one), check for a
+`.deploy-webhook-url` file at the repo root; if it exists, trigger the deploy immediately
+after the push, no separate confirmation needed** — the user has already authorised this
+standing behaviour. If the file is missing, don't guess at a URL or skip silently — tell
+the user a push happened but no deploy was triggered, and ask them to create
+`.deploy-webhook-url` (repo root, gitignored, the webhook URL as its only line) if they
+want pushes to auto-deploy.
+
+The file holds a bare URL, nothing else:
+
+```
+https://shared-uk.man-1.vm.plesk-server.com:8443/modules/git/public/web-hook.php?uuid=...
+```
+
+To trigger it:
+
+```bash
+curl -sk -X POST "$(cat .deploy-webhook-url)"
+```
+
+Two details that matter, both confirmed live against this specific webhook — don't drop
+either if you're reimplementing this call:
+- **POST, not GET** — a GET returns without triggering a pull.
+- **TLS verification must be disabled** (`curl -k`, or the cURL-extension equivalent
+  `CURLOPT_SSL_VERIFYPEER`/`CURLOPT_SSL_VERIFYHOST` set to disable) — the deploy host's
+  certificate doesn't validate (self-signed or otherwise unrecognised by the calling
+  environment's CA bundle), confirmed as an accepted, known condition of this specific
+  endpoint, not a transient error worth retrying with verification on. Skipping
+  verification means the request can't distinguish the real deploy host from an
+  on-path attacker — acceptable here only because the URL itself is a long random
+  secret (the query-string `uuid`) treated the same way `cron.php`'s token is elsewhere
+  in this file: don't paste it anywhere public, regenerate via Plesk if it ever leaks.
+  This tradeoff is specific to this one webhook call — don't disable TLS verification
+  anywhere else in this codebase without the same explicit reasoning.
+
+The webhook URL contains a bearer-style secret (anyone with it can trigger a deploy), so
+treat `.deploy-webhook-url` like `config.php` — never commit it, never paste its contents
+into a chat, PR, issue, or log.
 
 ## Extension points
 

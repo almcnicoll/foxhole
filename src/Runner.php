@@ -11,6 +11,7 @@ require_once __DIR__ . '/IntelligentScheduleBuilder.php';
 require_once __DIR__ . '/UsageEstimator.php';
 require_once __DIR__ . '/FoxessClient.php';
 require_once __DIR__ . '/SolarForecastClient.php';
+require_once __DIR__ . '/HistoryFetcher.php';
 
 /**
  * Runs the full fetch -> build -> (push) pipeline once. Shared by run.php
@@ -116,6 +117,31 @@ function runScheduler(bool $dryRun, ?bool $forceIntelligent = null): array
                 } catch (SolarForecastException $e) {
                     $logger->warn('Solar forecast fetch failed, skipping: ' . $e->getMessage());
                 }
+            }
+
+            // Captured into historic_generation on every run, fresh fetch or not — see
+            // HistoryFetcher.php's doc comment for why forecast history can only ever be
+            // built forward like this, never backfilled. Cheap and idempotent:
+            // upsertHistoricForecast() just re-writes the same value if nothing changed.
+            $forecastCapturedAt = new DateTimeImmutable('now', $timezone);
+            foreach (getLatestSolarForecast() as $bucket) {
+                if ($bucket['from'] >= $bucket['to']) {
+                    continue; // zero-width sunrise/sunset marker, see SolarForecastClient
+                }
+                upsertHistoricForecast($bucket['from'], $bucket['to'], $bucket['watt_hours'] / 1000, $forecastCapturedAt);
+            }
+        }
+
+        // Not on the critical path, same best-effort treatment as solar forecast above — a
+        // failure here should never abort a real scheduling run. Skipped for dry runs for
+        // the same reason FoxESS credentials aren't read at all in that mode (see below):
+        // this needs them too. See HistoryFetcher.php for what this actually does.
+        if (!$dryRun) {
+            try {
+                $historyResult = fetchGenerationHistory($config, $logger);
+                $logger->info('Generation history: ' . $historyResult['message']);
+            } catch (Throwable $e) {
+                $logger->warn('Generation history fetch failed, skipping: ' . $e->getMessage());
             }
         }
 

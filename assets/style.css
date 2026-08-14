@@ -21,6 +21,7 @@
     --color-error: #cf222e;
     --color-error-bg: #fdeeee;
     --color-solar: #daa520;
+    --color-generation: #2b6cb0;
 
     /* Green = discharging/exporting (saving money), red = charging/importing (costs money) —
      mode colouring is about cost direction, not charge-vs-discharge as such. */
@@ -310,6 +311,78 @@ progress.soc-green::-webkit-progress-value {
 }
 progress.soc-green::-moz-progress-bar {
     background: var(--soc-green);
+}
+
+.view-tabs {
+    display: flex;
+    gap: 0.5rem;
+    margin: 1rem 0 0.5rem;
+}
+.view-tab {
+    padding: 0.3rem 0.8rem;
+    border-radius: 4px;
+    border: 1px solid var(--color-border);
+    text-decoration: none;
+    font-size: 0.9rem;
+}
+.view-tab-active {
+    background: var(--color-primary);
+    border-color: var(--color-primary);
+    color: #fff;
+}
+
+.history-nav {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    margin: 0.5rem 0;
+}
+
+.history-date-form {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.6rem;
+    margin: 0.5rem 0 1rem;
+}
+.history-date-form label {
+    font-weight: normal;
+}
+
+/* DataTables ships a light-only skin — override its chrome (search box, page-length
+   select, pagination buttons, sort icons) to follow this app's own theme instead of
+   clashing with it in dark mode. The table body itself (th/td) already inherits this
+   app's own table styles (assets/style.css's element selectors), so only DataTables'
+   own added controls need overriding here. */
+.dataTables_wrapper {
+    color: var(--color-text);
+    font-size: 0.9rem;
+}
+.dataTables_wrapper .dataTables_filter input,
+.dataTables_wrapper .dataTables_length select {
+    background: var(--color-bg);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+    padding: 0.2rem 0.4rem;
+}
+.dataTables_wrapper .dataTables_paginate .paginate_button {
+    color: var(--color-text) !important;
+    border: 1px solid transparent;
+}
+.dataTables_wrapper .dataTables_paginate .paginate_button.current {
+    background: var(--color-primary) !important;
+    border-color: var(--color-primary) !important;
+    color: #fff !important;
+}
+.dataTables_wrapper .dataTables_paginate .paginate_button:hover {
+    background: var(--color-primary-light) !important;
+    border-color: var(--color-primary) !important;
+    color: var(--color-text) !important;
+}
+table.dataTable thead .sorting:after,
+table.dataTable thead .sorting_asc:after,
+table.dataTable thead .sorting_desc:after {
+    color: #fff;
 }
 
 .slot-columns {

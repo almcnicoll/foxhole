@@ -78,6 +78,23 @@ function db(?string $overridePath = null): PDO
         watt_hours INTEGER NOT NULL,
         fetched_at TEXT NOT NULL
     )');
+    // Deliberately NOT disposable, unlike every table above — this is a real accumulating
+    // history, kept indefinitely (see HistoryFetcher.php and CLAUDE.md's "Generation
+    // history" section). One row per local clock hour, keyed by its own start instant, so
+    // a generation backfill and a forecast capture landing at different times both upsert
+    // the same row without clobbering each other's column — see upsertHistoricGeneration()/
+    // upsertHistoricForecast() below. A separate table from rate_slots/solar_forecast on
+    // purpose, even though it overlaps in spirit with solar_forecast — those stay
+    // latest-fetch-only for the dashboard's "what's the plan right now" view; this table
+    // answers a different question ("what actually happened, over time") and duplicating
+    // the data is cheaper than making solar_forecast serve both jobs.
+    $pdo->exec('CREATE TABLE IF NOT EXISTS historic_generation (
+        slot_from TEXT PRIMARY KEY,
+        slot_to TEXT NOT NULL,
+        generation_kwh REAL,
+        forecast_kwh REAL,
+        updated_at TEXT NOT NULL
+    )');
     // One row per (date, kind) — a date-linked exception to the normal schedule, not
     // history, so it's fine as a plain upsertable table rather than the disposable
     // replace-all pattern rate_slots/schedule_groups use.
@@ -250,6 +267,77 @@ function getLatestSolarForecast(): array
         'watt_hours' => (int) $row['watt_hours'],
         'fetched_at' => new DateTimeImmutable($row['fetched_at']),
     ], $rows);
+}
+
+/**
+ * Upserts one local hour's actual generation (summed across every configured device —
+ * see HistoryFetcher), touching only generation_kwh/slot_to/updated_at. Any forecast_kwh
+ * already stored for the same hour (see upsertHistoricForecast()) is left exactly as-is —
+ * the two are written independently, on different schedules, by different callers.
+ */
+function upsertHistoricGeneration(DateTimeImmutable $slotFrom, DateTimeImmutable $slotTo, float $kwh, DateTimeImmutable $updatedAt): void
+{
+    $stmt = db()->prepare('INSERT INTO historic_generation (slot_from, slot_to, generation_kwh, updated_at) VALUES (:from, :to, :kwh, :updated_at)
+        ON CONFLICT(slot_from) DO UPDATE SET slot_to = excluded.slot_to, generation_kwh = excluded.generation_kwh, updated_at = excluded.updated_at');
+    $stmt->execute([
+        'from' => $slotFrom->format(DATE_ATOM),
+        'to' => $slotTo->format(DATE_ATOM),
+        'kwh' => $kwh,
+        'updated_at' => $updatedAt->format(DATE_ATOM),
+    ]);
+}
+
+/**
+ * Upserts one bucket's solar forecast, touching only forecast_kwh/slot_to/updated_at —
+ * mirrors upsertHistoricGeneration() above but never overwrites generation_kwh. Called
+ * prospectively, the moment a forecast fetch covers that hour (Runner.php) — there's no
+ * backfill equivalent for forecasts, since Forecast.Solar only offers *historic* forecasts
+ * on a paid tier (see HistoryFetcher.php's doc comment).
+ */
+function upsertHistoricForecast(DateTimeImmutable $slotFrom, DateTimeImmutable $slotTo, float $kwh, DateTimeImmutable $updatedAt): void
+{
+    $stmt = db()->prepare('INSERT INTO historic_generation (slot_from, slot_to, forecast_kwh, updated_at) VALUES (:from, :to, :kwh, :updated_at)
+        ON CONFLICT(slot_from) DO UPDATE SET slot_to = excluded.slot_to, forecast_kwh = excluded.forecast_kwh, updated_at = excluded.updated_at');
+    $stmt->execute([
+        'from' => $slotFrom->format(DATE_ATOM),
+        'to' => $slotTo->format(DATE_ATOM),
+        'kwh' => $kwh,
+        'updated_at' => $updatedAt->format(DATE_ATOM),
+    ]);
+}
+
+/**
+ * @return array{earliest: ?DateTimeImmutable, latest: ?DateTimeImmutable} slot_from range
+ *         of rows with a real (non-null) generation reading — forecast-only rows don't
+ *         count, since HistoryFetcher uses this purely to know where to resume backfilling/
+ *         catching up actual generation, not forecasts.
+ */
+function getHistoricGenerationBounds(): array
+{
+    $row = db()->query('SELECT MIN(slot_from) AS earliest, MAX(slot_from) AS latest FROM historic_generation WHERE generation_kwh IS NOT NULL')->fetch(PDO::FETCH_ASSOC);
+    return [
+        'earliest' => $row['earliest'] !== null ? new DateTimeImmutable($row['earliest']) : null,
+        'latest' => $row['latest'] !== null ? new DateTimeImmutable($row['latest']) : null,
+    ];
+}
+
+/**
+ * @return array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, generation_kwh: ?float, forecast_kwh: ?float}>
+ *         Raw hourly rows in [$from, $to), ascending. Aggregation into day/week/month/year
+ *         buckets (summed, not averaged — see history.php) happens in PHP on top of this,
+ *         same as every other table in this app; even a few years of hourly rows is a
+ *         trivial amount of data for SQLite/PHP to sum unaggregated.
+ */
+function getHistoricGeneration(DateTimeImmutable $from, DateTimeImmutable $to): array
+{
+    $stmt = db()->prepare('SELECT * FROM historic_generation WHERE slot_from >= :from AND slot_from < :to ORDER BY slot_from ASC');
+    $stmt->execute(['from' => $from->format(DATE_ATOM), 'to' => $to->format(DATE_ATOM)]);
+    return array_map(fn($row) => [
+        'from' => new DateTimeImmutable($row['slot_from']),
+        'to' => new DateTimeImmutable($row['slot_to']),
+        'generation_kwh' => $row['generation_kwh'] !== null ? (float) $row['generation_kwh'] : null,
+        'forecast_kwh' => $row['forecast_kwh'] !== null ? (float) $row['forecast_kwh'] : null,
+    ], $stmt->fetchAll(PDO::FETCH_ASSOC));
 }
 
 /**

@@ -14,6 +14,7 @@ require_once __DIR__ . '/../src/Store.php';
 require_once __DIR__ . '/../src/OctopusClient.php';
 require_once __DIR__ . '/../src/PriceProvider.php';
 require_once __DIR__ . '/../src/FoxessClient.php';
+require_once __DIR__ . '/../src/HistoryFetcher.php';
 require_once __DIR__ . '/../src/Runner.php';
 
 $failures = 0;
@@ -390,6 +391,28 @@ check(isOfflineFailure('FoxESS /op/v1/device/scheduler/enable error 41935: Devic
 check(!isOfflineFailure('FoxESS /op/v1/device/scheduler/enable error 41811: User permissions do not allow this operation'), 'a permissions error is not treated as a routine offline failure');
 check(!isOfflineFailure('cURL error fetching Octopus rates: Could not resolve host'), 'an unrelated cURL error is not treated as a routine offline failure');
 
+// --- HistoryFetcher: combineDeviceGenerationResults() SUCCESS/NO_DATA/ERROR semantics ---
+check(
+    combineDeviceGenerationResults([[1.0, 2.0], [0.5, 0.5]]) === [1.5, 2.5],
+    'two devices with real data are summed elementwise',
+);
+check(
+    combineDeviceGenerationResults([[1.0, 2.0], null]) === [1.0, 2.0],
+    'a device reporting NO_DATA (null) contributes 0, not blocking the day — the multi-inverter-added-later case',
+);
+check(
+    combineDeviceGenerationResults([null, null]) === null,
+    'every device reporting NO_DATA makes the whole day NO_DATA (the backfill-horizon signal)',
+);
+check(
+    combineDeviceGenerationResults([[1.0, 2.0], false]) === false,
+    'any device ERROR makes the whole day untrustworthy, even if another device had real data',
+);
+check(
+    combineDeviceGenerationResults([null, false]) === false,
+    'ERROR outranks NO_DATA when both appear — a day is never silently treated as "no data" just because it also errored',
+);
+
 // --- Store: settings/password/rates/schedule persistence ---
 // Points the whole module at a throwaway file (see Store::db()'s "sticky path"
 // doc comment) so this never touches — and truncates — the real database.
@@ -491,6 +514,32 @@ $storedSolar = getLatestSolarForecast();
 check(count($storedSolar) === 2 && $storedSolar[1]['watt_hours'] === 900, 'saved solar forecast slots round-trip');
 saveSolarForecast([$solarSlots[0]], $pushedAt);
 check(count(getLatestSolarForecast()) === 1, 'a new solar forecast fetch replaces the previous one whole, like rate_slots');
+
+// --- Store: historic_generation — generation and forecast upsert independently, never appending ---
+check(getHistoricGenerationBounds() === ['earliest' => null, 'latest' => null], 'empty historic_generation reports no bounds');
+$hour0 = new DateTimeImmutable('2026-01-05 06:00', $londonTzForSolar);
+$hour1 = new DateTimeImmutable('2026-01-05 07:00', $londonTzForSolar);
+upsertHistoricGeneration($hour0, $hour0->modify('+1 hour'), 1.5, $pushedAt);
+upsertHistoricGeneration($hour1, $hour1->modify('+1 hour'), 2.5, $pushedAt);
+$genRows = getHistoricGeneration($hour0, $hour1->modify('+1 hour'));
+check(count($genRows) === 2, 'two upserted hours round-trip as two rows');
+check($genRows[0]['generation_kwh'] === 1.5 && $genRows[0]['forecast_kwh'] === null, 'a generation-only row has null forecast_kwh, not 0');
+
+upsertHistoricForecast($hour0, $hour0->modify('+1 hour'), 1.25, $pushedAt);
+$genRows2 = getHistoricGeneration($hour0, $hour1->modify('+1 hour'));
+check($genRows2[0]['generation_kwh'] === 1.5 && $genRows2[0]['forecast_kwh'] === 1.25, 'writing a forecast for an hour that already has generation updates forecast_kwh without touching generation_kwh');
+
+$hour2 = new DateTimeImmutable('2026-01-05 08:00', $londonTzForSolar);
+upsertHistoricForecast($hour2, $hour2->modify('+1 hour'), 3.0, $pushedAt);
+$genRows3 = getHistoricGeneration($hour0, $hour2->modify('+1 hour'));
+check(count($genRows3) === 3, 'a forecast-only hour (no generation yet) still creates its own row');
+check($genRows3[2]['generation_kwh'] === null && $genRows3[2]['forecast_kwh'] === 3.0, 'the forecast-only row has null generation_kwh, not 0');
+
+$boundsAfter = getHistoricGenerationBounds();
+check(
+    $boundsAfter['earliest']->getTimestamp() === $hour0->getTimestamp() && $boundsAfter['latest']->getTimestamp() === $hour1->getTimestamp(),
+    'bounds only consider rows with a real (non-null) generation reading — the later forecast-only hour is excluded from "latest"',
+);
 
 // --- ScheduleBuilder: spliceForPush() carries today's remaining plan into tomorrow's ---
 $todayGroups = [['enable' => 1, 'startHour' => 20, 'startMinute' => 0, 'endHour' => 0, 'endMinute' => 0, 'workMode' => 'ForceDischarge', 'minSocOnGrid' => 15, 'fdSoc' => 15, 'fdPwr' => 3000]];

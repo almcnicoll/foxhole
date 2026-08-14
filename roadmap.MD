@@ -86,13 +86,20 @@ reprioritised.
 Ordered roughly by how much value they'd add relative to effort — not a
 commitment, just a starting point for prioritisation:
 
-1. **History/cost reporting.** `rate_slots` and `schedule_groups` currently
-   replace on every run (deliberately — see CLAUDE.md). Making them
-   append-only (stop the `DELETE FROM ...` in `Store::saveRateSlots()`/
-   `saveSchedule()`, add a date filter to the dashboard queries) is a small
-   change now that SQLite is already in place — cheaper than it would have
-   been against the old flat JSON files. Worth doing once you actually want
-   to look back and check the strategy is saving money.
+1. ~~**History/cost reporting.**~~ Partially done: `historic_generation`
+   (`src/Store.php`) is a real, append-only table tracking actual generation
+   (backfilled from FoxESS's report/query endpoint, see `HistoryFetcher.php`)
+   alongside solar forecast (captured prospectively, never backfilled — see
+   CLAUDE.md's "Generation history" section), viewable by day/week/month/year
+   at `history.php`. `rate_slots` and `schedule_groups` themselves are still
+   replace-on-every-run (deliberately — see CLAUDE.md's "Data storage"
+   section) — genuine cost/price history (what did we actually pay, not just
+   what did we generate) is still open. Making them append-only (stop the
+   `DELETE FROM ...` in `Store::saveRateSlots()`/`saveSchedule()`, add a date
+   filter to the dashboard queries) remains a small change if/when that's
+   wanted — `historic_generation` is a reasonable template for how to do it
+   (separate accumulating table, PHP-side aggregation, no new dependency
+   beyond what history.php already added).
 2. **Solar-generation-aware scheduling.** Spec explicitly calls this out as
    the natural next step for `ScheduleBuilder` — e.g. don't force-charge from
    the grid during slots where solar forecast already covers load. Needs a

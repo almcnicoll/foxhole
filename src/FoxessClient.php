@@ -44,6 +44,49 @@ class FoxessClient
     }
 
     /**
+     * Hourly generation (kWh) for one calendar day, per FoxESS's report/query endpoint
+     * (dimension=day) — this is the same total FoxESS Cloud's own app charts, not a raw
+     * power sample needing manual integration. Returns an array of up to 24 values,
+     * index 0 = 00:00-01:00 local (device timezone) through index 23 = 23:00-00:00 —
+     * FoxESS computes "day" by the power station's own timezone, per the OpenAPI docs.
+     * For "today" the trailing not-yet-elapsed hours may come back as 0 rather than
+     * absent — callers should only trust indexes before the current local hour (see
+     * HistoryFetcher, which is the one caller of this method).
+     *
+     * Returns null — not an empty array or a thrown exception — when FoxESS has no
+     * report data at all for this day (errno 0, empty/missing result). This is
+     * deliberately distinguished from a real error (thrown below, via post()): it's the
+     * signal HistoryFetcher's backward backfill uses to detect it's walked back past
+     * the device's own history horizon and should stop trying further back.
+     *
+     * Field name is 'sn' (singular), unlike the scheduler endpoints' 'deviceSN' or
+     * real/query's 'sns' array — confirmed against TonyM1958/FoxESS-Cloud (the same
+     * community reference CLAUDE.md already leans on for the scheduler endpoint and
+     * SoC field names), since FoxESS's own OpenAPI docs are thin here too.
+     */
+    public function getGenerationReport(int $year, int $month, int $day): ?array
+    {
+        $response = $this->post('/op/v0/device/report/query', [
+            'sn' => $this->deviceSn,
+            'dimension' => 'day',
+            'variables' => ['generation'],
+            'year' => $year,
+            'month' => $month,
+            'day' => $day,
+        ]);
+        $result = $response['result'] ?? [];
+        if (!$result) {
+            return null;
+        }
+        foreach ($result as $entry) {
+            if (($entry['variable'] ?? null) === 'generation') {
+                return array_map(fn($v) => $v !== null ? (float) $v : 0.0, $entry['values'] ?? []);
+            }
+        }
+        return null;
+    }
+
+    /**
      * Current battery state of charge (0-100), or null if this device didn't report one.
      * Field name per community reference implementations: 'SoC' for a single battery,
      * 'SoC_1' for the first battery on a multi-battery inverter — not in FoxESS's own
