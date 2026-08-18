@@ -197,30 +197,69 @@ class ScheduleBuilder
     }
 
     /**
-     * Splices today's already-decided plan (for whatever's left of today) onto tomorrow's
-     * freshly computed one, into a single set of recurring groups — the FoxESS scheduler
-     * has no date field, only time-of-day, so pushing tomorrow's plan wholesale would
-     * clobber the hours still left today (see CLAUDE.md's "Today/Tomorrow fix"). Today's
-     * plan wins for [$nowMinutes, midnight); tomorrow's plan fills everything else,
-     * including the [midnight, $nowMinutes) stretch that's logically "later" once today's
-     * date rolls over.
+     * Replaces the old today+tomorrow-specific spliceForPush() (GitHub issue #4,
+     * "Date-time-aware scheduling"): combines however many calendar days currently have a
+     * computed schedule into one absolute timeline, then slices out exactly the window
+     * FoxESS's push actually needs — from the start of the current hour through 24h
+     * ahead, or the end of known pricing data, whichever is sooner. FoxESS's own schedule
+     * format has no date field, only recurring hour/minute-of-day, so this is only safe
+     * because the sliced window is itself never wider than 24h — within it, an absolute
+     * instant's local hour/minute-of-day is unambiguous.
      *
-     * @param array $todayGroups periodsToGroups()-shaped groups for the remainder of today
-     * @param string[] $todayExplanations same length/order as $todayGroups
-     * @param array $tomorrowGroups periodsToGroups()-shaped groups for tomorrow
-     * @param string[] $tomorrowExplanations same length/order as $tomorrowGroups
-     * @param int $nowMinutes minutes since local midnight
-     * @return array{groups: array, explanations: string[]}
+     * Already-elapsed hours of today are naturally excluded (the window starts at the
+     * current hour, not midnight), and a day whose pricing hasn't been published yet is
+     * naturally never pushed past its own known horizon — neither needs special-casing
+     * "today vs tomorrow" the way the old splice did, since everything here works in real
+     * instants throughout. Recomputing every known day fresh each run (rather than
+     * reading a previously-*stored* "today" plan back out to splice, as the old version
+     * did) is safe: both schedulers are deterministic given the same inputs, and
+     * `IntelligentScheduleBuilder` *should* re-adapt to a changed real battery SoC between
+     * runs — that's a feature, not drift to guard against.
+     *
+     * @param array<string, array{groups: array, explanations: string[]}> $scheduleByDate
+     *        for_date (Y-m-d, local to $timezone) => that date's already-computed (and,
+     *        if applicable, override-applied) schedule
+     * @param ?DateTimeImmutable $knownDataEnd the latest instant pricing is actually known
+     *        up to (Store::getLatestPriceHorizon()) — caps the window so nothing gets
+     *        pushed as if it recurs for hours with no real price basis. Null (nothing
+     *        known at all) collapses the window to empty.
+     * @return array{groups: array, explanations: string[], windowStart: DateTimeImmutable, windowEnd: DateTimeImmutable}
+     *         windowStart/windowEnd are returned mainly so callers (Runner.php) can
+     *         describe what was actually pushed in a log/status message — when the window
+     *         collapses to empty, windowEnd equals windowStart.
      */
-    public function spliceForPush(array $todayGroups, array $todayExplanations, array $tomorrowGroups, array $tomorrowExplanations, int $nowMinutes): array
+    public function buildPushWindow(array $scheduleByDate, DateTimeImmutable $now, DateTimeZone $timezone, ?DateTimeImmutable $knownDataEnd): array
     {
-        $todayTail = $this->subtractInterval($this->groupsToIntervals($todayGroups, $todayExplanations), 0, $nowMinutes);
-        $tomorrowRest = $this->subtractInterval($this->groupsToIntervals($tomorrowGroups, $tomorrowExplanations), $nowMinutes, 24 * 60);
+        $localNow = $now->setTimezone($timezone);
+        $windowStart = $localNow->setTime((int) $localNow->format('G'), 0, 0);
+        $windowEnd = $windowStart->modify('+24 hours');
+        if ($knownDataEnd !== null && $knownDataEnd < $windowEnd) {
+            $windowEnd = $knownDataEnd;
+        }
+        if ($windowEnd <= $windowStart) {
+            return ['groups' => [], 'explanations' => [], 'windowStart' => $windowStart, 'windowEnd' => $windowStart];
+        }
 
-        $intervals = [...$todayTail, ...$tomorrowRest];
-        usort($intervals, fn($a, $b) => $a['start'] <=> $b['start']);
+        $absoluteIntervals = [];
+        foreach ($scheduleByDate as $forDate => $schedule) {
+            $dayStart = new DateTimeImmutable($forDate, $timezone);
+            foreach ($this->groupsToIntervals($schedule['groups'], $schedule['explanations']) as $iv) {
+                $absStart = $dayStart->modify("+{$iv['start']} minutes");
+                $absEnd = $dayStart->modify("+{$iv['end']} minutes");
+                if ($absEnd <= $windowStart || $absStart >= $windowEnd) {
+                    continue; // entirely outside the push window — e.g. already-elapsed hours of today
+                }
+                $absoluteIntervals[] = [
+                    'start' => max($absStart, $windowStart),
+                    'end' => min($absEnd, $windowEnd),
+                    'workMode' => $iv['workMode'],
+                    'explanation' => $iv['explanation'],
+                ];
+            }
+        }
+        usort($absoluteIntervals, fn($a, $b) => $a['start'] <=> $b['start']);
 
-        return $this->intervalsToGroups($intervals);
+        return $this->absoluteIntervalsToGroups($absoluteIntervals) + ['windowStart' => $windowStart, 'windowEnd' => $windowEnd];
     }
 
     /** @return array<int, array{start: int, end: int, workMode: string, explanation: string}> */
@@ -266,6 +305,50 @@ class ScheduleBuilder
                 'startMinute' => $iv['start'] % 60,
                 'endHour' => intdiv($end, 60),
                 'endMinute' => $end % 60,
+                'workMode' => $iv['workMode'],
+                'minSocOnGrid' => $minSocOnGrid,
+                'fdSoc' => $fdSoc,
+                'fdPwr' => (int) round($fdPwr * 1000),
+            ];
+            $explanations[] = $iv['explanation'];
+        }
+        return ['groups' => $groups, 'explanations' => $explanations];
+    }
+
+    /**
+     * Like intervalsToGroups(), but for real DateTimeImmutable instants rather than
+     * minutes since a conceptual single day's midnight — used only by buildPushWindow(),
+     * whose window doesn't necessarily start at midnight, so "minutes since window start"
+     * would map to the wrong hour/minute-of-day (FoxESS's fields are literal local clock
+     * time, not elapsed time from some reference point). A real midnight instant already
+     * formats as hour 0 / minute 0 via DateTimeImmutable::format(), which happens to be
+     * exactly FoxESS's own "end of day" convention — no 24*60-\>0 wraparound special-case
+     * needed here, unlike intervalsToGroups() above.
+     *
+     * @param array<int, array{start: DateTimeImmutable, end: DateTimeImmutable, workMode: string, explanation: string}> $absoluteIntervals
+     * @return array{groups: array, explanations: string[]}
+     */
+    private function absoluteIntervalsToGroups(array $absoluteIntervals): array
+    {
+        $chargeKw = (float) ($this->batteryConfig['max_charge_kw'] ?? 0);
+        $dischargeKw = (float) ($this->batteryConfig['max_discharge_kw'] ?? 0);
+        $minSocOnGrid = (int) ($this->batteryConfig['min_soc_on_grid'] ?? 0);
+        $reserveSoc = (int) ($this->batteryConfig['reserve_soc'] ?? 0);
+
+        $groups = [];
+        $explanations = [];
+        foreach ($absoluteIntervals as $iv) {
+            [$fdSoc, $fdPwr] = match ($iv['workMode']) {
+                'ForceCharge' => [100, $chargeKw],
+                'ForceDischarge' => [$reserveSoc, $dischargeKw],
+                default => [$minSocOnGrid, 0.0],
+            };
+            $groups[] = [
+                'enable' => 1,
+                'startHour' => (int) $iv['start']->format('G'),
+                'startMinute' => (int) $iv['start']->format('i'),
+                'endHour' => (int) $iv['end']->format('G'),
+                'endMinute' => (int) $iv['end']->format('i'),
                 'workMode' => $iv['workMode'],
                 'minSocOnGrid' => $minSocOnGrid,
                 'fdSoc' => $fdSoc,

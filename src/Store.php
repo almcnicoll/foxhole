@@ -29,18 +29,23 @@ function db(?string $overridePath = null): PDO
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     )');
-    // rate_slots gained a second price column (export) and dropped the old
-    // single `rate_pence` column. The table is always fully replaced on every
-    // fetch anyway (see saveRateSlots) — nothing worth migrating — so on the
-    // old schema just drop and recreate rather than building a migration
-    // system for one rename.
-    $hasOldSchema = (int) $pdo->query("SELECT COUNT(*) FROM pragma_table_info('rate_slots') WHERE name = 'rate_pence'")->fetchColumn();
-    if ($hasOldSchema > 0) {
+    // rate_slots (this table's previous name) was disposable by design — replaced
+    // wholesale on every fetch, never real history (see CLAUDE.md's old "Data storage"
+    // writeup). GitHub issue #4 replaced it with price_slots: permanent, upserted by
+    // slot_from, never wholesale-replaced. Nothing in the old table was ever worth
+    // migrating (it only ever held the latest fetch), so it's just dropped outright —
+    // same guarded-DROP-and-recreate pattern already used twice for this table's prior
+    // schema changes, just this time retiring the table itself rather than a column.
+    $hasOldRateSlots = (int) $pdo->query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'rate_slots'")->fetchColumn();
+    if ($hasOldRateSlots > 0) {
         $pdo->exec('DROP TABLE rate_slots');
     }
-    $pdo->exec('CREATE TABLE IF NOT EXISTS rate_slots (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        slot_from TEXT NOT NULL,
+    // Permanent, unlike the old rate_slots — see Store::upsertPriceSlots()/
+    // getPriceSlotsFrom() and CLAUDE.md's "Date-time-aware scheduling". slot_from is the
+    // natural primary key: each half-hour instant is only ever fetched once, re-fetched
+    // with (hopefully) the same value, or has its export leg filled in later.
+    $pdo->exec('CREATE TABLE IF NOT EXISTS price_slots (
+        slot_from TEXT PRIMARY KEY,
         slot_to TEXT NOT NULL,
         import_rate_pence REAL NOT NULL,
         export_rate_pence REAL,
@@ -70,7 +75,15 @@ function db(?string $overridePath = null): PDO
         explanation TEXT,
         pushed_at TEXT NOT NULL
     )');
-    // Disposable, replace-on-every-fetch — same pattern as rate_slots, see saveSolarForecast().
+    // One day-level summary sentence per known date — replaces the old single global
+    // `schedule_summary` setting, which only ever fit a single "target date" per run.
+    // Upserted per date (see upsertScheduleSummary()), pruned alongside schedule_groups.
+    $pdo->exec('CREATE TABLE IF NOT EXISTS schedule_summaries (
+        for_date TEXT PRIMARY KEY,
+        summary TEXT NOT NULL
+    )');
+    // Disposable, replace-on-every-fetch (unlike price_slots above, this stays a
+    // latest-fetch-only cache — see saveSolarForecast()).
     $pdo->exec('CREATE TABLE IF NOT EXISTS solar_forecast (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         slot_from TEXT NOT NULL,
@@ -170,40 +183,84 @@ function setSetting(string $key, string $value): void
 }
 
 /**
+ * Upserts (never wholesale-replaces) every fetched slot into the permanent price_slots
+ * table — see CLAUDE.md's "Date-time-aware scheduling" (GitHub issue #4). Each slot's
+ * `slot_from` is its natural primary key, so re-fetching a slot already known just
+ * refreshes it in place rather than duplicating a row.
+ *
  * @param array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, rate: float}> $importSlots
  * @param ?array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, rate: float}> $exportSlots
- *        same length/order as $importSlots, or null if export prices couldn't be resolved this run
- *        (stored as NULL per row rather than blocking the import/schedule/push path — see Runner.php)
+ *        same length/order as $importSlots, or null if export prices couldn't be resolved this run.
+ *        Import always overwrites; export only overwrites when non-null — a run that
+ *        couldn't resolve export prices must never clobber an export rate a previous run
+ *        already recorded for the same slot (COALESCE against the existing value), same
+ *        non-clobbering principle as historic_generation's independently-written columns.
  */
-function saveRateSlots(array $importSlots, ?array $exportSlots, DateTimeImmutable $fetchedAt): void
+function upsertPriceSlots(array $importSlots, ?array $exportSlots, DateTimeImmutable $fetchedAt): void
 {
     $pdo = db();
     $pdo->beginTransaction();
-    $pdo->exec('DELETE FROM rate_slots');
-    $stmt = $pdo->prepare('INSERT INTO rate_slots (slot_from, slot_to, import_rate_pence, export_rate_pence, fetched_at) VALUES (?, ?, ?, ?, ?)');
+    $stmt = $pdo->prepare('INSERT INTO price_slots (slot_from, slot_to, import_rate_pence, export_rate_pence, fetched_at)
+        VALUES (:slot_from, :slot_to, :import_rate_pence, :export_rate_pence, :fetched_at)
+        ON CONFLICT(slot_from) DO UPDATE SET
+            slot_to = excluded.slot_to,
+            import_rate_pence = excluded.import_rate_pence,
+            export_rate_pence = COALESCE(excluded.export_rate_pence, export_rate_pence),
+            fetched_at = excluded.fetched_at');
     foreach ($importSlots as $i => $slot) {
         $stmt->execute([
-            $slot['from']->format(DATE_ATOM),
-            $slot['to']->format(DATE_ATOM),
-            $slot['rate'],
-            $exportSlots[$i]['rate'] ?? null,
-            $fetchedAt->format(DATE_ATOM),
+            'slot_from' => $slot['from']->format(DATE_ATOM),
+            'slot_to' => $slot['to']->format(DATE_ATOM),
+            'import_rate_pence' => $slot['rate'],
+            'export_rate_pence' => $exportSlots[$i]['rate'] ?? null,
+            'fetched_at' => $fetchedAt->format(DATE_ATOM),
         ]);
     }
     $pdo->commit();
 }
 
-/** @return array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, import_rate: float, export_rate: ?float, fetched_at: DateTimeImmutable}> */
-function getLatestRateSlots(): array
+/**
+ * Every known slot from $from onward, ascending — the single query that replaces the old
+ * getLatestRateSlots() everywhere: pass local midnight today for "what should the
+ * dashboard/Schedulers page show", pass "now" for "what's actually left to schedule".
+ *
+ * $from is normalised to UTC before comparison — every stored slot_from is UTC (upsertPriceSlots()
+ * only ever writes import slots' own timestamps, and OctopusClient always returns UTC
+ * DateTimeImmutable objects), so a $from formatted in local time would compare its
+ * "+01:00"/"+00:00" offset against stored "+00:00" values as plain TEXT, which is only
+ * chronologically correct when every value shares the same offset. Confirmed live during
+ * BST: local midnight ("...T00:00:00+01:00") sorted as *later* than the UTC-stored slot
+ * for that exact same instant ("...T23:00:00+00:00" the previous calendar day), silently
+ * dropping the first hour of "today" from every query. Normalising both sides to UTC
+ * fixes this without needing every stored value to change.
+ *
+ * @return array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, import_rate: float, export_rate: ?float, fetched_at: DateTimeImmutable}>
+ */
+function getPriceSlotsFrom(DateTimeImmutable $from): array
 {
-    $rows = db()->query('SELECT * FROM rate_slots ORDER BY slot_from ASC')->fetchAll(PDO::FETCH_ASSOC);
+    $stmt = db()->prepare('SELECT * FROM price_slots WHERE slot_from >= ? ORDER BY slot_from ASC');
+    $stmt->execute([$from->setTimezone(new DateTimeZone('UTC'))->format(DATE_ATOM)]);
     return array_map(fn($row) => [
         'from' => new DateTimeImmutable($row['slot_from']),
         'to' => new DateTimeImmutable($row['slot_to']),
         'import_rate' => (float) $row['import_rate_pence'],
         'export_rate' => $row['export_rate_pence'] !== null ? (float) $row['export_rate_pence'] : null,
         'fetched_at' => new DateTimeImmutable($row['fetched_at']),
-    ], $rows);
+    ], $stmt->fetchAll(PDO::FETCH_ASSOC));
+}
+
+/** For the "rates last fetched at X" dashboard line — null if nothing has ever been fetched. */
+function getLatestPriceFetchedAt(): ?DateTimeImmutable
+{
+    $value = db()->query('SELECT MAX(fetched_at) FROM price_slots')->fetchColumn();
+    return $value !== null ? new DateTimeImmutable($value) : null;
+}
+
+/** The latest slot_to across every known price slot — the true end of current pricing knowledge, or null if none. */
+function getLatestPriceHorizon(): ?DateTimeImmutable
+{
+    $value = db()->query('SELECT MAX(slot_to) FROM price_slots')->fetchColumn();
+    return $value !== null ? new DateTimeImmutable($value) : null;
 }
 
 /**
@@ -272,10 +329,27 @@ function getScheduleForDate(string $forDate): array
     ];
 }
 
-/** Schedules are date-linked (see getScheduleForDate) — anything before today can never be spliced against again. */
+/** Schedules are date-linked (see getScheduleForDate) — anything before today can never be pushed again. */
 function pruneOldSchedules(string $today): void
 {
     db()->prepare('DELETE FROM schedule_groups WHERE for_date < ?')->execute([$today]);
+    db()->prepare('DELETE FROM schedule_summaries WHERE for_date < ?')->execute([$today]);
+}
+
+/** One day-level summary sentence per date — replaces the old single global `schedule_summary` setting. */
+function upsertScheduleSummary(string $forDate, string $summary): void
+{
+    $stmt = db()->prepare('INSERT INTO schedule_summaries (for_date, summary) VALUES (:for_date, :summary)
+        ON CONFLICT(for_date) DO UPDATE SET summary = excluded.summary');
+    $stmt->execute(['for_date' => $forDate, 'summary' => $summary]);
+}
+
+function getScheduleSummary(string $forDate): ?string
+{
+    $stmt = db()->prepare('SELECT summary FROM schedule_summaries WHERE for_date = ?');
+    $stmt->execute([$forDate]);
+    $value = $stmt->fetchColumn();
+    return $value !== false ? $value : null;
 }
 
 /**

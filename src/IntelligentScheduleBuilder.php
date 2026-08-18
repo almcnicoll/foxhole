@@ -62,7 +62,12 @@ class IntelligentScheduleBuilder
      *        any granularity — prorated onto $importSlots by time overlap. Null if unavailable.
      * @param ?float $currentSocPercent actual battery SoC right now (FoxessClient::getBatterySoc()),
      *        0-100, or null if unknown (falls back to assuming it's at the reserve floor).
-     * @return array{groups: array, explanations: string[], summary: string}
+     * @return array{groups: array, explanations: string[], summary: string, finalSocPercent: float}
+     *         finalSocPercent is this plan's projected SoC at the end of the given day —
+     *         GitHub issue #4's multi-day scheduling passes it back in as the next known
+     *         day's $currentSocPercent, so a projected trajectory carries across the day
+     *         boundary instead of every day independently assuming it starts at the real
+     *         live reading (which is only true for the first day in a run).
      */
     public function build(array $importSlots, ?array $exportSlots, array $costBasis, ?array $solarSlots, ?float $currentSocPercent): array
     {
@@ -228,11 +233,15 @@ class IntelligentScheduleBuilder
         // (fixed, already sized against $simulateSocBefore above) + tentative sell
         // candidates applied in time order; if the battery would go below reserve, drop
         // the least price-desirable *sell* candidate and re-check — reservations aren't
-        // evicted, since they were sized specifically to stay feasible. Bounded by count($selected).
-        while ($selected) {
+        // evicted, since they were sized specifically to stay feasible. Bounded by
+        // count($selected). Written as a closure returning both the outcome and the
+        // full-day-end SoC (not just a bare while ($selected) loop) specifically so a day
+        // with zero sell candidates still walks the whole day once — needed for
+        // $finalSocPercent below, which needs the real end-of-day figure even when
+        // nothing was ever a violation risk in the first place.
+        $simulateFullDay = function () use ($startingSocKwh, $chargeSet, $preChargeIndexes, &$selected, $netKwh, $chargeEnergyKwh, $dischargeEnergyKwh, $capacityKwh, $minSocOnGridKwh, $reserveKwh, $n): array {
             $soc = $startingSocKwh;
             $selectedSet = array_flip($selected);
-            $violated = false;
             for ($i = 0; $i < $n; $i++) {
                 if (isset($chargeSet[$i])) {
                     $soc = min($capacityKwh, $soc + $chargeEnergyKwh);
@@ -240,21 +249,25 @@ class IntelligentScheduleBuilder
                     $soc = max($reserveKwh, $soc - $dischargeEnergyKwh);
                 } elseif (isset($selectedSet[$i])) {
                     if ($soc - $dischargeEnergyKwh < $reserveKwh) {
-                        $violated = true;
-                        break;
+                        return ['soc' => $soc, 'violated' => true];
                     }
                     $soc -= $dischargeEnergyKwh;
                 } else {
                     $soc = max($minSocOnGridKwh, min($capacityKwh, $soc + $netKwh[$i]));
                 }
             }
-            if (!$violated) {
+            return ['soc' => $soc, 'violated' => false];
+        };
+        while (true) {
+            $dayResult = $simulateFullDay();
+            if (!$dayResult['violated']) {
                 break;
             }
             array_pop($selected); // arsort order preserved by the slice above — last = worst-ranked
         }
         $dischargeIndexes = [...array_keys($preChargeIndexes), ...$selected];
         sort($dischargeIndexes);
+        $finalSocPercent = $capacityKwh > 0 ? $dayResult['soc'] / $capacityKwh * 100 : 0.0;
 
         $modes = array_fill(0, $n, 'SelfUse');
         foreach ($chargeIndexes as $i) {
@@ -269,6 +282,7 @@ class IntelligentScheduleBuilder
         return [
             'groups' => $this->periodsToGroups($periods, $chargeKw, $dischargeKw, $minSocOnGrid, $reserveSoc),
             'explanations' => $this->explainPeriods($periods, $importRates, $exportRates, $neededTopUpKwh, $preChargeIndexes, $importSlots, $timezone, $bestExportRate),
+            'finalSocPercent' => $finalSocPercent,
             'summary' => sprintf(
                 'Solar forecast: %.1fkWh today, assumed usage %.1fkWh — projected %.1fkWh needed from the grid to reach full before the %s peak (%sp/kWh). Battery starting at %.0f%% (%.1fkWh).',
                 array_sum($solarKwh),

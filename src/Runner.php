@@ -39,59 +39,72 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
         $timezone = new DateTimeZone($config['strategy']['timezone'] ?? 'Europe/London');
         $today = new DateTimeImmutable('today', $timezone);
         $tomorrow = $today->modify('+1 day');
+        $now = new DateTimeImmutable('now', $timezone);
 
         $priceProvider = new PriceProvider(new OctopusClient($logger), $config['octopus']);
 
-        // Agile rates for tomorrow publish ~16:00 UK time. Prefer tomorrow (the
-        // normal case — cron runs once, after publish, to set up the next day)
-        // but fall back to today if they're not out yet, so a run before ~16:00,
-        // or a missed run catching up, still does something useful instead of
-        // just failing. This fallback only itself fails if today comes back
-        // completely empty, which in practice hasn't been observed — Octopus's
-        // published horizon can still lag by an hour or two even for "today"
-        // (see OctopusClient/PriceProvider), but a partial day is usable, not
-        // a failure: it's just built with whatever slots exist.
-        try {
-            $targetDate = $tomorrow;
-            $slots = $priceProvider->resolveImport($targetDate);
-        } catch (OctopusFetchException $e) {
-            $logger->info("Tomorrow's rates not available (" . $e->getMessage() . '), falling back to today.');
-            $targetDate = $today;
-            $slots = $priceProvider->resolveImport($targetDate);
-        }
+        // GitHub issue #4 ("Date-time-aware scheduling"): attempt BOTH today and
+        // tomorrow every run — not "tomorrow, falling back to today" — so the schedule
+        // can extend as far as pricing is actually published, not just one day at a
+        // time. Agile rates for tomorrow publish ~16:00 UK time, so a run before that
+        // just won't have tomorrow's rates yet, same as before; the only hard failure is
+        // *neither* day producing any usable slots at all (see below), which in practice
+        // hasn't been observed — Octopus's published horizon can lag an hour or two even
+        // for "today", but a partial day is usable, not a failure.
+        $fetchedAnyDay = false;
+        foreach ([$today, $tomorrow] as $date) {
+            try {
+                $importSlots = $priceProvider->resolveImport($date);
+            } catch (OctopusFetchException $e) {
+                $logger->info('Rates for ' . $date->format('Y-m-d') . ' not available (' . $e->getMessage() . ').');
+                continue;
+            }
+            $fetchedAnyDay = true;
 
-        // Export prices feed ScheduleBuilder's arbitrage/discharge logic, but a failure
-        // here shouldn't block the import/schedule/push path that matters more — store
-        // null for the run rather than aborting it. Aligned to import by timestamp
-        // rather than requiring equal counts: import is now often a same-day *prefix*
-        // of a full 48 (partial-day data, see OctopusClient) while fixed-mode export is
-        // always a clean 48, so raw counts routinely differ even when every import slot
-        // does have a matching export entry. Matched via getTimestamp(), not a formatted
-        // string — OctopusClient's slots are UTC, fixed-mode slots are the configured
-        // local timezone, so the same instant can format differently between the two.
-        $exportSlots = null;
-        try {
-            $candidate = $priceProvider->resolveExport($targetDate);
-            $exportByTime = [];
-            foreach ($candidate as $exportSlot) {
-                $exportByTime[$exportSlot['from']->getTimestamp()] = $exportSlot;
-            }
-            $aligned = [];
-            foreach ($slots as $importSlot) {
-                $match = $exportByTime[$importSlot['from']->getTimestamp()] ?? null;
-                if ($match === null) {
-                    $aligned = null;
-                    break;
+            // Export prices feed arbitrage/discharge logic, but a failure here shouldn't
+            // block the import/schedule/push path that matters more — store null for
+            // this day rather than aborting the run. Aligned to import by timestamp
+            // rather than requiring equal counts: import is often a same-day *prefix* of
+            // a full 48 (partial-day data, see OctopusClient) while fixed-mode export is
+            // always a clean 48, so raw counts routinely differ even when every import
+            // slot does have a matching export entry. Matched via getTimestamp(), not a
+            // formatted string — OctopusClient's slots are UTC, fixed-mode slots are the
+            // configured local timezone, so the same instant can format differently
+            // between the two.
+            $exportSlots = null;
+            try {
+                $candidate = $priceProvider->resolveExport($date);
+                $exportByTime = [];
+                foreach ($candidate as $exportSlot) {
+                    $exportByTime[$exportSlot['from']->getTimestamp()] = $exportSlot;
                 }
-                $aligned[] = $match;
+                $aligned = [];
+                foreach ($importSlots as $importSlot) {
+                    $match = $exportByTime[$importSlot['from']->getTimestamp()] ?? null;
+                    if ($match === null) {
+                        $aligned = null;
+                        break;
+                    }
+                    $aligned[] = $match;
+                }
+                if ($aligned !== null) {
+                    $exportSlots = $aligned;
+                } else {
+                    $logger->warn('Export price slots do not fully cover import slots for ' . $date->format('Y-m-d') . ', storing without export prices.');
+                }
+            } catch (OctopusFetchException $e) {
+                $logger->warn('Export price fetch failed for ' . $date->format('Y-m-d') . ', storing without export prices: ' . $e->getMessage());
             }
-            if ($aligned !== null) {
-                $exportSlots = $aligned;
-            } else {
-                $logger->warn('Export price slots do not fully cover the import slots for this run, storing without export prices.');
-            }
-        } catch (OctopusFetchException $e) {
-            $logger->warn('Export price fetch failed, storing without export prices: ' . $e->getMessage());
+
+            // Persisted immediately per day, even in --dry-run (it's just a record of
+            // what was fetched, and it's what powers the dashboard/Schedulers preview) —
+            // upsertPriceSlots() never clobbers an already-known export rate with null,
+            // so a later run that couldn't resolve export prices can't erase one this run
+            // just recorded. See Store.php.
+            upsertPriceSlots($importSlots, $exportSlots, $now);
+        }
+        if (!$fetchedAnyDay) {
+            throw new OctopusFetchException('No rates available for today or tomorrow.');
         }
 
         // Not on the critical path — not used by ScheduleBuilder yet (see roadmap.MD's
@@ -147,17 +160,40 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
             }
         }
 
-        $costBasis = (new CostBasisProvider($config['cost_basis']))->getCostBasis(count($slots));
+        // Known window: every currently-known slot from the start of today onward — may
+        // span into tomorrow once published (see above). Split into calendar-day chunks;
+        // each chunk gets scheduled exactly as a single-day run would have built it before
+        // this multi-day support existed — see Schedulers.php's buildMultiDaySchedule(),
+        // which both this function and schedulers.php's preview call.
+        $knownSlots = getPriceSlotsFrom($today);
+        $slotsByDate = [];
+        foreach ($knownSlots as $slot) {
+            $forDate = $slot['from']->setTimezone($timezone)->format('Y-m-d');
+            $slotsByDate[$forDate]['importSlots'][] = ['from' => $slot['from'], 'to' => $slot['to'], 'rate' => $slot['import_rate']];
+            $slotsByDate[$forDate]['exportSlots'][] = $slot['export_rate'] !== null
+                ? ['from' => $slot['from'], 'to' => $slot['to'], 'rate' => $slot['export_rate']]
+                : null;
+        }
+        // Export must be null for the whole day (not a list containing some nulls)
+        // whenever any slot in that day lacks one — the schedulers expect "all or
+        // nothing" per day, same alignment rule enforced per fetch above.
+        foreach ($slotsByDate as $forDate => &$dayInputs) {
+            if (in_array(null, $dayInputs['exportSlots'], true)) {
+                $dayInputs['exportSlots'] = null;
+            }
+            $dayInputs['costBasis'] = (new CostBasisProvider($config['cost_basis']))->getCostBasis(count($dayInputs['importSlots']));
+        }
+        unset($dayInputs);
 
-        // $scheduleBuilder is always constructed — even when a different scheduler is
-        // selected — because applyOverrides()/spliceForPush() below are pure
-        // group/interval transforms that only need battery config, not any of
-        // ScheduleBuilder's own price-selection state, so every scheduler shares this
-        // one instance for those two steps rather than duplicating them.
         // getBatteryConfig() reads from the settings table (editable via settings.php),
         // falling back to config.php's legacy 'battery' array (if still present) only
         // for whichever keys haven't been saved via settings.php yet — see Store.php.
         $batteryConfig = getBatteryConfig($config['battery'] ?? []);
+        // $scheduleBuilder is always constructed — even when a different scheduler is
+        // selected — because applyOverrides()/buildPushWindow() below are pure
+        // group/interval transforms that only need battery config, not any of
+        // ScheduleBuilder's own price-selection state, so every scheduler shares this
+        // one instance for those two steps rather than duplicating them.
         $scheduleBuilder = new ScheduleBuilder($config['strategy'], $batteryConfig);
 
         // Which scheduler actually runs is chosen on the Schedulers page (schedulers.php),
@@ -166,14 +202,16 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
         // toggle -> default).
         $schedulerId = resolveSchedulerId($forceSchedulerId);
         $schedulerName = SCHEDULER_DEFINITIONS[$schedulerId]['name'] ?? $schedulerId;
-        $logger->info("Scheduler: $schedulerName" . ($forceSchedulerId !== null ? ' (forced via CLI flag)' : ' (from settings)'));
-
-        $scheduleInputs = ['importSlots' => $slots, 'exportSlots' => $exportSlots, 'costBasis' => $costBasis];
+        $logger->info("Scheduler: $schedulerName" . ($forceSchedulerId !== null ? ' (forced via CLI flag)' : ' (from settings)') . ', covering ' . implode(', ', array_keys($slotsByDate)) . '.');
 
         // The forecast-weighted scheduler is the only one that currently needs solar
         // forecast, live battery SoC or an estimated usage profile — gathered here rather
         // than unconditionally so a run using any other scheduler doesn't pay for a live
-        // FoxESS SoC call it has no use for.
+        // FoxESS SoC call it has no use for. Gathered once for the whole run, not per
+        // day: the live SoC reading only seeds day one (buildMultiDaySchedule() carries
+        // each day's own projected finalSocPercent into the next), and the day-length
+        // difference between adjacent calendar days is immaterial to the usage estimate.
+        $forecastExtras = [];
         if ($schedulerId === 'forecast_weighted_price_model') {
             // Real battery SoC makes the projected-energy simulation meaningfully more
             // accurate, but reading it means touching FoxESS credentials — skipped for a
@@ -212,75 +250,72 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
                     $currentSocPercent = array_sum($socReadings) / count($socReadings);
                 }
             }
-            $scheduleInputs['usageConfig'] = ['avg_daily_kwh' => UsageEstimator::estimateDailyKwh(
-                (float) getSetting('usage_summer_kwh_month', '300'),
-                (float) getSetting('usage_winter_kwh_month', '700'),
-                $targetDate,
-                $timezone,
-                getLatestSolarForecast(),
-            )];
-            $scheduleInputs['solarSlots'] = getLatestSolarForecast() ?: null;
-            $scheduleInputs['currentSocPercent'] = $currentSocPercent;
-        }
-        $schedule = buildScheduleWithScheduler($schedulerId, $config['strategy'], $batteryConfig, $scheduleInputs);
-        $now = new DateTimeImmutable('now', $timezone);
-
-        // Rates are worth recording even in a dry run — it's what powers the dashboard.
-        saveRateSlots($slots, $exportSlots, $now);
-
-        // Any "Fill your boots" / "Power down" override saved for this exact date (override.php)
-        // gets carved into the schedule here — after the price logic built its plan, before
-        // either the dry-run preview or the real push, so both reflect it identically.
-        $overridesForTarget = getOverridesForDate($targetDate->format('Y-m-d'));
-        if ($overridesForTarget) {
-            $overlaid = $scheduleBuilder->applyOverrides($schedule['groups'], $schedule['explanations'], $overridesForTarget, $timezone);
-            $schedule['groups'] = $overlaid['groups'];
-            $schedule['explanations'] = $overlaid['explanations'];
+            $forecastExtras = [
+                'usageConfig' => ['avg_daily_kwh' => UsageEstimator::estimateDailyKwh(
+                    (float) getSetting('usage_summer_kwh_month', '300'),
+                    (float) getSetting('usage_winter_kwh_month', '700'),
+                    $today,
+                    $timezone,
+                    getLatestSolarForecast(),
+                )],
+                'solarSlots' => getLatestSolarForecast() ?: null,
+                'currentSocPercent' => $currentSocPercent,
+            ];
         }
 
-        if ($dryRun) {
-            $message = 'Dry run for ' . $targetDate->format('Y-m-d') . ': ' . count($schedule['groups']) . ' group(s), not pushed. ' . $schedule['summary'];
-            $logger->info($message);
-            return ['ok' => true, 'dryRun' => true, 'message' => $message, 'schedule' => $schedule];
-        }
+        $scheduleByDate = buildMultiDaySchedule($schedulerId, $config['strategy'], $batteryConfig, $slotsByDate, $forecastExtras);
 
-        // Whichever hours are still left of today can't just be overwritten by tomorrow's
-        // plan wholesale — the FoxESS scheduler has no date field, only time-of-day, so
-        // that would clobber today's already-correct decisions for the rest of today (see
-        // CLAUDE.md's "Today/Tomorrow fix"). Splice today's stored plan onto tomorrow's
-        // freshly-built one when there's a today plan to splice against; otherwise (e.g.
-        // fallback-to-today runs before ~16:00) there's nothing to splice, push as-is.
-        $pushGroups = $schedule['groups'];
-        $pushExplanations = $schedule['explanations'];
-        if ($targetDate == $tomorrow) {
-            $todayPlan = getScheduleForDate($today->format('Y-m-d'));
-            if ($todayPlan['pushed_at'] !== null) {
-                $nowMinutes = ((int) $now->format('G')) * 60 + (int) $now->format('i');
-                $spliced = $scheduleBuilder->spliceForPush($todayPlan['groups'], $todayPlan['explanations'], $schedule['groups'], $schedule['explanations'], $nowMinutes);
-                $pushGroups = $spliced['groups'];
-                $pushExplanations = $spliced['explanations'];
+        // Any "Fill your boots" / "Power down" override saved for a known date
+        // (override.php) gets carved into that date's schedule here — after the price
+        // logic built its plan, before either the dry-run preview or the real push, so
+        // both reflect it identically. applyOverrides() is a no-op for a date with none.
+        foreach ($scheduleByDate as $forDate => &$daySchedule) {
+            $overridesForDate = getOverridesForDate($forDate);
+            if ($overridesForDate) {
+                $overlaid = $scheduleBuilder->applyOverrides($daySchedule['groups'], $daySchedule['explanations'], $overridesForDate, $timezone);
+                $daySchedule['groups'] = $overlaid['groups'];
+                $daySchedule['explanations'] = $overlaid['explanations'];
             }
         }
+        unset($daySchedule);
 
-        // Compared against the last *actually pushed* (i.e. spliced) groups, not the raw
-        // per-date plan — the splice boundary moves every run even when nothing about the
-        // underlying prices changed, so diffing raw plans would misfire the skip. A device
-        // that didn't receive that content stays in "pending_device_sns" until it does —
-        // without this, a run that recomputes the same content as last time would read as
-        // a no-op and a device that failed earlier (e.g. a battery-less inverter offline
-        // overnight — see CLAUDE.md) would never get retried once it's reachable again.
-        // Recorded regardless of whether anything below actually gets pushed to FoxESS —
-        // this is what index.php shows as "today's plan"/"pushed at", and it must not go
-        // missing just because the resolved schedule happens to match what's already
-        // active on the inverter (the common case: a "Run now" click, or an every-3h
-        // cron tick, that legitimately has nothing new to say). Otherwise the dashboard
-        // has no record for today's date at all and reads as "nothing has run", even
-        // though the correct schedule from a prior run is still in effect. Saved before
-        // the unchanged/skip check below, not after, so a skipped push doesn't skip this.
-        saveSchedule($targetDate->format('Y-m-d'), $schedule['groups'], $schedule['explanations'], $now);
+        if ($dryRun) {
+            $totalGroups = array_sum(array_map(fn($s) => count($s['groups']), $scheduleByDate));
+            $message = 'Dry run for ' . implode(', ', array_keys($scheduleByDate)) . ': ' . $totalGroups . ' total group(s) across ' . count($scheduleByDate) . ' day(s), not pushed.';
+            $logger->info($message);
+            return ['ok' => true, 'dryRun' => true, 'message' => $message, 'schedule' => $scheduleByDate];
+        }
+
+        // Recorded for every known date regardless of whether anything below actually
+        // gets pushed to FoxESS — this is what index.php/schedulers.php show as each
+        // date's plan, and it must not go missing just because the resolved schedule
+        // happens to match what's already active on the inverter (the common case: a
+        // "Run now" click, or an every-3h cron tick, that legitimately has nothing new
+        // to say). Saved before the push-window derivation below, not after, so a
+        // skipped/failed push doesn't skip this.
+        foreach ($scheduleByDate as $forDate => $daySchedule) {
+            saveSchedule($forDate, $daySchedule['groups'], $daySchedule['explanations'], $now);
+            upsertScheduleSummary($forDate, $daySchedule['summary']);
+        }
         pruneOldSchedules($today->format('Y-m-d'));
-        setSetting('schedule_summary', $schedule['summary']);
 
+        // The actual FoxESS push covers from the start of the current hour through 24h
+        // ahead or the end of known pricing, whichever is sooner (GitHub issue #4, point
+        // 3) — never a full 24h recurring cycle pretending to know hours it doesn't have
+        // real prices for. See ScheduleBuilder::buildPushWindow().
+        $knownDataEnd = getLatestPriceHorizon();
+        $pushWindow = $scheduleBuilder->buildPushWindow($scheduleByDate, $now, $timezone, $knownDataEnd);
+        $pushGroups = $pushWindow['groups'];
+        $windowDescription = $pushWindow['windowStart']->format('D j M H:i') . ' to ' . $pushWindow['windowEnd']->format('D j M H:i');
+
+        // Compared against the last *actually pushed* (i.e. windowed) groups, not any
+        // single date's raw plan — the window boundary moves every run even when nothing
+        // about the underlying prices changed, so diffing raw plans would misfire the
+        // skip. A device that didn't receive that content stays in "pending_device_sns"
+        // until it does — without this, a run that recomputes the same content as last
+        // time would read as a no-op and a device that failed earlier (e.g. a
+        // battery-less inverter offline overnight — see CLAUDE.md) would never get
+        // retried once it's reachable again.
         $lastPushed = json_decode(getSetting('last_pushed_groups_json', '') ?: 'null', true);
         $pendingSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('pending_device_sns', '')))));
         $contentChanged = $pushGroups != $lastPushed;
@@ -289,9 +324,9 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
         // inverters regardless of whether the schedule changed. Uncomment to restore the
         // "skip an unchanged push" optimisation.
         // if (!$contentChanged && !$pendingSns) {
-        //     $message = 'Schedule for ' . $targetDate->format('Y-m-d') . ' unchanged from last run, skipped FoxESS push.';
+        //     $message = 'Push window ' . $windowDescription . ' unchanged from last run, skipped FoxESS push.';
         //     $logger->info($message);
-        //     return ['ok' => true, 'dryRun' => false, 'message' => $message, 'schedule' => $schedule];
+        //     return ['ok' => true, 'dryRun' => false, 'message' => $message, 'schedule' => $scheduleByDate];
         // }
 
         $apiKey = getSetting('foxess_api_key', '');
@@ -317,8 +352,8 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
         $stillPending = $pushResult['failedSns'];
         setSetting('pending_device_sns', implode("\n", $stillPending));
 
-        // saveSchedule()/schedule_summary already recorded above, before the unchanged-skip
-        // check, so only the push-tracking setting is left to update here.
+        // saveSchedule()/schedule_summaries already recorded above, before the push-window
+        // derivation, so only the push-tracking setting is left to update here.
         setSetting('last_pushed_groups_json', json_encode($pushGroups));
 
         if ($stillPending) {
@@ -331,8 +366,8 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
                 fn($sn) => !isOfflineFailure($pushResult['failureMessages'][$sn]),
             ));
             $message = sprintf(
-                'Pushed schedule for %s to %d/%d inverter(s); still pending: %s.',
-                $targetDate->format('Y-m-d'),
+                'Pushed schedule (%s) to %d/%d inverter(s); still pending: %s.',
+                $windowDescription,
                 count($devicesToPush) - count($stillPending),
                 count($deviceSns),
                 implode(', ', $stillPending),
@@ -340,22 +375,22 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
             if ($hardFailureSns) {
                 $logger->error($message . ' Failure detail: ' . implode('; ', $pushResult['failures']));
                 alertOnFailure($config, 'FoxESS scheduler: push incomplete', $message);
-                return ['ok' => false, 'dryRun' => false, 'message' => $message, 'schedule' => $schedule];
+                return ['ok' => false, 'dryRun' => false, 'message' => $message, 'schedule' => $scheduleByDate];
             }
             $logger->info($message . ' (offline — expected to retry next run)');
-            return ['ok' => true, 'dryRun' => false, 'message' => $message, 'schedule' => $schedule];
+            return ['ok' => true, 'dryRun' => false, 'message' => $message, 'schedule' => $scheduleByDate];
         }
 
         $message = sprintf(
-            'Pushed schedule for %s to %d inverter(s): %d group(s), %d FoxESS API call(s) this run. %s',
-            $targetDate->format('Y-m-d'),
+            'Pushed schedule (%s) to %d inverter(s): %d group(s), %d FoxESS API call(s) this run. %s',
+            $windowDescription,
             count($deviceSns),
             count($pushGroups),
             $pushResult['callCount'],
-            $schedule['summary'],
+            implode(' ', array_column($scheduleByDate, 'summary')),
         );
         $logger->info($message);
-        return ['ok' => true, 'dryRun' => false, 'message' => $message, 'schedule' => $schedule];
+        return ['ok' => true, 'dryRun' => false, 'message' => $message, 'schedule' => $scheduleByDate];
     } catch (OctopusFetchException|ScheduleBuildException|FoxessPushException $e) {
         $label = match (true) {
             $e instanceof OctopusFetchException => 'Octopus fetch failed',
@@ -375,12 +410,14 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
 }
 
 /**
- * Called by override.php right after saving an override. Rebuilds the schedule from
- * the *last-fetched* rate slots (no new Octopus call — this isn't a real run, just a
- * re-overlay) and, if that rebuild's date has overrides, pushes the overlaid result
- * to FoxESS immediately. Always rebuilds from scratch rather than overlaying onto
- * getLatestSchedule() — that's already-overridden output from the last push, so
- * re-overlaying onto it would permanently lose whatever it trimmed the first time.
+ * Called by override.php right after saving an override for one or more dates. Rebuilds
+ * every currently-known date's schedule from *already-stored* prices (no new Octopus
+ * call — this isn't a real run, just a re-overlay), applies whatever overrides exist per
+ * date, and — if any date actually has one — pushes the resulting push window to FoxESS
+ * immediately, same window derivation runScheduler() uses (ScheduleBuilder::buildPushWindow()).
+ * Always rebuilds from scratch rather than overlaying onto getScheduleForDate()'s stored
+ * output — that's already-overridden from the last push, so re-overlaying onto it would
+ * permanently lose whatever it trimmed the first time.
  *
  * @return array{ok: bool, message: string}
  */
@@ -389,34 +426,53 @@ function reapplyOverrides(): array
     $logger = new Logger(__DIR__ . '/../logs/scheduler.log');
     $config = require __DIR__ . '/../config.php';
     $timezone = new DateTimeZone($config['strategy']['timezone'] ?? 'Europe/London');
+    $today = new DateTimeImmutable('today', $timezone);
+    $now = new DateTimeImmutable('now', $timezone);
 
-    $rows = getLatestRateSlots();
-    if (!$rows) {
-        return ['ok' => true, 'message' => 'No rates fetched yet, so there is nothing to overlay onto yet — this will apply automatically once a run has fetched rates for that date.'];
+    $knownSlots = getPriceSlotsFrom($today);
+    if (!$knownSlots) {
+        return ['ok' => true, 'message' => 'No rates fetched yet, so there is nothing to overlay onto yet — this will apply automatically once a run has fetched rates.'];
     }
 
-    $targetDate = $rows[0]['from']->setTimezone($timezone)->format('Y-m-d');
-    $overrides = getOverridesForDate($targetDate);
-    if (!$overrides) {
-        return ['ok' => true, 'message' => "Saved. The currently active schedule is for $targetDate, which has no override — nothing to push now."];
+    // Same per-calendar-day split as runScheduler() — see Schedulers.php's buildMultiDaySchedule().
+    $slotsByDate = [];
+    foreach ($knownSlots as $slot) {
+        $forDate = $slot['from']->setTimezone($timezone)->format('Y-m-d');
+        $slotsByDate[$forDate]['importSlots'][] = ['from' => $slot['from'], 'to' => $slot['to'], 'rate' => $slot['import_rate']];
+        $slotsByDate[$forDate]['exportSlots'][] = $slot['export_rate'] !== null
+            ? ['from' => $slot['from'], 'to' => $slot['to'], 'rate' => $slot['export_rate']]
+            : null;
+    }
+    foreach ($slotsByDate as $forDate => &$dayInputs) {
+        if (in_array(null, $dayInputs['exportSlots'], true)) {
+            $dayInputs['exportSlots'] = null;
+        }
+        $dayInputs['costBasis'] = (new CostBasisProvider($config['cost_basis']))->getCostBasis(count($dayInputs['importSlots']));
+    }
+    unset($dayInputs);
+
+    $hasAnyOverride = false;
+    foreach (array_keys($slotsByDate) as $forDate) {
+        if (getOverridesForDate($forDate)) {
+            $hasAnyOverride = true;
+            break;
+        }
+    }
+    if (!$hasAnyOverride) {
+        return ['ok' => true, 'message' => 'Saved. None of the currently known dates (' . implode(', ', array_keys($slotsByDate)) . ') have an override — nothing to push now.'];
     }
 
-    $importSlots = array_map(fn($r) => ['from' => $r['from'], 'to' => $r['to'], 'rate' => $r['import_rate']], $rows);
-    $exportSlots = $rows[0]['export_rate'] !== null
-        ? array_map(fn($r) => ['from' => $r['from'], 'to' => $r['to'], 'rate' => $r['export_rate']], $rows)
-        : null;
-
-    $costBasis = (new CostBasisProvider($config['cost_basis']))->getCostBasis(count($importSlots));
     $batteryConfig = getBatteryConfig($config['battery'] ?? []);
-    // $scheduleBuilder is always constructed for applyOverrides() below (a pure
-    // group/interval transform, same reasoning as runScheduler()) but the base schedule
-    // it overlays onto must come from whichever scheduler is actually selected (see
-    // Schedulers.php) — this used to always call ScheduleBuilder::build() regardless of
-    // that, so saving an override could silently produce a classic-heuristic schedule
+    // $scheduleBuilder is always constructed for applyOverrides()/buildPushWindow() below
+    // (pure group/interval transforms, same reasoning as runScheduler()) but the base
+    // schedule they overlay onto must come from whichever scheduler is actually selected
+    // (see Schedulers.php) — this used to always call ScheduleBuilder::build() regardless
+    // of that, so saving an override could silently produce a classic-heuristic schedule
     // even when a different scheduler was selected for real runs.
     $scheduleBuilder = new ScheduleBuilder($config['strategy'], $batteryConfig);
     $schedulerId = resolveSchedulerId();
-    $scheduleInputs = ['importSlots' => $importSlots, 'exportSlots' => $exportSlots, 'costBasis' => $costBasis];
+
+    $forecastExtras = [];
     if ($schedulerId === 'forecast_weighted_price_model') {
         $socApiKey = getSetting('foxess_api_key', '');
         $socDeviceSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('foxess_device_sns', '')))));
@@ -431,18 +487,30 @@ function reapplyOverrides(): array
                 $logger->warn("Battery SoC read from $sn failed, excluding from average: " . $e->getMessage());
             }
         }
-        $scheduleInputs['currentSocPercent'] = $socReadings ? array_sum($socReadings) / count($socReadings) : null;
-        $scheduleInputs['usageConfig'] = ['avg_daily_kwh' => UsageEstimator::estimateDailyKwh(
-            (float) getSetting('usage_summer_kwh_month', '300'),
-            (float) getSetting('usage_winter_kwh_month', '700'),
-            $rows[0]['from']->setTimezone($timezone),
-            $timezone,
-            getLatestSolarForecast(),
-        )];
-        $scheduleInputs['solarSlots'] = getLatestSolarForecast() ?: null;
+        $forecastExtras = [
+            'currentSocPercent' => $socReadings ? array_sum($socReadings) / count($socReadings) : null,
+            'usageConfig' => ['avg_daily_kwh' => UsageEstimator::estimateDailyKwh(
+                (float) getSetting('usage_summer_kwh_month', '300'),
+                (float) getSetting('usage_winter_kwh_month', '700'),
+                $today,
+                $timezone,
+                getLatestSolarForecast(),
+            )],
+            'solarSlots' => getLatestSolarForecast() ?: null,
+        ];
     }
-    $base = buildScheduleWithScheduler($schedulerId, $config['strategy'], $batteryConfig, $scheduleInputs);
-    $overlaid = $scheduleBuilder->applyOverrides($base['groups'], $base['explanations'], $overrides, $timezone);
+
+    $scheduleByDate = buildMultiDaySchedule($schedulerId, $config['strategy'], $batteryConfig, $slotsByDate, $forecastExtras);
+
+    foreach ($scheduleByDate as $forDate => &$daySchedule) {
+        $overridesForDate = getOverridesForDate($forDate);
+        if ($overridesForDate) {
+            $overlaid = $scheduleBuilder->applyOverrides($daySchedule['groups'], $daySchedule['explanations'], $overridesForDate, $timezone);
+            $daySchedule['groups'] = $overlaid['groups'];
+            $daySchedule['explanations'] = $overlaid['explanations'];
+        }
+    }
+    unset($daySchedule);
 
     $apiKey = getSetting('foxess_api_key', '');
     $deviceSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('foxess_device_sns', '')))));
@@ -450,23 +518,29 @@ function reapplyOverrides(): array
         return ['ok' => false, 'message' => 'Saved, but not pushed — FoxESS is not configured yet (settings.php).'];
     }
 
+    foreach ($scheduleByDate as $forDate => $daySchedule) {
+        saveSchedule($forDate, $daySchedule['groups'], $daySchedule['explanations'], $now);
+        upsertScheduleSummary($forDate, $daySchedule['summary']);
+    }
+
+    $knownDataEnd = getLatestPriceHorizon();
+    $pushWindow = $scheduleBuilder->buildPushWindow($scheduleByDate, $now, $timezone, $knownDataEnd);
+
     $clients = [];
     foreach ($deviceSns as $sn) {
         $clients[$sn] = new FoxessClient($apiKey, $sn, $config['foxess']['base_url']);
     }
-    $pushResult = pushToDevices($clients, $overlaid['groups'], $logger);
+    $pushResult = pushToDevices($clients, $pushWindow['groups'], $logger);
     if ($pushResult['failures']) {
         $message = sprintf('Saved, but the push failed for %d/%d inverter(s): %s', count($pushResult['failures']), count($deviceSns), implode('; ', $pushResult['failures']));
         $logger->error($message);
         return ['ok' => false, 'message' => $message];
     }
 
-    $now = new DateTimeImmutable('now', $timezone);
-    saveSchedule($targetDate, $overlaid['groups'], $overlaid['explanations'], $now);
-    setSetting('last_pushed_groups_json', json_encode($overlaid['groups']));
-    setSetting('schedule_summary', $base['summary']);
-    $logger->info("Override applied and pushed for $targetDate.");
-    return ['ok' => true, 'message' => "Saved and pushed to today's active schedule ($targetDate)."];
+    setSetting('last_pushed_groups_json', json_encode($pushWindow['groups']));
+    $windowDescription = $pushWindow['windowStart']->format('D j M H:i') . ' to ' . $pushWindow['windowEnd']->format('D j M H:i');
+    $logger->info("Override applied and pushed ($windowDescription).");
+    return ['ok' => true, 'message' => "Saved and pushed the active schedule ($windowDescription)."];
 }
 
 /**

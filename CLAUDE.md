@@ -61,7 +61,7 @@ logs/
   scheduler.log
   .htaccess              # deny all web access
 data/
-  scheduler.sqlite       # settings (incl. FoxESS creds + password hash), rate_slots, schedule_groups
+  scheduler.sqlite       # settings (incl. FoxESS creds + password hash), price_slots, schedule_groups
   .htaccess               # deny all web access
 ```
 
@@ -79,44 +79,52 @@ wherever this actually gets deployed.
 ## Data storage: SQLite, no ORM
 
 `src/Store.php` is the entire data layer — plain `PDO` + hand-written SQL,
-three tables, `CREATE TABLE IF NOT EXISTS` run on every connection instead of
-a migration system (the schema is small and stable enough that idempotent
-DDL is simpler than tracking migrations).
+`CREATE TABLE IF NOT EXISTS` run on every connection instead of a migration
+system (the schema is small and stable enough that idempotent DDL is
+simpler than tracking migrations).
 
 - **`settings`** — plain key/value (`key TEXT PRIMARY KEY, value TEXT`).
   Holds `foxess_api_key`, `foxess_device_sns` (newline-separated — see
   "Multi-inverter support" below), `system_password_hash`,
   `{import,export}_price_mode`, `{import,export}_price_fixed_pence`,
-  `schedule_summary` (the latest day-level explanation sentence — see
-  "Cost-optimising ScheduleBuilder" below). A key/value table was chosen
-  over typed columns because the set of "small bits of config/state the app
-  needs a single current value for" is exactly the kind of thing that grows
-  over time (see roadmap) — a new entry is a new row, not a migration.
-- **`rate_slots`** — the latest fetch, both `import_rate_pence` (purchase)
-  and `export_rate_pence` (sale, nullable — see `PriceProvider` below).
-  `saveRateSlots()` deletes and re-inserts on every call, mirroring the old
-  `last_rates.json` latest-fetch-only semantics. It is *not* an accumulating
-  history table, even though nothing would break if it were — don't
-  repurpose it as one without deciding on retention first (see roadmap's
-  history/reporting item). This table's disposability is also why its one
-  schema change so far (splitting `rate_pence` into two columns) was handled
-  as a guarded `DROP TABLE` + recreate in `Store::db()` rather than a real
-  migration — there's never anything in it worth preserving across a schema
-  change.
-- **`schedule_groups`** — the latest schedule actually pushed to FoxESS,
-  plus a per-group `explanation` (nullable TEXT, added the same
-  disposable-table way as `rate_slots`' column change above). Same
-  replace-not-append pattern. This is also what `run.php` diffs the
-  freshly-computed schedule against to decide whether to skip a no-op push
-  — `getLatestSchedule()`'s `groups` key deliberately excludes `explanation`
-  so that diff stays about what's actually sent to FoxESS, not wording.
+  `scheduler_id` (see "Pluggable scheduler architecture"). A key/value table
+  was chosen over typed columns because the set of "small bits of
+  config/state the app needs a single current value for" is exactly the
+  kind of thing that grows over time (see roadmap) — a new entry is a new
+  row, not a migration.
+- **`price_slots`** — every known import/export price slot, permanently
+  (`import_rate_pence`, `export_rate_pence` nullable — see `PriceProvider`
+  below), keyed by `slot_from`. Replaced the old disposable `rate_slots`
+  table (GitHub issue #4, "Date-time-aware scheduling") — see that section
+  further down for the full story of why and how. `Store::upsertPriceSlots()`
+  upserts by `slot_from` rather than replacing wholesale; import always
+  overwrites, export only overwrites when the incoming value is non-null, so
+  a run that couldn't resolve export prices can never erase an already-known
+  one for the same slot.
+- **`schedule_groups`** — the latest schedule actually pushed to FoxESS, one
+  row set *per calendar date* (`for_date`), plus a per-group `explanation`
+  (nullable TEXT, added the same disposable-table way `rate_slots` — this
+  table's own previous incarnation — got its export column: a guarded
+  `DROP TABLE` + recreate in `Store::db()`, not a real migration, since
+  there's never anything in it worth preserving across a schema change).
+  Each date's rows are replaced wholesale on every recompute for that date,
+  not appended — the table is per-date-disposable, not a full history (see
+  "Date-time-aware scheduling" for why that's still the right call even
+  though prices themselves are now permanent). `schedule_groups.groups`
+  (via `getScheduleForDate()`) deliberately excludes `explanation` from what
+  the no-op-push diff compares, so wording drift alone never triggers a
+  re-push.
+- **`schedule_summaries`** — one day-level summary sentence per known date
+  (`for_date TEXT PRIMARY KEY, summary TEXT`), upserted per date. Replaced
+  the old single global `schedule_summary` setting, which only ever fit one
+  "target date" per run — see "Date-time-aware scheduling".
 
 `Store::db()` takes an optional, "sticky" path override specifically so
 `tests/self_check.php` can point the whole module at a throwaway SQLite file
 — call `db($somePath)` once and every other Store function's internal
 no-arg `db()` call reuses that connection. **Never run the test suite
-against the real `data/scheduler.sqlite`** — `saveRateSlots`/`saveSchedule`
-truncate on every call, so doing so would wipe the live dashboard data.
+against the real `data/scheduler.sqlite`** — `saveSchedule()` truncates
+each date's rows on every call, so doing so would wipe live dashboard data.
 
 ## Request flow (`src/Runner.php`'s `runScheduler()`)
 
@@ -128,42 +136,57 @@ and lets the caller decide what to do with that (an exit code for cron, an
 on-screen message for the UI).
 
 1. Load `config.php` (non-secret tunables only — see Config & secrets below).
-2. `PriceProvider::resolveImport()` — tries **tomorrow** first (local
-   midnight-to-midnight); if that throws `OctopusFetchException` (transport
-   failure, or zero slots because Agile hasn't published at all yet), logs
-   an INFO line and retries for **today** instead. Whichever date wins
-   becomes `$targetDate` for the rest of the run. See "Either side of
-   midnight" below for why this exists, and "Partial-day data is normal, not
-   a failure" for why the trigger is *zero* slots, not *fewer than 48*.
-3. `saveRateSlots()` — persisted to SQLite immediately, even in `--dry-run`
-   (it's just a record of what was fetched, and it's what powers the
-   dashboard). Export prices are aligned to import's slots by timestamp, not
-   array position — see "Partial-day data is normal" below for why that
-   matters.
-4. `CostBasisProvider::getCostBasis()` — 48 values (currently flat, `fixed`
-   mode) to compare Agile rates against.
-5. `resolveSchedulerId()` + `buildScheduleWithScheduler()` (`src/Schedulers.php`,
-   see "Pluggable scheduler architecture" below) — resolves which scheduler
-   is selected (`schedulers.php`, or a CLI override) and calls its `build()`.
-   Produces `{groups: [...], explanations: [...], summary: '...'}`. See
-   "Cost-optimising ScheduleBuilder" below for `ScheduleBuilder`'s own
-   selection rules specifically (`IntelligentScheduleBuilder`'s are
-   documented in its own class doc comment).
-6. `--dry-run` stops here and returns the computed schedule — no FoxESS
-   credentials are even read.
-7. Diff the computed groups against `getLatestSchedule()`; skip the FoxESS
-   call if unchanged.
-8. Read `foxess_api_key`/`foxess_device_sns` from `Store` (via `getSetting()`)
+2. `PriceProvider::resolveImport()`/`resolveExport()` — attempts **both**
+   today and tomorrow (local midnight-to-midnight) every run, not "tomorrow,
+   falling back to today" (see "Date-time-aware scheduling" below for why
+   that changed). A day whose `OctopusFetchException` fires (transport
+   failure, or zero slots because Agile hasn't published yet — the usual
+   case for tomorrow before ~16:00) is just skipped for that run; only
+   *neither* day producing anything at all is a hard failure. See
+   "Partial-day data is normal, not a failure" for why the trigger is *zero*
+   slots for a day, not *fewer than 48*.
+3. `Store::upsertPriceSlots()` — each day's slots persisted immediately as
+   they're fetched, even in `--dry-run` (it's just a record of what was
+   fetched, and it's what powers the dashboard/Schedulers preview). Export
+   prices are aligned to import's slots by timestamp, not array position —
+   see "Partial-day data is normal" below for why that matters.
+4. `Store::getPriceSlotsFrom($today)` — every currently-known slot from
+   local midnight today onward (may include slots from earlier runs, not
+   just this one), split into calendar-day chunks.
+5. `CostBasisProvider::getCostBasis()` — one call per day chunk (currently
+   flat, `fixed` mode) to compare that day's Agile rates against.
+6. `resolveSchedulerId()` + `buildMultiDaySchedule()` (`src/Schedulers.php`,
+   see "Pluggable scheduler architecture" and "Date-time-aware scheduling"
+   below) — resolves which scheduler is selected (`schedulers.php`, or a CLI
+   override) and calls its `build()` once per known day, carrying
+   `IntelligentScheduleBuilder`'s projected `finalSocPercent` from each day
+   into the next. Produces one `{groups: [...], explanations: [...],
+   summary: '...'}` per date. See "Cost-optimising ScheduleBuilder" below
+   for `ScheduleBuilder`'s own per-day selection rules specifically
+   (`IntelligentScheduleBuilder`'s are documented in its own class doc
+   comment).
+7. `--dry-run` stops here and returns the computed per-date schedules — no
+   FoxESS credentials are even read.
+8. `saveSchedule()`/`upsertScheduleSummary()` per date, then
+   `ScheduleBuilder::buildPushWindow()` derives exactly what actually gets
+   pushed: from the start of the current hour through 24h ahead or the end
+   of known pricing, whichever is sooner (see "Date-time-aware scheduling").
+   Diffed against the last *pushed* window (not any single date's raw plan)
+   to decide whether to skip a no-op push (currently disabled, see below).
+9. Read `foxess_api_key`/`foxess_device_sns` from `Store` (via `getSetting()`)
    — throws `FoxessPushException` with a pointer to `settings.php` if the key
    is empty or the device list is empty.
-9. `pushToDevices()` — one `FoxessClient` per configured device serial
-   number, each signing and POSTing to `/op/v1/device/scheduler/enable`
-   independently. See "Multi-inverter support" below for why this loop lives
-   in `Runner.php` rather than inside `FoxessClient` itself.
-10. On success, `saveSchedule()` persists the new schedule and logs a
-    summary. On any failure, log at ERROR and best-effort email
-    `notify.alert_email` — both happen inside `runScheduler()` itself, so
-    they're identical regardless of which entry point called it.
+10. `pushToDevices()` — one `FoxessClient` per configured device serial
+    number, each signing and POSTing to `/op/v1/device/scheduler/enable`
+    independently. See "Multi-inverter support" below for why this loop
+    lives in `Runner.php` rather than inside `FoxessClient` itself.
+11. On success, logs a summary of what was pushed and to how many devices
+    (`saveSchedule()`/`upsertScheduleSummary()` already ran in step 8, before
+    the push, so the dashboard/Schedulers page has a record even if the push
+    itself fails or is only partial). On any failure, log at ERROR and
+    best-effort email `notify.alert_email` — both happen inside
+    `runScheduler()` itself, so they're identical regardless of which entry
+    point called it.
 
 **Three entry points, three trust gates, same pipeline:**
 
@@ -231,21 +254,28 @@ tinted purple along with everything else.
   single-user hobby tool, not proportionate to add without being asked. If
   this ever gets exposed somewhere less trusted than "my own inverter's
   control panel," add one.
-- **`index.php`** — reads the latest `rate_slots` + `schedule_groups`,
-  resolves each half-hour slot's mode by checking which schedule group (if
-  any) its local start time falls in (`slotWorkMode()` in `index.php`), and
-  renders one unified table, split into two side-by-side columns
-  (`renderSlotTable()` called twice — 00:00–11:30 and 12:00–23:30, split by
-  local hour, not array index, since a partial day's slots aren't always
-  exactly 48) via the `.slot-columns` flex layout in `Layout.php`.
-  Deliberately merges prices and schedule into a single view rather than
-  further-separate tables — that merge *is* the "quick glance" the UI exists
-  for. Each row also gets a `row-{mode}` class (subtle background tint —
-  green/red/grey for charge/discharge/self-use) alongside the existing
-  per-cell `.badge`, and the Import/Export cells get a `.currency` class
-  (monospace, right-aligned). A "Today's energy plan" section — `<h3>`, not
-  `<h2>`; day summary from `settings.schedule_summary` + each group's stored
-  explanation — renders *above* the slot tables, and the "Run now" button
+- **`index.php`** — reads `Store::getPriceSlotsFrom($today)` (every known
+  price slot from local midnight today onward — may span into tomorrow, see
+  "Date-time-aware scheduling") plus `getScheduleForDate()` for every date
+  present, merged via `scheduleToAbsoluteIntervals()` into one list of real
+  `DateTimeImmutable` intervals. `slotWorkMode(DateTimeImmutable $instant,
+  array $absoluteIntervals)` resolves a slot's mode by comparing the actual
+  instant against that merged list — deliberately *not* a minute-of-day
+  comparison (the pre-issue-#4 version), since "14:00" means something
+  different on two different calendar days once more than one can be shown
+  at once. Renders one unified table **per known date**, each split into two
+  side-by-side columns (`renderSlotTable()` called twice per date — before
+  and after local noon, split by local hour, not array index, since a
+  partial day's slots aren't always exactly 48) via the `.slot-columns` flex
+  layout in `Layout.php`. Deliberately merges prices and schedule into a
+  single view rather than further-separate tables — that merge *is* the
+  "quick glance" the UI exists for. Each row also gets a `row-{mode}` class
+  (subtle background tint — green/red/grey for charge/discharge/self-use)
+  alongside the existing per-cell `.badge`, and the Import/Export cells get
+  a `.currency` class (monospace, right-aligned). An "Energy plan" section —
+  `<h3>`, not `<h2>`; one `<h4>` sub-heading per known date, each with that
+  date's own summary (`getScheduleSummary()`) and stored per-group
+  explanations — renders *above* the slot tables, and the "Run now" button
   renders *below* it (both user-requested orderings; the button used to sit
   above everything). After a run redirects back, a result banner reads
   `?ran=1&ok=…&msg=…` — no session flash-message plumbing, just query-string
@@ -299,12 +329,13 @@ tinted purple along with everything else.
   `resolveSchedulerId()` currently resolves to, a "Use this scheduler"
   button otherwise (POST-redirect-GET, same pattern as settings.php's
   cron-token regenerate — just writes the `scheduler_id` setting, no push),
-  and every scheduler's *current recommended schedule*, computed from the
-  latest already-fetched rate slots (`getLatestRateSlots()` — no fresh
-  Octopus call; this page previews, it doesn't re-run the pipeline) but
-  never pushed. Each scheduler's build is wrapped in its own try/catch so
-  one throwing (e.g. no rates fetched yet) shows an inline error in that
-  box rather than breaking the whole page.
+  and every scheduler's *current recommended schedule for every known
+  date* (`getPriceSlotsFrom($today)` — no fresh Octopus call; this page
+  previews, it doesn't re-run the pipeline), computed via the same
+  `buildMultiDaySchedule()` `Runner.php` uses, but never pushed. Each
+  scheduler's build is wrapped in its own try/catch so one throwing (e.g.
+  no rates fetched yet) shows an inline error in that box rather than
+  breaking the whole page.
 
 Auth is a native PHP session (`src/Auth.php`, `session_start()` +
 `$_SESSION['authed']`) — no token store, no "remember me," nothing custom.
@@ -318,15 +349,17 @@ this app for that.
 
 ## Decisions made while building (things the spec left open)
 
-**Either side of midnight: tomorrow-first, today-as-fallback.** User-requested
-change from the original "always target tomorrow" behaviour. `runScheduler()`
-tries tomorrow, and on any `OctopusFetchException` (almost always "not
-published yet" — Agile publishes ~16:00) retries the whole fetch for today
-instead. This is what makes "Run now" actually useful for daytime testing
-(previously it just failed with "not published yet" any time before ~16:00,
-which was most of the day), and means a missed cron run gets caught up
-automatically next time cron *does* fire, rather than silently doing nothing
-until the following evening.
+**Either side of midnight: tomorrow-first, today-as-fallback, later superseded
+by fetching both.** User-requested change from the original "always target
+tomorrow" behaviour: `runScheduler()` tried tomorrow, and on any
+`OctopusFetchException` (almost always "not published yet" — Agile publishes
+~16:00) retried the whole fetch for today instead. This is what first made
+"Run now" useful for daytime testing (previously it just failed with "not
+published yet" any time before ~16:00, which was most of the day). GitHub
+issue #4 ("Date-time-aware scheduling") later replaced the either/or with
+attempting *both* every run (see "Date-time-aware scheduling" below) — the
+daytime-testing and missed-cron-catch-up benefits this decision was for
+still hold, just without having to pick exactly one date per run anymore.
 
 **Partial-day data is normal, not a failure.** Originally assumed "today can't
 fail the completeness check — it was 'tomorrow' as of yesterday's publish, so
@@ -359,14 +392,14 @@ two, so a naive string comparison silently fails every lookup. If any import
 slot has no matching export entry, export is dropped for that run (logged as
 a WARN) rather than risking a misaligned zip.
 
-One cosmetic side effect worth knowing about: `schedule_groups.for_date` only
-updates when a push actually happens — if a same-day fallback push and a
-later proper tomorrow-targeted push produce byte-identical groups (a real
-possibility, since FoxESS's own schedule payload has no date field, just
-recurring hour/minute windows), the second run's diff-against-`getLatestSchedule()`
-sees no change and skips, leaving `for_date` on the dashboard one day
-"behind" even though the inverter's actual applied schedule is correct
-either way. Not worth solving — it's a label, not a functional bug.
+A cosmetic side effect this used to have — `schedule_groups.for_date` only
+updating when a push actually happened, so a same-day-fallback push
+followed by a later proper tomorrow-targeted push could leave the
+dashboard's `for_date` label a day "behind" even though the inverter's
+applied schedule was correct either way — no longer applies: GitHub issue
+#4's rework has `saveSchedule()`/`upsertScheduleSummary()` run unconditionally
+for every known date on every run (see "Date-time-aware scheduling"), not
+gated on whether a push happened for one specific target date.
 
 **Export price failures don't block a push; import price failures do.**
 `PriceProvider::resolveImport()`/`resolveExport()` share the same API-vs-fixed
@@ -506,6 +539,92 @@ cheap import and expensive export rarely swap places), and FoxESS's own
 firmware will just discharge whatever's actually available rather than
 erroring.
 
+**Date-time-aware scheduling (GitHub issue #4).** User-reported: prices and
+schedules were only ever handled one "target date" at a time (`Runner.php`
+tried tomorrow, fell back to today), which caused real problems around the
+turn of the day — a run could only ever see one day's prices, and the
+FoxESS push either represented a spliced today+tomorrow 24h cycle or, when
+tomorrow wasn't published yet, pushed today's decisions as if they'd recur
+into tomorrow morning too, hours they were never actually computed for.
+Three changes, confirmed with the user before building:
+
+1. *Store all prices permanently, with full date/time.* `rate_slots`
+   (disposable, replaced wholesale on every fetch) was replaced outright by
+   `price_slots` (permanent, upserted by `slot_from`) — see "Data storage"
+   above. Confirmed with the user: no separate table kept alongside the old
+   one, since there's no distinct "latest fetch" need left once permanent
+   storage exists (unlike `solar_forecast` vs `historic_generation`, which
+   answer genuinely different questions — forward-looking "current plan" vs
+   backward-looking "what happened" — price data doesn't have that
+   duality, it's just one growing timeline).
+2. *Schedule as far ahead as pricing is available.* `Runner.php` now
+   attempts **both** today's and tomorrow's Octopus fetch every run
+   (`upsertPriceSlots()`-ing whichever succeed), instead of tomorrow with a
+   today fallback. `Store::getPriceSlotsFrom($today)` returns everything
+   currently known, split into calendar-day chunks, and — this is the
+   single biggest risk-reduction decision in the whole feature, confirmed
+   with the user — **`ScheduleBuilder`/`IntelligentScheduleBuilder` run
+   completely unchanged, once per calendar day**, via
+   `Schedulers.php`'s `buildMultiDaySchedule()`, rather than either
+   scheduler's internals being rewritten to reason across a multi-day
+   array. Config caps like `cheap_slots_to_charge` stay exactly what they
+   were tuned as: a per-day cap, not a per-window one. Accepted limitation:
+   each day's arbitrage/peak logic only sees that day's own prices, not
+   across the day boundary — reasonable for a first version, not a
+   blocking gap. `IntelligentScheduleBuilder::build()` gained an additive
+   `finalSocPercent` return key specifically so `buildMultiDaySchedule()`
+   can carry each day's projected end-of-day SoC into the next day's
+   `$currentSocPercent`, instead of every day independently assuming the
+   real live reading (only actually true for day one). `index.php`'s chart
+   and slot tables, and `schedulers.php`'s previews, all show every known
+   day this way too — see their own entries above.
+3. *The actual FoxESS push covers the current hour through 24h ahead, or
+   the end of known pricing, whichever is sooner.* FoxESS's schedule format
+   has no date field, only recurring hour/minute-of-day, so this is still
+   fundamentally a ≤24h window — `ScheduleBuilder::buildPushWindow()`
+   replaces the old `spliceForPush()` (which only ever handled the
+   today+tomorrow special case) with a version that combines however many
+   calendar days currently have a computed schedule into one absolute
+   timeline, then slices `[start of current hour, min(+24h, latest known
+   `slot_to`))`. Already-elapsed hours of today are naturally excluded
+   (the window starts at the current hour, not midnight), and a day with
+   no published pricing yet is naturally never pushed past its own known
+   horizon — neither needs special-casing "today vs tomorrow" anymore,
+   since everything works in real instants throughout. One correctness
+   subtlety worth knowing if touching this again: converting the sliced
+   window back to FoxESS's hour/minute-of-day fields can't reuse the old
+   `intervalsToGroups()` (which assumes "minutes since a conceptual
+   midnight", true only when the window itself starts at midnight) —
+   `buildPushWindow()` uses a new `absoluteIntervalsToGroups()` that reads
+   each interval's real local hour/minute directly off its
+   `DateTimeImmutable`, which is what actually makes a non-midnight-aligned
+   window (the normal case — most runs happen mid-day) come out correct.
+   Recomputing every known day fresh each run, rather than reading a
+   previously-*stored* "today" plan back out to splice as the old version
+   did, turned out to be safe and simpler: both schedulers are
+   deterministic given the same inputs, and `IntelligentScheduleBuilder`
+   *should* re-adapt to a changed real battery SoC between runs — that's a
+   feature, not drift to guard against.
+
+**A real bug found via live verification, not by inspection: SQLite TEXT
+comparison of ISO 8601 datetime strings isn't chronologically correct
+unless every value shares the same UTC offset.** `price_slots.slot_from` is
+always stored in UTC (`OctopusClient` only ever returns UTC
+`DateTimeImmutable`s), but `getPriceSlotsFrom($from)` was originally
+comparing against `$from->format(DATE_ATOM)` in whatever timezone the
+caller passed — during BST (`+01:00`), local midnight's UTC-offset string
+representation ("...T23:00:00+00:00", the previous calendar date) sorted as
+*earlier* than the local-midnight cutoff string ("...T00:00:00+01:00")
+even though they're the same instant, silently dropping the first hour of
+"today" from every query. Confirmed live against real data before
+diagnosing, then fixed by normalising `$from` to UTC before comparison —
+see `getPriceSlotsFrom()`'s own doc comment, and the regression test in
+`tests/self_check.php` (a fixed `+01:00` `DateTimeZone`, not a real DST
+transition, so it doesn't depend on which calendar date is actually in
+DST). Worth remembering for *any* future SQLite query comparing a
+`DATE_ATOM`-formatted parameter against stored TEXT timestamps in this
+codebase — normalise both sides to the same offset first, always.
+
 **Dashboard battery display: `SoC`/`SoC_1` field names are a best-effort
 guess, not confirmed against FoxESS's own docs** — same caveat as `fdSoc`/
 `fdPwr` above. Confirmed via community reference implementations
@@ -536,13 +655,14 @@ wasn't actually the one applied — an early draft had exactly this bug for
 the flat-export case. One sentence per emitted group (`explanations`, same
 order as `groups`) plus one day-level `summary` about the import peak.
 Persisted in `schedule_groups.explanation` (one column, nullable, dropped
-alongside the rest of that row on every push — same disposable-table pattern
-as `rate_slots`) and `settings.schedule_summary` (a single value, reusing the
-existing key/value table rather than adding new schema for one string).
-`getLatestSchedule()['groups']` deliberately excludes explanation text — it's
-what the no-op-push diff compares, and wording drift shouldn't trigger a
-re-push when the actual schedule hasn't changed. `index.php` renders both
-under "Why these decisions?" below the price table.
+alongside the rest of that date's rows on every recompute for that date —
+same per-date-disposable pattern as the rest of `schedule_groups`) and, one
+per known date, `schedule_summaries` (see "Date-time-aware scheduling" for
+why that replaced the old single global `settings.schedule_summary` value).
+`getScheduleForDate()['groups']` deliberately excludes explanation text —
+it's what the no-op-push diff compares, and wording drift shouldn't trigger
+a re-push when the actual schedule hasn't changed. `index.php` renders both
+under "Energy plan", one `<h4>` sub-section per known date.
 
 **FoxESS scheduler endpoint: v1, not v0 or v3.** Cross-checked the live
 FoxESS OpenAPI docs, the `foxesscommunity.com` forums, and existing
@@ -745,10 +865,12 @@ not half-hourly (48) — that's the API's native resolution, not a choice this a
 — confirmed against `TonyM1958/FoxESS-Cloud` (the same community reference this file
 already leans on for the scheduler endpoint and SoC field names).
 
-**Storage is a genuinely accumulating table, unlike everything else in this app.**
-`historic_generation` (`src/Store.php`) is deliberately *not* replace-on-every-fetch like
-`rate_slots`/`schedule_groups`/`solar_forecast` — see "Data storage" above for why those
-three are disposable. This table exists specifically to answer "what happened over time",
+**Storage is a genuinely accumulating table** — `price_slots` and `api_log` (see
+"Date-time-aware scheduling" and "API call log" respectively) are the only other two, as
+of this writing; everything else stays disposable (`schedule_groups`/`solar_forecast`,
+still per-date/per-fetch replace — see "Data storage" above). `historic_generation`
+(`src/Store.php`) is deliberately *not* replace-on-every-fetch, same reasoning as those
+two. This table exists specifically to answer "what happened over time",
 so it's append/upsert-only, one row per local clock hour, kept indefinitely. Generation
 and forecast share the row (`generation_kwh`, `forecast_kwh`, both nullable) but are
 written independently by different callers on different schedules — `upsertHistoricGeneration()`/
@@ -955,9 +1077,12 @@ shared cache for no benefit.
   does — `getSetting()`/`setSetting()`, no schema change needed for a plain
   scalar value.
 
-## Out of scope (spec §12, still true post-UI — don't build these without a scope conversation)
+## Out of scope (spec §12 — mostly superseded by since-built features, kept for what's still true)
 
-Solar generation forecasting, multi-inverter support, historical cost
-analytics/reporting (note: `rate_slots`/`schedule_groups` are replace-only,
-*not* an accumulating history — see Data storage above), retry/backoff
-beyond one attempt.
+Spec §12 originally listed solar generation forecasting, multi-inverter support, and
+historical cost/price reporting as out of scope — all three are now implemented (solar
+forecast, multi-inverter `foxess_device_sns`, and `price_slots`' permanent per-slot price
+history respectively; `schedule_groups` itself stays per-date replace, not full history —
+see "Data storage" above). What's still genuinely out of scope: retry/backoff beyond one
+attempt, and any further analytics/reporting UI beyond what `history.php`/`price_slots`
+already provide — don't build more of that without a scope conversation first.

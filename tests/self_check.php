@@ -34,8 +34,13 @@ function check(bool $cond, string $msg): void
 /** Build N synthetic UTC slots for 2026-01-05 (Europe/London = UTC in January, keeps hour math simple). */
 function buildSlots(array $rates): array
 {
+    return buildSlotsFrom($rates, new DateTimeImmutable('2026-01-05 00:00:00', new DateTimeZone('UTC')));
+}
+
+/** Same as buildSlots(), but starting from an arbitrary instant — for tests spanning more than one day. */
+function buildSlotsFrom(array $rates, DateTimeImmutable $start): array
+{
     $slots = [];
-    $start = new DateTimeImmutable('2026-01-05 00:00:00', new DateTimeZone('UTC'));
     for ($i = 0; $i < count($rates); $i++) {
         $from = $start->modify(sprintf('+%d minutes', $i * 30));
         $slots[] = ['from' => $from, 'to' => $from->modify('+30 minutes'), 'rate' => $rates[$i]];
@@ -451,17 +456,67 @@ check(verifySystemPassword('foxhole') === false, 'old default stops working once
 check(verifySystemPassword('a-real-password') === true, 'new password verifies correctly');
 check(verifySystemPassword('a-real-password ') === false, 'password check is exact, not trimmed/fuzzy');
 
+// --- Store: price_slots (GitHub issue #4) — permanent, upserted by slot_from, non-clobbering export ---
 $fetchedAt = new DateTimeImmutable('2026-01-04 16:00:00', new DateTimeZone('UTC'));
-saveRateSlots(buildSlots(array_fill(0, 4, 20.0)), buildSlots(array_fill(0, 4, 12.0)), $fetchedAt);
-$storedSlots = getLatestRateSlots();
-check(count($storedSlots) === 4, 'saved rate slots round-trip at the right count');
+$day1Start = new DateTimeImmutable('2026-01-05 00:00:00', new DateTimeZone('UTC'));
+upsertPriceSlots(buildSlotsFrom(array_fill(0, 4, 20.0), $day1Start), buildSlotsFrom(array_fill(0, 4, 12.0), $day1Start), $fetchedAt);
+$storedSlots = getPriceSlotsFrom($day1Start);
+check(count($storedSlots) === 4, 'upserted price slots round-trip at the right count');
 check($storedSlots[0]['import_rate'] === 20.0, 'import rate value round-trips');
 check($storedSlots[0]['export_rate'] === 12.0, 'export rate value round-trips');
 check($storedSlots[0]['fetched_at']->format(DATE_ATOM) === $fetchedAt->format(DATE_ATOM), 'fetched_at round-trips');
-saveRateSlots(buildSlots(array_fill(0, 2, 15.0)), null, $fetchedAt);
-$noExportSlots = getLatestRateSlots();
-check(count($noExportSlots) === 2, 'saving new rate slots replaces the old batch, not appends');
-check($noExportSlots[0]['export_rate'] === null, 'a null export batch stores null export prices rather than stale ones');
+
+// Re-upserting the same day's slots with no export data must NOT erase the export rates
+// just stored — a run that couldn't resolve export prices should never clobber an
+// already-known one for the same slot.
+$laterFetch = $fetchedAt->modify('+1 hour');
+upsertPriceSlots(buildSlotsFrom(array_fill(0, 4, 21.0), $day1Start), null, $laterFetch);
+$afterNullExport = getPriceSlotsFrom($day1Start);
+check(count($afterNullExport) === 4, 're-upserting the same slots updates in place, not appends');
+check($afterNullExport[0]['import_rate'] === 21.0, 'import rate is overwritten by a later fetch');
+check($afterNullExport[0]['export_rate'] === 12.0, 'a null export batch does not clobber a previously-known export rate');
+check($afterNullExport[0]['fetched_at']->format(DATE_ATOM) === $laterFetch->format(DATE_ATOM), 'fetched_at reflects the later upsert');
+
+// A second calendar day's slots, upserted separately — getPriceSlotsFrom() should be able
+// to select just one day, or both, by its $from cutoff.
+$day2Start = $day1Start->modify('+1 day');
+upsertPriceSlots(buildSlotsFrom(array_fill(0, 4, 30.0), $day2Start), null, $fetchedAt);
+check(count(getPriceSlotsFrom($day1Start)) === 8, 'getPriceSlotsFrom() spans both known days when asked from day 1');
+check(count(getPriceSlotsFrom($day2Start)) === 4, 'getPriceSlotsFrom() returns only day 2 when asked from day 2');
+check(getPriceSlotsFrom($day2Start)[0]['import_rate'] === 30.0, 'day 2 slots round-trip independently of day 1');
+
+check(getLatestPriceFetchedAt()->format(DATE_ATOM) === $laterFetch->format(DATE_ATOM), 'getLatestPriceFetchedAt() reflects the most recent upsert across all slots');
+check(getLatestPriceHorizon()->format(DATE_ATOM) === $day2Start->modify('+2 hours')->format(DATE_ATOM), 'getLatestPriceHorizon() is the latest slot_to across every known slot');
+
+// Regression test: confirmed live (BST, +01:00) that comparing $from against stored
+// slot_from as plain TEXT — rather than normalising both to the same UTC offset first —
+// silently drops a slot whose UTC-stored calendar date is "earlier" than $from's own
+// offset-shifted calendar date, even when they're the exact same instant. Reproduced here
+// with a slot stored at 23:00 UTC and queried via that identical instant reformatted
+// through a +01:00 zone, which pushes its date string to the *next* calendar day
+// ("...T00:00:00+01:00") — a fixed offset, not a real DST transition, so the test doesn't
+// depend on which calendar date happens to be in DST. Deliberately placed after the
+// getLatestPriceHorizon()/getLatestPriceFetchedAt() checks above, not before — this slot's
+// timestamp would otherwise become the new latest and break those assertions.
+$boundaryInstant = new DateTimeImmutable('2026-02-01 23:00:00', new DateTimeZone('UTC'));
+upsertPriceSlots(buildSlotsFrom([99.0], $boundaryInstant), null, $fetchedAt);
+$queryFrom = $boundaryInstant->setTimezone(new DateTimeZone('+01:00')); // same instant, formats as 2026-02-02T00:00:00+01:00
+$foundBoundarySlot = array_filter(getPriceSlotsFrom($queryFrom), fn($s) => $s['import_rate'] === 99.0);
+check(
+    count($foundBoundarySlot) === 1,
+    'getPriceSlotsFrom() finds a slot exactly at $from even when $from\'s own UTC offset pushes its date string past the stored (UTC) date string for the identical instant',
+);
+
+// --- Store: schedule_summaries (one day-level summary per date, replacing the old global setting) ---
+check(getScheduleSummary('2026-01-05') === null, 'no summary for a date that has none');
+upsertScheduleSummary('2026-01-05', 'First summary.');
+check(getScheduleSummary('2026-01-05') === 'First summary.', 'summary round-trips through the table');
+upsertScheduleSummary('2026-01-05', 'Replaced summary.');
+check(getScheduleSummary('2026-01-05') === 'Replaced summary.', 're-saving the same date upserts rather than duplicating');
+upsertScheduleSummary('2020-01-01', 'Old summary.');
+pruneOldSchedules('2026-01-01');
+check(getScheduleSummary('2020-01-01') === null, 'pruneOldSchedules() also prunes schedule_summaries older than the cutoff');
+check(getScheduleSummary('2026-01-05') === 'Replaced summary.', 'pruneOldSchedules() leaves current/future summaries alone');
 
 check(getOverridesForDate('2026-01-05') === [], 'no overrides for a date that has none');
 saveOverride('2026-01-05', 'power_down', '08:00', '09:00', '07:00', '08:00');
@@ -599,21 +654,44 @@ check(
     'bounds only consider rows with a real (non-null) generation reading — the later forecast-only hour is excluded from "latest"',
 );
 
-// --- ScheduleBuilder: spliceForPush() carries today's remaining plan into tomorrow's ---
+// --- ScheduleBuilder: buildPushWindow() (GitHub issue #4, replaces the old today+tomorrow-only spliceForPush()) ---
+$pushTz = new DateTimeZone('Europe/London');
 $todayGroups = [['enable' => 1, 'startHour' => 20, 'startMinute' => 0, 'endHour' => 0, 'endMinute' => 0, 'workMode' => 'ForceDischarge', 'minSocOnGrid' => 15, 'fdSoc' => 15, 'fdPwr' => 3000]];
 $todayExplanations = ['Selling 20:00-00:00.'];
 $tomorrowGroups = [['enable' => 1, 'startHour' => 2, 'startMinute' => 0, 'endHour' => 5, 'endMinute' => 0, 'workMode' => 'ForceCharge', 'minSocOnGrid' => 15, 'fdSoc' => 100, 'fdPwr' => 3000]];
 $tomorrowExplanations = ['Charging 02:00-05:00.'];
-$splice = (new ScheduleBuilder($strategy, $battery))->spliceForPush($todayGroups, $todayExplanations, $tomorrowGroups, $tomorrowExplanations, 18 * 60);
-$spliceModes = array_map(fn($g) => $g['workMode'] . ' ' . $g['startHour'] . '-' . $g['endHour'], $splice['groups']);
-check($spliceModes === ['ForceCharge 2-5', 'ForceDischarge 20-0'], 'splice keeps today\'s 20:00-00:00 tail and tomorrow\'s 02:00-05:00 plan untouched when now (18:00) is before both, sorted by start time: got ' . implode(',', $spliceModes));
+$scheduleByDate = [
+    '2026-01-05' => ['groups' => $todayGroups, 'explanations' => $todayExplanations],
+    '2026-01-06' => ['groups' => $tomorrowGroups, 'explanations' => $tomorrowExplanations],
+];
 
-$splice2 = (new ScheduleBuilder($strategy, $battery))->spliceForPush($todayGroups, $todayExplanations, $tomorrowGroups, $tomorrowExplanations, 21 * 60);
-$tail = $splice2['groups'][array_key_last($splice2['groups'])];
+$pushBuilder = new ScheduleBuilder($strategy, $battery);
+$push = $pushBuilder->buildPushWindow($scheduleByDate, new DateTimeImmutable('2026-01-05 18:00:00', $pushTz), $pushTz, null);
+$pushModes = array_map(fn($g) => $g['workMode'] . ' ' . $g['startHour'] . '-' . $g['endHour'], $push['groups']);
+check(
+    $pushModes === ['ForceDischarge 20-0', 'ForceCharge 2-5'],
+    'with nothing capping the window, both known days combine into one 24h push, in true chronological order (today\'s evening before tomorrow\'s early morning, not sorted by raw hour-of-day): got ' . implode(',', $pushModes),
+);
+
+$push2 = $pushBuilder->buildPushWindow($scheduleByDate, new DateTimeImmutable('2026-01-05 21:00:00', $pushTz), $pushTz, null);
+$tail = $push2['groups'][0];
 check(
     $tail['startHour'] === 21 && $tail['endHour'] === 0,
-    'splice trims today\'s plan to start from "now" (21:00), not its original 20:00 start',
+    'the window starts at the current hour (21:00), trimming away the already-elapsed 20:00-21:00 portion of today\'s plan: got startHour=' . $tail['startHour'],
 );
+
+// Only today known (tomorrow not in $scheduleByDate at all, e.g. not published yet) and
+// pricing data ends at midnight tonight — the push must not extend a full 24h past that,
+// satisfying "24h ahead, or the end of known pricing, whichever is sooner" (issue #4).
+$todayOnly = ['2026-01-05' => ['groups' => $todayGroups, 'explanations' => $todayExplanations]];
+$knownEndsAtMidnight = new DateTimeImmutable('2026-01-06 00:00:00', $pushTz);
+$capped = $pushBuilder->buildPushWindow($todayOnly, new DateTimeImmutable('2026-01-05 14:00:00', $pushTz), $pushTz, $knownEndsAtMidnight);
+check(count($capped['groups']) === 1 && $capped['groups'][0]['startHour'] === 20 && $capped['groups'][0]['endHour'] === 0, 'a day with no known pricing past it is included up to its own end, unclipped, when that end is sooner than 24h out');
+
+// Pricing data that's already fully in the past relative to "now" collapses the window to nothing.
+$stale = $pushBuilder->buildPushWindow($todayOnly, new DateTimeImmutable('2026-01-05 14:00:00', $pushTz), $pushTz, new DateTimeImmutable('2026-01-05 10:00:00', $pushTz));
+check($stale['groups'] === [] && $stale['explanations'] === [], 'a known-data-end already before "now" collapses the push window to empty rather than an invalid negative-width window');
+check($stale['windowEnd'] == $stale['windowStart'], 'a collapsed window still reports windowStart/windowEnd (equal to each other) for the caller\'s status message');
 
 // --- Schedulers.php: pluggable scheduler registry (GitHub issue #2) ---
 check(resolveSchedulerId() === 'forecast_weighted_price_model', 'resolveSchedulerId() defaults to the forecast-weighted scheduler with nothing stored');
@@ -642,6 +720,35 @@ $forecastViaRegistry = buildScheduleWithScheduler('forecast_weighted_price_model
 ]);
 $forecastDirect = (new IntelligentScheduleBuilder($strategy, $battery, ['avg_daily_kwh' => 10.0]))->build($registrySlots, null, $registryCostBasis, null, null);
 check($forecastViaRegistry['groups'] === $forecastDirect['groups'], 'buildScheduleWithScheduler(\'forecast_weighted_price_model\', ...) produces the same groups as calling IntelligentScheduleBuilder directly');
+
+// --- Schedulers.php: buildMultiDaySchedule() (GitHub issue #4's "per calendar day" decision) ---
+$day2Slots = buildSlotsFrom($registryRates, new DateTimeImmutable('2026-01-06 00:00:00', new DateTimeZone('UTC')));
+$multiDaySlots = [
+    '2026-01-05' => ['importSlots' => $registrySlots, 'exportSlots' => null, 'costBasis' => $registryCostBasis],
+    '2026-01-06' => ['importSlots' => $day2Slots, 'exportSlots' => null, 'costBasis' => $registryCostBasis],
+];
+
+$multiClassic = buildMultiDaySchedule('classic', $strategy, $battery, $multiDaySlots);
+check(
+    $multiClassic['2026-01-05']['groups'] === $multiClassic['2026-01-06']['groups'],
+    'the classic scheduler has no cross-day state, so two days with identical price patterns produce identical plans',
+);
+
+$multiForecastExtras = ['usageConfig' => ['avg_daily_kwh' => 10.0], 'solarSlots' => null, 'currentSocPercent' => 50.0];
+$multiForecast = buildMultiDaySchedule('forecast_weighted_price_model', $strategy, $battery, $multiDaySlots, $multiForecastExtras);
+check(
+    abs($multiForecast['2026-01-05']['finalSocPercent'] - 50.0) > 0.5,
+    'day 1 actually projects some real change in SoC over the day (otherwise the carry-over check below would be meaningless): got ' . $multiForecast['2026-01-05']['finalSocPercent'],
+);
+$expectedDay2 = buildScheduleWithScheduler('forecast_weighted_price_model', $strategy, $battery, [
+    'importSlots' => $day2Slots, 'exportSlots' => null, 'costBasis' => $registryCostBasis,
+    'usageConfig' => ['avg_daily_kwh' => 10.0], 'solarSlots' => null,
+    'currentSocPercent' => $multiForecast['2026-01-05']['finalSocPercent'],
+]);
+check(
+    $multiForecast['2026-01-06']['groups'] === $expectedDay2['groups'],
+    'day 2 of the forecast-weighted scheduler starts from day 1\'s projected finalSocPercent, not the original live reading passed in for day 1',
+);
 
 @unlink($testDbPath);
 
@@ -696,6 +803,19 @@ $full = $intelligentBuilder->build($intelligentImportSlots, null, $intelligentCo
 check(
     !array_filter($full['groups'], fn($g) => $g['workMode'] === 'ForceCharge'),
     'a battery already at 100% is not force-charged just because a slot is cheap',
+);
+
+// finalSocPercent (GitHub issue #4's multi-day carry-over) — the projected SoC at the end
+// of the day, used as the next known day's starting point instead of always re-reading
+// the real live SoC (which is only meaningful for the first day in a run).
+check(isset($full['finalSocPercent']) && $full['finalSocPercent'] >= 0.0 && $full['finalSocPercent'] <= 100.0, 'finalSocPercent is present and a valid percentage');
+check(
+    $full['finalSocPercent'] <= 100.0 && $full['finalSocPercent'] >= $intelligentBattery['min_soc_on_grid'] - 0.01,
+    'a full battery with no forced charge/discharge drains no further than the min_soc_on_grid floor over a no-solar day: got ' . $full['finalSocPercent'],
+);
+check(
+    $sunny['finalSocPercent'] >= 50.0,
+    'plenty of solar all day and moderate starting SoC should not project a lower end-of-day SoC than the 50% it started at: got ' . $sunny['finalSocPercent'],
 );
 
 // Arbitrage: even a full battery should still charge if import is cheaper than the best export rate.

@@ -4,7 +4,7 @@ require_once __DIR__ . '/Exceptions.php';
 
 // Fetches half-hourly Agile (or any standard-unit-rates tariff) rates from
 // the public Octopus Energy API. Callers are responsible for persisting the
-// result (see Store::saveRateSlots) — this class only fetches and parses.
+// result (see Store::upsertPriceSlots) — this class only fetches and parses.
 class OctopusClient
 {
     private const BASE_URL = 'https://api.octopus.energy/v1';

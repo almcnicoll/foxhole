@@ -58,18 +58,19 @@ reprioritised.
 
 ## Near-term
 
-- [x] **Today/Tomorrow fix** — done. `schedule_groups` now keeps one row set
-  per `for_date` (`Store::saveSchedule()`/`getScheduleForDate()`,
-  `pruneOldSchedules()` drops dates before today). When a run computes
-  tomorrow's plan and today's own plan is already stored,
-  `Runner.php` splices them via `ScheduleBuilder::spliceForPush()` (reuses
-  `applyOverrides()`'s interval-subtraction) before pushing: today's plan
-  for whatever's left of today, tomorrow's plan for everything else, as one
-  set of recurring groups. The no-op push diff now compares against the
-  last *actually pushed* (spliced) groups, stored in `settings.last_pushed_groups_json`,
-  not the raw per-date plan — the splice boundary moves every run even when
-  nothing else changed. See CLAUDE.md and `tests/self_check.php` for
-  details.
+- [x] **Today/Tomorrow fix** — done, and later generalized by GitHub issue #4
+  ("Date-time-aware scheduling"). `schedule_groups` keeps one row set per
+  `for_date` (`Store::saveSchedule()`/`getScheduleForDate()`,
+  `pruneOldSchedules()` drops dates before today). What actually gets
+  pushed to FoxESS is derived by `ScheduleBuilder::buildPushWindow()` (which
+  replaced the original today+tomorrow-only `spliceForPush()`): every known
+  date's schedule combined into one absolute timeline, then sliced to
+  `[start of current hour, min(+24h, latest known pricing)]`. The no-op
+  push diff compares against the last *actually pushed* (windowed) groups,
+  stored in `settings.last_pushed_groups_json`, not any single date's raw
+  plan — the window boundary moves every run even when nothing else
+  changed. See CLAUDE.md's "Date-time-aware scheduling" and
+  `tests/self_check.php` for details.
 
 - **Flux cost-basis mode.** `CostBasisProvider`'s `octopus_product` branch is
   a stub (throws on purpose). Implement once Flux is actually live on the
@@ -86,20 +87,19 @@ reprioritised.
 Ordered roughly by how much value they'd add relative to effort — not a
 commitment, just a starting point for prioritisation:
 
-1. ~~**History/cost reporting.**~~ Partially done: `historic_generation`
-   (`src/Store.php`) is a real, append-only table tracking actual generation
-   (backfilled from FoxESS's report/query endpoint, see `HistoryFetcher.php`)
-   alongside solar forecast (captured prospectively, never backfilled — see
-   CLAUDE.md's "Generation history" section), viewable by day/week/month/year
-   at `history.php`. `rate_slots` and `schedule_groups` themselves are still
-   replace-on-every-run (deliberately — see CLAUDE.md's "Data storage"
-   section) — genuine cost/price history (what did we actually pay, not just
-   what did we generate) is still open. Making them append-only (stop the
-   `DELETE FROM ...` in `Store::saveRateSlots()`/`saveSchedule()`, add a date
-   filter to the dashboard queries) remains a small change if/when that's
-   wanted — `historic_generation` is a reasonable template for how to do it
-   (separate accumulating table, PHP-side aggregation, no new dependency
-   beyond what history.php already added).
+1. ~~**History/cost reporting.**~~ Done for price data: `price_slots`
+   (`src/Store.php`) replaced the old disposable `rate_slots` as part of
+   GitHub issue #4 ("Date-time-aware scheduling") — permanent, upserted by
+   slot timestamp, never wholesale-replaced, same append-only spirit as
+   `historic_generation` (backfilled from FoxESS's report/query endpoint, see
+   `HistoryFetcher.php`) alongside solar forecast (captured prospectively,
+   never backfilled — see CLAUDE.md's "Generation history" section), viewable
+   by day/week/month/year at `history.php`. `schedule_groups` is still
+   per-date replace (deliberately — each date's plan can legitimately be
+   recomputed as prices/battery state change before it's pushed), not a full
+   append-only history — a genuine "what schedule was actually in effect at
+   time X" audit trail is still open if that's ever wanted; `price_slots` and
+   `historic_generation` are both reasonable templates for how to add it.
 2. **Solar-generation-aware scheduling.** Spec explicitly calls this out as
    the natural next step for `ScheduleBuilder` — e.g. don't force-charge from
    the grid during slots where solar forecast already covers load. Needs a

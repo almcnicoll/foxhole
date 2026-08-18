@@ -84,3 +84,44 @@ function buildScheduleWithScheduler(string $schedulerId, array $strategyConfig, 
     $builder = new ScheduleBuilder($strategyConfig, $batteryConfig);
     return $builder->build($inputs['importSlots'], $inputs['exportSlots'], $inputs['costBasis']);
 }
+
+/**
+ * Runs the resolved scheduler once per calendar day present in $slotsByDate — the "per
+ * calendar day" decision behind GitHub issue #4's multi-day scheduling: each day's plan
+ * is exactly what buildScheduleWithScheduler() would already produce for that single day
+ * in isolation, so config caps like cheap_slots_to_charge apply per day, completely
+ * unchanged. `Runner.php`'s real pipeline and `schedulers.php`'s preview both call this
+ * one function, rather than each independently looping and risking drift between them.
+ *
+ * For the forecast-weighted scheduler specifically, each day after the first carries
+ * forward the *previous* day's projected `finalSocPercent` as its own starting SoC,
+ * instead of every day independently assuming the real live reading — that reading is
+ * only actually true for day one; day two's simulation should start from wherever day
+ * one's own plan is projected to leave the battery.
+ *
+ * @param array<string, array{importSlots: array, exportSlots: ?array, costBasis: array}> $slotsByDate
+ *        for_date (Y-m-d) => that day's inputs, in date order
+ * @param array $forecastExtras only consulted for forecast_weighted_price_model:
+ *        ['usageConfig' => array, 'solarSlots' => ?array, 'currentSocPercent' => ?float] —
+ *        currentSocPercent seeds day one only.
+ * @return array<string, array{groups: array, explanations: string[], summary: string}> for_date => schedule, same order as $slotsByDate
+ */
+function buildMultiDaySchedule(string $schedulerId, array $strategyConfig, array $batteryConfig, array $slotsByDate, array $forecastExtras = []): array
+{
+    $result = [];
+    $currentSocPercent = $forecastExtras['currentSocPercent'] ?? null;
+    foreach ($slotsByDate as $forDate => $dayInputs) {
+        $inputs = $dayInputs;
+        if ($schedulerId === 'forecast_weighted_price_model') {
+            $inputs['usageConfig'] = $forecastExtras['usageConfig'] ?? [];
+            $inputs['solarSlots'] = $forecastExtras['solarSlots'] ?? null;
+            $inputs['currentSocPercent'] = $currentSocPercent;
+        }
+        $schedule = buildScheduleWithScheduler($schedulerId, $strategyConfig, $batteryConfig, $inputs);
+        $result[$forDate] = $schedule;
+        if ($schedulerId === 'forecast_weighted_price_model') {
+            $currentSocPercent = $schedule['finalSocPercent'] ?? $currentSocPercent;
+        }
+    }
+    return $result;
+}
