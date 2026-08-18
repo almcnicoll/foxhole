@@ -8,6 +8,7 @@ require_once __DIR__ . '/../src/Exceptions.php';
 require_once __DIR__ . '/../src/CostBasisProvider.php';
 require_once __DIR__ . '/../src/ScheduleBuilder.php';
 require_once __DIR__ . '/../src/IntelligentScheduleBuilder.php';
+require_once __DIR__ . '/../src/Schedulers.php';
 require_once __DIR__ . '/../src/UsageEstimator.php';
 require_once __DIR__ . '/../src/Logger.php';
 require_once __DIR__ . '/../src/Store.php';
@@ -572,6 +573,34 @@ check(
     $tail['startHour'] === 21 && $tail['endHour'] === 0,
     'splice trims today\'s plan to start from "now" (21:00), not its original 20:00 start',
 );
+
+// --- Schedulers.php: pluggable scheduler registry (GitHub issue #2) ---
+check(resolveSchedulerId() === 'forecast_weighted_price_model', 'resolveSchedulerId() defaults to the forecast-weighted scheduler with nothing stored');
+check(resolveSchedulerId('classic') === 'classic', 'an explicit override (run.php --classic) wins regardless of any stored setting');
+check(resolveSchedulerId('not-a-real-id') === 'forecast_weighted_price_model', 'an unrecognised override id is ignored, falling through to the stored/default resolution');
+
+setSetting('intelligent_scheduler_enabled', '0');
+check(resolveSchedulerId() === 'classic', 'legacy intelligent_scheduler_enabled=0 toggle maps to the classic scheduler when scheduler_id was never saved');
+setSetting('intelligent_scheduler_enabled', '1');
+check(resolveSchedulerId() === 'forecast_weighted_price_model', 'legacy intelligent_scheduler_enabled=1 toggle maps to the forecast-weighted scheduler');
+
+setSetting('scheduler_id', 'classic');
+check(resolveSchedulerId() === 'classic', 'a saved scheduler_id wins over the legacy boolean toggle once it exists');
+
+$registryRates = array_fill(0, 48, 30.0);
+for ($i = 0; $i < 6; $i++) { $registryRates[$i] = 10.0; }
+$registrySlots = buildSlots($registryRates);
+$registryCostBasis = array_fill(0, 48, 24.5);
+$classicViaRegistry = buildScheduleWithScheduler('classic', $strategy, $battery, ['importSlots' => $registrySlots, 'exportSlots' => null, 'costBasis' => $registryCostBasis]);
+$classicDirect = (new ScheduleBuilder($strategy, $battery))->build($registrySlots, null, $registryCostBasis);
+check($classicViaRegistry['groups'] === $classicDirect['groups'], 'buildScheduleWithScheduler(\'classic\', ...) produces the same groups as calling ScheduleBuilder directly');
+
+$forecastViaRegistry = buildScheduleWithScheduler('forecast_weighted_price_model', $strategy, $battery, [
+    'importSlots' => $registrySlots, 'exportSlots' => null, 'costBasis' => $registryCostBasis,
+    'usageConfig' => ['avg_daily_kwh' => 10.0], 'solarSlots' => null, 'currentSocPercent' => null,
+]);
+$forecastDirect = (new IntelligentScheduleBuilder($strategy, $battery, ['avg_daily_kwh' => 10.0]))->build($registrySlots, null, $registryCostBasis, null, null);
+check($forecastViaRegistry['groups'] === $forecastDirect['groups'], 'buildScheduleWithScheduler(\'forecast_weighted_price_model\', ...) produces the same groups as calling IntelligentScheduleBuilder directly');
 
 @unlink($testDbPath);
 

@@ -8,6 +8,7 @@ require_once __DIR__ . '/PriceProvider.php';
 require_once __DIR__ . '/CostBasisProvider.php';
 require_once __DIR__ . '/ScheduleBuilder.php';
 require_once __DIR__ . '/IntelligentScheduleBuilder.php';
+require_once __DIR__ . '/Schedulers.php';
 require_once __DIR__ . '/UsageEstimator.php';
 require_once __DIR__ . '/FoxessClient.php';
 require_once __DIR__ . '/SolarForecastClient.php';
@@ -19,14 +20,15 @@ require_once __DIR__ . '/HistoryFetcher.php';
  * — same logic, gated by two different trust mechanisms. Never exits; callers
  * decide what to do with the result (exit code for cron, a message for the UI).
  *
- * @param ?bool $forceIntelligent overrides the `intelligent_scheduler_enabled` setting for
- *        this run only — true/false forces that mode regardless of the stored setting, null
- *        (the default, and what run-now.php always passes) reads the setting as normal. This
- *        is how run.php's --classic/--intelligent CLI flags work; there's no UI equivalent —
- *        the setting itself is what the dashboard's "Run now" and cron both read.
+ * @param ?string $forceSchedulerId overrides the stored `scheduler_id` setting (see
+ *        Schedulers.php) for this run only — a valid scheduler id forces that scheduler
+ *        regardless of what's selected on the Schedulers page, null (the default, and
+ *        what run-now.php/cron.php always pass) resolves the setting as normal. This is
+ *        how run.php's --classic/--intelligent CLI flags work; choosing a scheduler for
+ *        real runs happens on the Schedulers page (schedulers.php), not here.
  * @return array{ok: bool, dryRun: bool, message: string, schedule: ?array}
  */
-function runScheduler(bool $dryRun, ?bool $forceIntelligent = null): array
+function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
 {
     $logger = new Logger(__DIR__ . '/../logs/scheduler.log');
     $config = [];
@@ -147,21 +149,32 @@ function runScheduler(bool $dryRun, ?bool $forceIntelligent = null): array
 
         $costBasis = (new CostBasisProvider($config['cost_basis']))->getCostBasis(count($slots));
 
-        // $scheduleBuilder is always constructed — even in intelligent mode — because
-        // applyOverrides()/spliceForPush() below are pure group/interval transforms that
-        // only need battery config, not any of ScheduleBuilder's own price-selection
-        // state, so both scheduler modes share this one instance for those two steps
-        // rather than IntelligentScheduleBuilder duplicating them.
+        // $scheduleBuilder is always constructed — even when a different scheduler is
+        // selected — because applyOverrides()/spliceForPush() below are pure
+        // group/interval transforms that only need battery config, not any of
+        // ScheduleBuilder's own price-selection state, so every scheduler shares this
+        // one instance for those two steps rather than duplicating them.
         // getBatteryConfig() reads from the settings table (editable via settings.php),
         // falling back to config.php's legacy 'battery' array (if still present) only
         // for whichever keys haven't been saved via settings.php yet — see Store.php.
         $batteryConfig = getBatteryConfig($config['battery'] ?? []);
         $scheduleBuilder = new ScheduleBuilder($config['strategy'], $batteryConfig);
 
-        $useIntelligent = $forceIntelligent ?? (getSetting('intelligent_scheduler_enabled', '1') === '1');
-        $logger->info('Scheduler mode: ' . ($useIntelligent ? 'intelligent' : 'classic') . ($forceIntelligent !== null ? ' (forced via CLI flag)' : ' (from settings)'));
+        // Which scheduler actually runs is chosen on the Schedulers page (schedulers.php),
+        // not here — see Schedulers.php's resolveSchedulerId() for the fallback chain
+        // (CLI override -> stored scheduler_id -> legacy intelligent_scheduler_enabled
+        // toggle -> default).
+        $schedulerId = resolveSchedulerId($forceSchedulerId);
+        $schedulerName = SCHEDULER_DEFINITIONS[$schedulerId]['name'] ?? $schedulerId;
+        $logger->info("Scheduler: $schedulerName" . ($forceSchedulerId !== null ? ' (forced via CLI flag)' : ' (from settings)'));
 
-        if ($useIntelligent) {
+        $scheduleInputs = ['importSlots' => $slots, 'exportSlots' => $exportSlots, 'costBasis' => $costBasis];
+
+        // The forecast-weighted scheduler is the only one that currently needs solar
+        // forecast, live battery SoC or an estimated usage profile — gathered here rather
+        // than unconditionally so a run using any other scheduler doesn't pay for a live
+        // FoxESS SoC call it has no use for.
+        if ($schedulerId === 'forecast_weighted_price_model') {
             // Real battery SoC makes the projected-energy simulation meaningfully more
             // accurate, but reading it means touching FoxESS credentials — skipped for a
             // dry run so `--dry-run` keeps working with no FoxESS config at all (see
@@ -199,18 +212,17 @@ function runScheduler(bool $dryRun, ?bool $forceIntelligent = null): array
                     $currentSocPercent = array_sum($socReadings) / count($socReadings);
                 }
             }
-            $usageConfig = ['avg_daily_kwh' => UsageEstimator::estimateDailyKwh(
+            $scheduleInputs['usageConfig'] = ['avg_daily_kwh' => UsageEstimator::estimateDailyKwh(
                 (float) getSetting('usage_summer_kwh_month', '300'),
                 (float) getSetting('usage_winter_kwh_month', '700'),
                 $targetDate,
                 $timezone,
                 getLatestSolarForecast(),
             )];
-            $intelligentBuilder = new IntelligentScheduleBuilder($config['strategy'], $batteryConfig, $usageConfig);
-            $schedule = $intelligentBuilder->build($slots, $exportSlots, $costBasis, getLatestSolarForecast() ?: null, $currentSocPercent);
-        } else {
-            $schedule = $scheduleBuilder->build($slots, $exportSlots, $costBasis);
+            $scheduleInputs['solarSlots'] = getLatestSolarForecast() ?: null;
+            $scheduleInputs['currentSocPercent'] = $currentSocPercent;
         }
+        $schedule = buildScheduleWithScheduler($schedulerId, $config['strategy'], $batteryConfig, $scheduleInputs);
         $now = new DateTimeImmutable('now', $timezone);
 
         // Rates are worth recording even in a dry run — it's what powers the dashboard.
@@ -398,12 +410,14 @@ function reapplyOverrides(): array
     $batteryConfig = getBatteryConfig($config['battery'] ?? []);
     // $scheduleBuilder is always constructed for applyOverrides() below (a pure
     // group/interval transform, same reasoning as runScheduler()) but the base schedule
-    // it overlays onto must come from whichever builder run-now/cron actually use —
-    // this used to always call ScheduleBuilder::build() regardless of the
-    // intelligent_scheduler_enabled setting, so saving an override produced a
-    // classic-heuristic schedule even when the rest of the app was running intelligent.
+    // it overlays onto must come from whichever scheduler is actually selected (see
+    // Schedulers.php) — this used to always call ScheduleBuilder::build() regardless of
+    // that, so saving an override could silently produce a classic-heuristic schedule
+    // even when a different scheduler was selected for real runs.
     $scheduleBuilder = new ScheduleBuilder($config['strategy'], $batteryConfig);
-    if (getSetting('intelligent_scheduler_enabled', '1') === '1') {
+    $schedulerId = resolveSchedulerId();
+    $scheduleInputs = ['importSlots' => $importSlots, 'exportSlots' => $exportSlots, 'costBasis' => $costBasis];
+    if ($schedulerId === 'forecast_weighted_price_model') {
         $socApiKey = getSetting('foxess_api_key', '');
         $socDeviceSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('foxess_device_sns', '')))));
         $socReadings = [];
@@ -417,19 +431,17 @@ function reapplyOverrides(): array
                 $logger->warn("Battery SoC read from $sn failed, excluding from average: " . $e->getMessage());
             }
         }
-        $currentSocPercent = $socReadings ? array_sum($socReadings) / count($socReadings) : null;
-        $usageConfig = ['avg_daily_kwh' => UsageEstimator::estimateDailyKwh(
+        $scheduleInputs['currentSocPercent'] = $socReadings ? array_sum($socReadings) / count($socReadings) : null;
+        $scheduleInputs['usageConfig'] = ['avg_daily_kwh' => UsageEstimator::estimateDailyKwh(
             (float) getSetting('usage_summer_kwh_month', '300'),
             (float) getSetting('usage_winter_kwh_month', '700'),
             $rows[0]['from']->setTimezone($timezone),
             $timezone,
             getLatestSolarForecast(),
         )];
-        $base = (new IntelligentScheduleBuilder($config['strategy'], $batteryConfig, $usageConfig))
-            ->build($importSlots, $exportSlots, $costBasis, getLatestSolarForecast() ?: null, $currentSocPercent);
-    } else {
-        $base = $scheduleBuilder->build($importSlots, $exportSlots, $costBasis);
+        $scheduleInputs['solarSlots'] = getLatestSolarForecast() ?: null;
     }
+    $base = buildScheduleWithScheduler($schedulerId, $config['strategy'], $batteryConfig, $scheduleInputs);
     $overlaid = $scheduleBuilder->applyOverrides($base['groups'], $base['explanations'], $overrides, $timezone);
 
     $apiKey = getSetting('foxess_api_key', '');

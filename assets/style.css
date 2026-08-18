@@ -190,6 +190,19 @@ tr.row-SelfUse {
     background: #6666661a;
     color: #666;
 }
+.badge-active {
+    background: var(--color-primary-light);
+    color: var(--color-primary-dark);
+    font-weight: 600;
+}
+
+/* schedulers.php: one boxed card per registered scheduler (src/Schedulers.php),
+   reusing the same fieldset styling as everything else — the active one just gets a
+   thicker, brand-coloured border so it's obvious at a glance which one is selected. */
+.scheduler-card-active {
+    border-color: var(--color-primary);
+    border-width: 2px;
+}
 
 form {
     display: flex;

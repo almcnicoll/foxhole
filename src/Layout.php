@@ -27,6 +27,7 @@ function renderHeader(string $title, bool $showNav = true, string $headerExtra =
 <?php if ($showNav): ?>
 <nav>
   <a href="index.php">Dashboard</a>
+  <a href="schedulers.php">Schedulers</a>
   <a href="override.php">Override</a>
   <a href="history.php">History</a>
   <a href="settings.php">Settings</a>

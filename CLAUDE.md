@@ -33,6 +33,7 @@ cron.php              # web-triggerable cron alternative (secret-token-gated, GE
 index.php             # dashboard (password-walled)
 login.php / logout.php
 settings.php          # FoxESS credentials + system password form (password-walled)
+schedulers.php         # pick/preview the active scheduler (password-walled), see "Pluggable schedulers" below
 history.php            # generation-vs-forecast history, day/week/month/year (password-walled)
 history-fetch.php      # manual trigger for the generation history backfill/catch-up (login-only, POST-only)
 assets/
@@ -48,7 +49,9 @@ src/
   OctopusClient.php     # fetches half-hourly rates from api.octopus.energy (fetch/parse only, no storage)
   PriceProvider.php     # resolves import/export prices, per-side API-vs-fixed (settings.php)
   CostBasisProvider.php # resolves the "worth charging below this" reference price
-  ScheduleBuilder.php   # rates + cost basis -> FoxESS scheduler groups
+  ScheduleBuilder.php   # rates + cost basis -> FoxESS scheduler groups (the "classic" scheduler)
+  IntelligentScheduleBuilder.php # solar/usage/SoC-aware scheduler (the "forecast-weighted" scheduler)
+  Schedulers.php        # pluggable scheduler registry — see "Pluggable schedulers" below
   FoxessClient.php      # signs + sends requests to the FoxESS OpenAPI
   HistoryFetcher.php    # backfills/catches up historic_generation from FoxESS's report/query endpoint
 tests/
@@ -138,9 +141,13 @@ on-screen message for the UI).
    matters.
 4. `CostBasisProvider::getCostBasis()` — 48 values (currently flat, `fixed`
    mode) to compare Agile rates against.
-5. `ScheduleBuilder::build()` — price/arbitrage-threshold logic, no I/O.
+5. `resolveSchedulerId()` + `buildScheduleWithScheduler()` (`src/Schedulers.php`,
+   see "Pluggable scheduler architecture" below) — resolves which scheduler
+   is selected (`schedulers.php`, or a CLI override) and calls its `build()`.
    Produces `{groups: [...], explanations: [...], summary: '...'}`. See
-   "Cost-optimising ScheduleBuilder" below for the actual selection rules.
+   "Cost-optimising ScheduleBuilder" below for `ScheduleBuilder`'s own
+   selection rules specifically (`IntelligentScheduleBuilder`'s are
+   documented in its own class doc comment).
 6. `--dry-run` stops here and returns the computed schedule — no FoxESS
    credentials are even read.
 7. Diff the computed groups against `getLatestSchedule()`; skip the FoxESS
@@ -283,6 +290,20 @@ tinted purple along with everything else.
   minmax(320px, 1fr))`) instead of one long vertical stack — no JS, each
   fieldset just flows into however many columns the viewport fits, matching
   the app's "simplest thing that works" bias over a JS tab widget.
+- **`schedulers.php`** — see "Pluggable schedulers" below for the
+  architecture; this page is just its UI. One `.settings-grid` box per
+  registered scheduler (`SCHEDULER_DEFINITIONS`, `src/Schedulers.php`),
+  each showing its name, description, an "Active" badge (`.badge-active`)
+  plus a thicker border (`.scheduler-card-active`) if it's the one
+  `resolveSchedulerId()` currently resolves to, a "Use this scheduler"
+  button otherwise (POST-redirect-GET, same pattern as settings.php's
+  cron-token regenerate — just writes the `scheduler_id` setting, no push),
+  and every scheduler's *current recommended schedule*, computed from the
+  latest already-fetched rate slots (`getLatestRateSlots()` — no fresh
+  Octopus call; this page previews, it doesn't re-run the pipeline) but
+  never pushed. Each scheduler's build is wrapped in its own try/catch so
+  one throwing (e.g. no rates fetched yet) shows an inline error in that
+  box rather than breaking the whole page.
 
 Auth is a native PHP session (`src/Auth.php`, `session_start()` +
 `$_SESSION['authed']`) — no token store, no "remember me," nothing custom.
@@ -418,21 +439,71 @@ direct translation of a specific ask:
   variability check is what decides which ranking key is used, not just
   whether export data exists at all.
 
-**No live battery SoC *in the scheduling algorithm* — the "spare energy"
-question is still decided by battery capacity/power maths, not tracked
-state.** `real/query` is now called (see `FoxessClient::getBatterySoc()` and
-"Dashboard battery display" below), but only for the dashboard — `Runner.php`
-never reads it, and `ScheduleBuilder` still doesn't track a running kWh
-balance across the day. Both charge and discharge slot counts are still
-capped by the plain `cheap_slots_to_charge`/`expensive_slots_to_export`
-config values (see "cheap_slots_to_charge is a plain config cap" above) —
-there's no check that discharge slots don't promise to export more energy
-than was actually charged. In practice this mostly self-corrects (Agile's
-daily shape means cheap import and expensive export rarely swap places), and
-FoxESS's own firmware will just discharge whatever's actually available
-rather than erroring — but if this ever needs tightening, feeding
-`getBatterySoc()`'s result into `runScheduler()` and simulating a running
-balance through the day is the natural next step. Flagged in roadmap.MD.
+**Pluggable scheduler architecture (GitHub issue #2).** User-requested: "a
+pluggable architecture where the user can select which scheduling system to
+use." Before this, the two scheduling algorithms that already existed —
+`ScheduleBuilder` (plain price-threshold heuristic) and
+`IntelligentScheduleBuilder` (solar/usage/SoC-aware simulation, added later —
+see below) — were wired together through one ad-hoc boolean setting,
+`intelligent_scheduler_enabled`, read directly in `Runner.php`. That worked
+for exactly two options but didn't generalise, had no user-facing name or
+description for either one, and had no way to preview a scheduler's output
+before switching to it.
+
+`src/Schedulers.php` is the fix: `SCHEDULER_DEFINITIONS` is an ordered array
+of `id => ['name' => ..., 'description' => ...]` — the one place that lists
+which schedulers exist and how they're described to the user —
+`resolveSchedulerId(?string $override = null)` resolves which one is active
+(CLI override, e.g. run.php's `--classic`/`--intelligent` -> the stored
+`scheduler_id` setting -> the legacy `intelligent_scheduler_enabled` boolean,
+read once as a migration fallback for an install that saved that setting
+before this registry existed, same "read the old key once" pattern as
+`foxess_device_sns` and battery config's own migration fallbacks -> a
+hardcoded default), and `buildScheduleWithScheduler()` dispatches to
+whichever class the resolved id maps to. `Runner.php`'s `runScheduler()` and
+`reapplyOverrides()` both call through this registry now, instead of each
+separately duplicating an `if (intelligent) ... else ...` branch — which
+they used to (`reapplyOverrides()` had drifted enough to *always* use
+`ScheduleBuilder` regardless of the setting at one point, precisely the kind
+of bug a shared dispatch point makes harder to reintroduce).
+
+New user-facing area: **`schedulers.php`** ("Schedulers" in the nav) shows
+every registered scheduler as its own boxed card — name, description, an
+"Active" badge on whichever `resolveSchedulerId()` currently resolves to,
+and a "Use this scheduler" button on the others that just writes the
+`scheduler_id` setting (no push, takes effect on the next real run) — plus
+each one's *current recommended schedule*, computed from the latest
+already-fetched rate slots but never pushed to FoxESS, so you can compare
+what each algorithm would actually do before switching. `settings.php`'s old
+"Use the intelligent scheduler" checkbox is gone — selection lives on
+`schedulers.php` now, per the issue's explicit ask that it be "from a new
+area called 'Schedulers'," not folded into general settings.
+
+Deliberately still a plain array + a small `switch`-shaped dispatch
+function, not a class-per-scheduler interface: the two implementations
+already existed with genuinely different `build()` signatures
+(`IntelligentScheduleBuilder` takes two more parameters, for solar forecast
+and current SoC, that `ScheduleBuilder` has no use for) before this registry
+did, and forcing a shared interface would mean either widening one's
+signature to accept inputs it ignores or narrowing the other's to lose real
+ones — busywork, not a real abstraction. Same "greedy heuristic, not a
+solver" philosophy as the schedulers themselves.
+
+**No live battery SoC in `ScheduleBuilder` (the "classic" scheduler) — the
+"spare energy" question there is still decided by battery capacity/power
+maths, not tracked state.** This is no longer true of every scheduler:
+`IntelligentScheduleBuilder` (the "forecast-weighted" one) *does* read
+`FoxessClient::getBatterySoc()` (via `Runner.php`, when that scheduler is
+selected) and simulate a running kWh balance across the day — see its own
+class doc comment. `ScheduleBuilder` still doesn't, and both charge and
+discharge slot counts there are still capped by the plain
+`cheap_slots_to_charge`/`expensive_slots_to_export` config values (see
+"cheap_slots_to_charge is a plain config cap" above) — there's no check that
+its discharge slots don't promise to export more energy than was actually
+charged. In practice this mostly self-corrects (Agile's daily shape means
+cheap import and expensive export rarely swap places), and FoxESS's own
+firmware will just discharge whatever's actually available rather than
+erroring.
 
 **Dashboard battery display: `SoC`/`SoC_1` field names are a best-effort
 guess, not confirmed against FoxESS's own docs** — same caveat as `fdSoc`/
@@ -819,13 +890,14 @@ shared cache for no benefit.
   when a time-banded tariff like Flux goes live) is stubbed with a `TODO`,
   deliberately not implemented against guessed API shapes. See spec §13 and
   [roadmap.MD](roadmap.MD).
-- **Scheduling algorithm**: `ScheduleBuilder::build()` is a greedy,
-  explainable price/arbitrage heuristic by design (see "Cost-optimising
-  ScheduleBuilder" above), not a global optimiser — spec §7 wants
-  price-threshold logic, and explanations need to be narratable. A smarter
-  version (solar forecast, load-aware, real SoC tracking) would replace this
-  method's body without touching its inputs/outputs — `run.php` and
-  `FoxessClient` don't need to change.
+- **Scheduling algorithm**: see "Pluggable schedulers" below — there are two
+  today (`ScheduleBuilder`, `IntelligentScheduleBuilder`), both greedy,
+  explainable heuristics by design, not a global optimiser (spec §7 wants
+  price-threshold logic, and explanations need to be narratable). Adding a
+  third means a new class plus one entry in `SCHEDULER_DEFINITIONS` and one
+  branch in `buildScheduleWithScheduler()` (`src/Schedulers.php`) — nothing
+  else (`run.php`, `Runner.php`'s control flow, `schedulers.php`) needs to
+  change, since all of them just iterate the registry.
 - **More settings-table config**: if more of `config.php` ends up needing a
   UI (see roadmap), it follows the same pattern `foxess_api_key` already
   does — `getSetting()`/`setSetting()`, no schema change needed for a plain

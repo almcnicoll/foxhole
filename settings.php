@@ -73,8 +73,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    $intelligentSchedulerEnabled = isset($_POST['intelligent_scheduler_enabled']);
-
     $batteryValues = [];
     foreach ($batteryFields as $field) {
         $batteryValues[$field] = trim((string) ($_POST["battery_{$field}"] ?? ''));
@@ -107,7 +105,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 setSetting("solar_{$field}", (string) (float) $solarValues[$field]);
             }
         }
-        setSetting('intelligent_scheduler_enabled', $intelligentSchedulerEnabled ? '1' : '0');
         foreach ($batteryFields as $field) {
             setSetting("battery_{$field}", (string) (float) $batteryValues[$field]);
         }
@@ -136,8 +133,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     foreach ($solarFields as $field) {
         $solarValues[$field] = getSetting("solar_{$field}", '');
     }
-    // Default on — see CLAUDE.md's ScheduleBuilder extension point note.
-    $intelligentSchedulerEnabled = getSetting('intelligent_scheduler_enabled', '1') === '1';
     // Falls back to config.php's old 'battery' array for any key not yet saved via this
     // form — see Store::getBatteryConfig().
     $batteryDefaults = getBatteryConfig($legacyBatteryConfig);
@@ -217,14 +212,9 @@ renderHeader('Settings');
 
     <fieldset>
         <legend>Scheduler</legend>
-        <label for="intelligent_scheduler_enabled">
-            <input type="checkbox" id="intelligent_scheduler_enabled" name="intelligent_scheduler_enabled"
-                <?= $intelligentSchedulerEnabled ? 'checked' : '' ?>>
-            Use the intelligent scheduler
-        </label>
-        <p class="muted">Simulates battery charge through the day using the solar forecast below, an estimated usage
-            profile, and import/export price, instead of a flat price-threshold rule. Uncheck to fall back to the
-            simpler price-only scheduler. <code>run.php</code> can also override this per-run with
+        <p class="muted">Which scheduling algorithm actually runs is now chosen from the
+            <a href="schedulers.php">Schedulers</a> page — it also previews each one's current recommended
+            schedule before you switch. <code>run.php</code> can still override the selection per-run with
             <code>--classic</code> or <code>--intelligent</code>.
         </p>
     </fieldset>
@@ -232,8 +222,9 @@ renderHeader('Settings');
     <fieldset>
         <legend>Solar forecast</legend>
         <p class="muted">Retrieved from <a href="https://forecast.solar" target="_blank"
-                rel="noopener">Forecast.Solar</a> (free, no API key) and shown on the dashboard. Feeds the intelligent
-            scheduler above when enabled.</p>
+                rel="noopener">Forecast.Solar</a> (free, no API key) and shown on the dashboard. Feeds the
+            "Forecast-weighted price model" scheduler on the <a href="schedulers.php">Schedulers</a> page when
+            enabled.</p>
         <label for="solar_enabled">
             <input type="checkbox" id="solar_enabled" name="solar_enabled" <?= $solarEnabled ? 'checked' : '' ?>>
             Enabled
@@ -257,9 +248,10 @@ renderHeader('Settings');
 
     <fieldset>
         <legend>Estimated usage</legend>
-        <p class="muted">There's no real usage history to draw on, so the intelligent scheduler estimates a daily
-            figure by interpolating between these two using day length (longer days lean towards summer, shorter
-            towards winter) — check a few recent bills for your own monthly averages.</p>
+        <p class="muted">There's no real usage history to draw on, so the "Forecast-weighted price model" scheduler
+            (see the <a href="schedulers.php">Schedulers</a> page) estimates a daily figure by interpolating
+            between these two using day length (longer days lean towards summer, shorter towards winter) — check a
+            few recent bills for your own monthly averages.</p>
         <label for="usage_summer_kwh_month">Summer usage (kWh/month, longest day)</label>
         <input type="number" step="any" min="0" id="usage_summer_kwh_month" name="usage_summer_kwh_month"
             value="<?= htmlspecialchars($usageSummerKwhMonth) ?>">

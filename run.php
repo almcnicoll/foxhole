@@ -21,9 +21,10 @@ if ($forceClassic && $forceIntelligent) {
     fwrite(STDERR, "--classic and --intelligent are mutually exclusive.\n");
     exit(1);
 }
-// Neither flag: use the intelligent_scheduler_enabled setting, same as run-now.php.
-$modeOverride = $forceClassic ? false : ($forceIntelligent ? true : null);
-$result = runScheduler($dryRun, $modeOverride);
+// Neither flag: use whichever scheduler is selected on the Schedulers page (see
+// Schedulers.php's resolveSchedulerId()), same as run-now.php and cron.php.
+$schedulerOverride = $forceClassic ? 'classic' : ($forceIntelligent ? 'forecast_weighted_price_model' : null);
+$result = runScheduler($dryRun, $schedulerOverride);
 
 if ($result['ok'] && $dryRun) {
     echo json_encode($result['schedule'], JSON_PRETTY_PRINT) . PHP_EOL;
