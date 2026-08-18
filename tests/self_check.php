@@ -478,6 +478,47 @@ pruneOldOverrides('2026-01-01');
 check(getOverridesForDate('2020-01-01') === [], 'pruneOldOverrides removes dates before the given cutoff');
 check(count(getOverridesForDate('2026-01-05')) === 1, 'pruneOldOverrides leaves current/future dates alone');
 
+// --- Store: api_log (GitHub issue #3) — round-trip, ordering, and the 7-day body redaction rule ---
+check(countApiLogEntries() === 0, 'no api_log rows before anything is saved');
+$logNow = new DateTimeImmutable('2026-01-10 12:00:00', new DateTimeZone('UTC'));
+saveApiLogEntry('/op/v1/device/scheduler/enable', '{"deviceSN":"ABC"}', 200, '{"errno":0}', $logNow);
+$entries = getApiLogEntries(10);
+check(count($entries) === 1, 'saved api_log entry round-trips');
+check($entries[0]['endpoint'] === '/op/v1/device/scheduler/enable' && $entries[0]['status_code'] === 200, 'endpoint and status_code round-trip');
+check($entries[0]['request_body'] === '{"deviceSN":"ABC"}' && $entries[0]['response_body'] === '{"errno":0}', 'request/response bodies round-trip for a recent entry');
+
+// This second entry is timed to land just under 7 days before the third save below —
+// i.e. close to *that* call's "now", not close to the first entry's — so it's the one
+// that should still be within the retention window once the third entry triggers a prune.
+$logSecondEntryAt = $logNow->modify('+8 days')->modify('-1 hour');
+saveApiLogEntry('/op/v1/device/real/query', null, null, 'cURL error: timed out', $logSecondEntryAt);
+$entriesDesc = getApiLogEntries(10);
+check($entriesDesc[0]['endpoint'] === '/op/v1/device/real/query', 'getApiLogEntries() returns most-recent-first');
+check($entriesDesc[0]['status_code'] === null && $entriesDesc[0]['response_body'] === 'cURL error: timed out', 'a transport failure logs a null status_code with the cURL error as the body');
+check(countApiLogEntries() === 2, 'countApiLogEntries() reflects both saved rows');
+
+// A third save, 8 days after the first entry, should redact (not delete) that first
+// entry's bodies — it's now older than the 7-day retention window — while leaving the
+// second (1 hour earlier, still within the window) untouched.
+saveApiLogEntry('/op/v1/device/scheduler/get', '{}', 200, '{"errno":0}', $logNow->modify('+8 days'));
+check(countApiLogEntries() === 3, 'redaction nulls bodies, it does not delete the row');
+$byEndpoint = [];
+foreach (getApiLogEntries(10) as $e) {
+    $byEndpoint[$e['endpoint']] = $e;
+}
+check(
+    $byEndpoint['/op/v1/device/scheduler/enable']['request_body'] === null && $byEndpoint['/op/v1/device/scheduler/enable']['response_body'] === null,
+    'an entry older than 7 days has its request/response bodies redacted to null',
+);
+check($byEndpoint['/op/v1/device/scheduler/enable']['status_code'] === 200, 'status_code survives redaction — only the bodies are cleared');
+check(
+    $byEndpoint['/op/v1/device/real/query']['response_body'] === 'cURL error: timed out',
+    'an entry within the 7-day window keeps its bodies intact',
+);
+
+check(count(getApiLogEntries(1)) === 1, 'getApiLogEntries() respects its $limit argument');
+check(count(getApiLogEntries(10, 1)) === 2, 'getApiLogEntries() respects its $offset argument');
+
 // --- PriceProvider: fixed mode (default + override), api mode without a configured product/tariff ---
 $priceLogger = new Logger(sys_get_temp_dir() . '/foxhole_self_check_' . getmypid() . '.log');
 $priceProvider = new PriceProvider(new OctopusClient($priceLogger), ['product_code' => null, 'tariff_code' => null]);

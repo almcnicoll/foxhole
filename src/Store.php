@@ -107,6 +107,20 @@ function db(?string $overridePath = null): PDO
         prep_end TEXT,
         PRIMARY KEY (for_date, kind)
     )");
+    // Deliberately not disposable, same reasoning as historic_generation — this table
+    // exists specifically to answer "what did we actually send/receive, over time," so
+    // rows are never deleted. Only the request_body/response_body columns get redacted
+    // (set to NULL) once they're more than 7 days old — see saveApiLogEntry() — leaving
+    // called_at/endpoint/status_code as a permanent, storage-cheap call history. See
+    // CLAUDE.md's "API call log".
+    $pdo->exec('CREATE TABLE IF NOT EXISTS api_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        called_at TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        request_body TEXT,
+        status_code INTEGER,
+        response_body TEXT
+    )');
 
     return $pdo;
 }
@@ -406,6 +420,50 @@ function getOverridesForDate(string $forDate): array
 function pruneOldOverrides(string $today): void
 {
     db()->prepare('DELETE FROM overrides WHERE for_date < ?')->execute([$today]);
+}
+
+/**
+ * Logs one FoxESS API call — called from FoxessClient::post(), the single choke point
+ * every FoxESS request goes through (scheduler push/get, real/query, report/query), so
+ * no individual call site has to remember to log itself. $statusCode is the HTTP status,
+ * or null for a transport-level failure (no HTTP response at all) — see FoxessClient.php.
+ *
+ * Redacts (nulls out) request_body/response_body on any existing row older than 7 days
+ * *before* inserting the new one, rather than on a separate cron/cleanup schedule — see
+ * CLAUDE.md's "API call log" — so the retention rule runs every time this table is
+ * touched at all and can't silently stop happening if a separate cleanup job were ever
+ * forgotten. Rows themselves are never deleted — see the api_log table comment in db().
+ */
+function saveApiLogEntry(string $endpoint, ?string $requestBody, ?int $statusCode, ?string $responseBody, DateTimeImmutable $calledAt): void
+{
+    $pdo = db();
+    $cutoff = $calledAt->modify('-7 days')->format(DATE_ATOM);
+    $pdo->prepare('UPDATE api_log SET request_body = NULL, response_body = NULL
+        WHERE called_at < ? AND (request_body IS NOT NULL OR response_body IS NOT NULL)')->execute([$cutoff]);
+    $stmt = $pdo->prepare('INSERT INTO api_log (called_at, endpoint, request_body, status_code, response_body) VALUES (?, ?, ?, ?, ?)');
+    $stmt->execute([$calledAt->format(DATE_ATOM), $endpoint, $requestBody, $statusCode, $responseBody]);
+}
+
+/** @return array<int, array{id:int, called_at: DateTimeImmutable, endpoint:string, request_body:?string, status_code:?int, response_body:?string}> most recent first */
+function getApiLogEntries(int $limit, int $offset = 0): array
+{
+    $stmt = db()->prepare('SELECT * FROM api_log ORDER BY id DESC LIMIT ? OFFSET ?');
+    $stmt->bindValue(1, $limit, PDO::PARAM_INT);
+    $stmt->bindValue(2, $offset, PDO::PARAM_INT);
+    $stmt->execute();
+    return array_map(fn($row) => [
+        'id' => (int) $row['id'],
+        'called_at' => new DateTimeImmutable($row['called_at']),
+        'endpoint' => $row['endpoint'],
+        'request_body' => $row['request_body'],
+        'status_code' => $row['status_code'] !== null ? (int) $row['status_code'] : null,
+        'response_body' => $row['response_body'],
+    ], $stmt->fetchAll(PDO::FETCH_ASSOC));
+}
+
+function countApiLogEntries(): int
+{
+    return (int) db()->query('SELECT COUNT(*) FROM api_log')->fetchColumn();
 }
 
 function verifySystemPassword(string $attempt): bool

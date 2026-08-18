@@ -30,6 +30,7 @@ function renderHeader(string $title, bool $showNav = true, string $headerExtra =
   <a href="schedulers.php">Schedulers</a>
   <a href="override.php">Override</a>
   <a href="history.php">History</a>
+  <a href="api-log.php">API log</a>
   <a href="settings.php">Settings</a>
   <a href="logout.php">Log out</a>
 </nav>

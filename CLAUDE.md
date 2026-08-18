@@ -35,6 +35,7 @@ login.php / logout.php
 settings.php          # FoxESS credentials + system password form (password-walled)
 schedulers.php         # pick/preview the active scheduler (password-walled), see "Pluggable schedulers" below
 history.php            # generation-vs-forecast history, day/week/month/year (password-walled)
+api-log.php            # every FoxESS API call, most recent first (password-walled), see "API call log" below
 history-fetch.php      # manual trigger for the generation history backfill/catch-up (login-only, POST-only)
 assets/
   style.css            # the only stylesheet — every page links this, no per-page CSS
@@ -568,6 +569,57 @@ being set to an API client ID from FoxESS Cloud's API Management page rather
 than the actual inverter serial number — the account legitimately has no
 write permission over a "device" that isn't a real device it owns. Worth
 checking first if this recurs, before assuming it's account-level.
+
+**API call log (GitHub issue #3).** User-requested: every FoxESS API call logged —
+datetime, request body, endpoint, response code, response body — visible in a new
+"API log" area, most recent first, expandable, with the collapsed row colour-coded
+success/warning/error.
+
+Logged from inside `FoxessClient::post()` itself (`Store::saveApiLogEntry()`), not at
+each call site — `post()` is the one choke point every request (scheduler push/get,
+`real/query` for SoC, `report/query` for generation history) already goes through, so
+logging there can't be forgotten by a future call site the way logging at each of the
+half-dozen places `FoxessClient` gets instantiated could be. This is the one place
+`FoxessClient` now depends on `Store.php` — previously a self-contained API client with
+zero persistence concerns of its own. A retried call (single retry on transport failure,
+per spec §12) logs as two rows, one per actual network round-trip, since each one really
+did happen. A transport-level failure (no HTTP response at all) has no status code to
+record — `status_code` is stored `NULL` for that row, with the cURL error message
+standing in for a response body.
+
+**`api_log` is a genuinely accumulating table, like `historic_generation` — rows are
+never deleted, only their bodies get redacted.** Per the issue's own retention rule:
+"anything older than seven days should have its request and response bodies cleared —
+only datetime, endpoint and status code should remain." `saveApiLogEntry()` runs that
+redaction (`UPDATE ... SET request_body = NULL, response_body = NULL WHERE called_at <
+cutoff`) immediately before every insert, rather than on a separate cron/cleanup step —
+same reasoning as everywhere else redaction-on-write is used in this app: the rule runs
+every single time this table is touched at all, so there's no separate scheduled job to
+forget to set up or to silently stop running.
+
+**Row-level colour needs more than the raw HTTP status, because FoxESS wraps logical
+errors inside HTTP 200.** A naive "colour by status code" would show green for most real
+failures, since FoxESS's own API returns `{errno, msg, result}` inside a 200 response for
+business-level errors (bad auth, wrong permissions, etc.) rather than a non-2xx status —
+only a genuine transport failure or an unexpected non-200 HTTP response gets a non-200
+status at all. `api-log.php`'s `apiLogLevel()` therefore parses the stored response body
+for `errno` when the status is 200, downgrading the specific, already-established "Device
+offline" case (`errno` 41935, same string check `Runner.php`'s `isOfflineFailure()` uses)
+to a warning rather than an error, since that's routine for a battery-less inverter
+overnight, not a real problem. This is a display-time heuristic in `api-log.php`, not a
+new column `saveApiLogEntry()` writes — same "derive it at render time rather than
+storing a redundant field" pattern index.php's `$ranClass` warning-detection already
+uses. One accepted consequence: once a body is redacted past the 7-day window, `errno`
+is no longer recoverable and the colour falls back to the coarser status-code-only
+judgement — a known, accepted trade-off of the retention rule, not a bug.
+
+**Nav gets `flex-wrap` rather than a redesign.** The issue flagged that adding "API log"
+might make the nav unwieldy — with `Dashboard`/`Schedulers`/`Override`/`History`/`API log`/
+`Settings`/`Log out` now seven items, a narrow viewport could genuinely overflow. Fixed
+with one property (`nav { flex-wrap: wrap; }`, `style.css`) rather than a hamburger menu
+or JS-driven collapse — confirmed via the mobile viewport preset that this alone stops the
+nav overflowing horizontally. If more nav items get added later and this still isn't
+enough, that's the point to revisit with an actual collapsing menu, not before.
 
 **`fdSoc` / `fdPwr` field semantics are a best-effort guess, not confirmed.**
 The spec's own example payload was marked "confirm exact field names against

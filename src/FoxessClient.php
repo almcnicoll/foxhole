@@ -1,11 +1,16 @@
 <?php
 
 require_once __DIR__ . '/Exceptions.php';
+require_once __DIR__ . '/Store.php';
 
 // Signs and sends requests to the FoxESS OpenAPI. Uses the v1 scheduler
 // endpoints, not v0 — community reports (foxesscommunity.com) describe v0
 // scheduler writes corrupting backend state on some inverters. See CLAUDE.md
 // for the research trail behind this choice.
+//
+// Requires Store.php (a dependency this class didn't have before) purely so post() can
+// log every call via Store::saveApiLogEntry() — see CLAUDE.md's "API call log". This is
+// the one exception to this class otherwise having zero persistence concerns of its own.
 class FoxessClient
 {
     private int $callCount = 0;
@@ -134,6 +139,19 @@ class FoxessClient
         $error = curl_error($ch);
         $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
+
+        // Logged here, the one choke point every FoxESS request goes through, rather than
+        // at each call site — see Store::saveApiLogEntry(). A retried attempt logs as two
+        // rows (one per real network round-trip), and a transport-level failure (no HTTP
+        // response at all) logs status_code as null with the cURL error in place of a
+        // response body — there genuinely isn't a status code to record for that case.
+        saveApiLogEntry(
+            $path,
+            json_encode($body),
+            $errno !== 0 ? null : $status,
+            $errno !== 0 ? "cURL error: $error" : $raw,
+            new DateTimeImmutable('now'),
+        );
 
         if ($errno !== 0) {
             // Single retry on transient network failure, per spec §12 — no backoff, no further retries.

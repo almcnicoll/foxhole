@@ -76,6 +76,7 @@ a {
 
 nav {
     display: flex;
+    flex-wrap: wrap;
     gap: 1rem;
     margin-bottom: 1.5rem;
     font-size: 0.9rem;
@@ -194,6 +195,53 @@ tr.row-SelfUse {
     background: var(--color-primary-light);
     color: var(--color-primary-dark);
     font-weight: 600;
+}
+
+/* api-log.php: same success/warning/error semantics as the .alert-* banners elsewhere
+   in this app, just as a small pill instead of a full-width box — see apiLogLevel() in
+   api-log.php. */
+.badge-success {
+    background: var(--color-success-bg);
+    color: var(--color-success);
+}
+.badge-warning {
+    background: var(--color-warning-bg);
+    color: var(--color-warning);
+}
+.badge-error {
+    background: var(--color-error-bg);
+    color: var(--color-error);
+}
+
+/* api-log.php: one native <details> per logged call — no JS needed for expand/collapse,
+   same "native platform feature" bias as the battery <progress> indicator. */
+.api-log-entry {
+    border: 1px solid var(--color-border);
+    border-radius: 6px;
+    padding: 0.5rem 0.8rem;
+    margin: 0.4rem 0;
+}
+.api-log-summary {
+    display: flex;
+    align-items: center;
+    gap: 0.8rem;
+    cursor: pointer;
+}
+.api-log-summary .api-log-endpoint {
+    font-family: var(--currency-font);
+    font-size: 0.9rem;
+}
+.api-log-body {
+    margin-top: 0.6rem;
+}
+.api-log-body pre {
+    background: var(--color-primary-light);
+    border-radius: 4px;
+    padding: 0.6rem;
+    overflow-x: auto;
+    font-size: 0.85rem;
+    white-space: pre-wrap;
+    word-break: break-word;
 }
 
 /* schedulers.php: one boxed card per registered scheduler (src/Schedulers.php),
