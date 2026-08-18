@@ -10,7 +10,10 @@ requireLogin();
 
 $config = file_exists(__DIR__ . '/config.php') ? require __DIR__ . '/config.php' : [];
 $timezone = new DateTimeZone($config['strategy']['timezone'] ?? 'Europe/London');
-$minSoc = (float) ($config['battery']['min_soc_on_grid'] ?? 0);
+// Battery specs live in the settings table now (see settings.php's "Battery" section,
+// Store::getBatteryConfig()) — config.php's old 'battery' array is only read as a
+// migration fallback for whichever keys haven't been saved via settings.php yet.
+$minSoc = (float) getBatteryConfig($config['battery'] ?? [])['min_soc_on_grid'];
 
 $slots = getLatestRateSlots();
 $solarForecast = getSetting('solar_enabled', '0') === '1' ? getLatestSolarForecast() : [];

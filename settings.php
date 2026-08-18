@@ -11,6 +11,10 @@ $errors = [];
 $notice = null;
 
 $priceKinds = ['import' => ['api', '0'], 'export' => ['fixed', '12']];
+$batteryFields = ['capacity_kwh', 'max_charge_kw', 'max_discharge_kw', 'min_soc_on_grid', 'reserve_soc'];
+// Only read for getBatteryConfig()'s legacy fallback below — config.php's 'battery'
+// array, if an old one is still sitting there. See Store::getBatteryConfig().
+$legacyBatteryConfig = (file_exists(__DIR__ . '/config.php') ? require __DIR__ . '/config.php' : [])['battery'] ?? [];
 
 // Independent of the main form below — its own button, so saving other settings can
 // never accidentally rotate the token, and rotating it doesn't require re-filling the
@@ -71,6 +75,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     $intelligentSchedulerEnabled = isset($_POST['intelligent_scheduler_enabled']);
 
+    $batteryValues = [];
+    foreach ($batteryFields as $field) {
+        $batteryValues[$field] = trim((string) ($_POST["battery_{$field}"] ?? ''));
+        if (!is_numeric($batteryValues[$field]) || (float) $batteryValues[$field] < 0) {
+            $errors[] = 'Battery ' . str_replace('_', ' ', $field) . ' must be a non-negative number.';
+        }
+    }
+
     $usageSummerKwhMonth = trim((string) ($_POST['usage_summer_kwh_month'] ?? ''));
     $usageWinterKwhMonth = trim((string) ($_POST['usage_winter_kwh_month'] ?? ''));
     if (!is_numeric($usageSummerKwhMonth) || (float) $usageSummerKwhMonth < 0) {
@@ -96,6 +108,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
         setSetting('intelligent_scheduler_enabled', $intelligentSchedulerEnabled ? '1' : '0');
+        foreach ($batteryFields as $field) {
+            setSetting("battery_{$field}", (string) (float) $batteryValues[$field]);
+        }
         setSetting('usage_summer_kwh_month', (string) (float) $usageSummerKwhMonth);
         setSetting('usage_winter_kwh_month', (string) (float) $usageWinterKwhMonth);
         if ($newPassword !== '') {
@@ -123,6 +138,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     // Default on — see CLAUDE.md's ScheduleBuilder extension point note.
     $intelligentSchedulerEnabled = getSetting('intelligent_scheduler_enabled', '1') === '1';
+    // Falls back to config.php's old 'battery' array for any key not yet saved via this
+    // form — see Store::getBatteryConfig().
+    $batteryDefaults = getBatteryConfig($legacyBatteryConfig);
+    $batteryValues = [];
+    foreach ($batteryFields as $field) {
+        $batteryValues[$field] = (string) $batteryDefaults[$field];
+    }
     // Defaults are a plausible typical UK household, not this install's real figures —
     // update them to match your own bills for an accurate estimate.
     $usageSummerKwhMonth = getSetting('usage_summer_kwh_month', '300');
@@ -146,12 +168,36 @@ renderHeader('Settings');
 <?php if ($notice): ?><p class="notice"><?= htmlspecialchars($notice) ?></p><?php endif; ?>
 
 <form method="post">
+    <div class="settings-grid">
     <fieldset>
         <legend>FoxESS API</legend>
         <label for="api_key">API key</label>
         <input type="text" id="api_key" name="api_key" value="<?= htmlspecialchars($apiKey) ?>" required>
         <label for="device_sns">Device serial numbers (one per line — the same schedule is pushed to each)</label>
         <textarea id="device_sns" name="device_sns" rows="3" required><?= htmlspecialchars($deviceSnsRaw) ?></textarea>
+    </fieldset>
+
+    <fieldset>
+        <legend>Battery</legend>
+        <p class="muted">Your battery/inverter's hardware specs — check the datasheet rather than guessing.
+            <strong>Max discharge power should be the inverter's actual rated maximum, not just matched to charge
+            power</strong> — FoxESS's force-discharge power cap is a hard ceiling on how much a slot chosen
+            specifically to sell/export can actually shift, so a conservative value here leaves money on the table.</p>
+        <label for="battery_capacity_kwh">Usable capacity (kWh)</label>
+        <input type="number" step="any" min="0" id="battery_capacity_kwh" name="battery_capacity_kwh"
+            value="<?= htmlspecialchars($batteryValues['capacity_kwh']) ?>">
+        <label for="battery_max_charge_kw">Max charge power (kW)</label>
+        <input type="number" step="any" min="0" id="battery_max_charge_kw" name="battery_max_charge_kw"
+            value="<?= htmlspecialchars($batteryValues['max_charge_kw']) ?>">
+        <label for="battery_max_discharge_kw">Max discharge power (kW)</label>
+        <input type="number" step="any" min="0" id="battery_max_discharge_kw" name="battery_max_discharge_kw"
+            value="<?= htmlspecialchars($batteryValues['max_discharge_kw']) ?>">
+        <label for="battery_min_soc_on_grid">Min SoC on grid (%)</label>
+        <input type="number" step="1" min="0" max="100" id="battery_min_soc_on_grid" name="battery_min_soc_on_grid"
+            value="<?= htmlspecialchars($batteryValues['min_soc_on_grid']) ?>">
+        <label for="battery_reserve_soc">Reserve SoC (%, force-discharge floor)</label>
+        <input type="number" step="1" min="0" max="100" id="battery_reserve_soc" name="battery_reserve_soc"
+            value="<?= htmlspecialchars($batteryValues['reserve_soc']) ?>">
     </fieldset>
 
     <fieldset>
@@ -230,11 +276,13 @@ renderHeader('Settings');
         <label for="confirm_password">Confirm new password</label>
         <input type="password" id="confirm_password" name="confirm_password" minlength="8" autocomplete="new-password">
     </fieldset>
+    </div>
 
     <button type="submit">Save</button>
 </form>
 
 <form method="post">
+    <div class="settings-grid">
     <fieldset>
         <legend>Cron trigger</legend>
         <p class="muted">For hosts where cron can't invoke the PHP CLI — point your host's scheduler at
@@ -250,6 +298,7 @@ renderHeader('Settings');
         <input type="text" id="cron_token" readonly value="<?= htmlspecialchars($cronToken) ?>" onclick="this.select()">
         <button type="submit" name="regenerate_cron_token" value="1">Regenerate</button>
     </fieldset>
+    </div>
 </form>
 
 <?php

@@ -401,6 +401,16 @@ table.dataTable thead .sorting_desc:after {
     min-width: 320px;
 }
 
+/* settings.php: boxed fieldsets laid out as a responsive grid instead of one long
+   vertical stack — each fieldset is already its own bordered box (see the `fieldset`
+   rule above), this just lets them flow into columns instead of one column. */
+.settings-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 1rem;
+    align-items: start;
+}
+
 .full-width {
     width: 100%;
 }

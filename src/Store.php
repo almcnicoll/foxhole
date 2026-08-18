@@ -119,6 +119,35 @@ function getSetting(string $key, ?string $default = null): ?string
     return $value !== false ? $value : $default;
 }
 
+/**
+ * Battery hardware specs (capacity, max charge/discharge power, SoC floors) — moved out
+ * of config.php's 'battery' section into the settings table (see CLAUDE.md's "Battery
+ * config moved to settings") so they're editable from settings.php without a deploy.
+ * The trigger was `max_discharge_kw` specifically being left at a too-conservative value
+ * (mirrored from `max_charge_kw`) with no easy way to notice or fix it short of editing
+ * config.php directly.
+ *
+ * @param array $legacyConfig config.php's old 'battery' array, if the caller has one —
+ *        read once per key as a migration fallback for any value that hasn't been saved
+ *        via settings.php yet, same pattern as foxess_device_sns' fallback to the old
+ *        singular foxess_device_sn key. Once a key is saved via settings.php it's in the
+ *        settings table for good and this fallback stops mattering for that key.
+ * @return array{capacity_kwh: float, max_charge_kw: float, max_discharge_kw: float, min_soc_on_grid: int, reserve_soc: int}
+ */
+function getBatteryConfig(array $legacyConfig = []): array
+{
+    $defaults = ['capacity_kwh' => 10.0, 'max_charge_kw' => 3.0, 'max_discharge_kw' => 3.0, 'min_soc_on_grid' => 15, 'reserve_soc' => 15];
+    $result = [];
+    foreach ($defaults as $key => $default) {
+        $fallback = $legacyConfig[$key] ?? $default;
+        $stored = getSetting("battery_{$key}");
+        $result[$key] = $stored !== null ? (float) $stored : (float) $fallback;
+    }
+    $result['min_soc_on_grid'] = (int) $result['min_soc_on_grid'];
+    $result['reserve_soc'] = (int) $result['reserve_soc'];
+    return $result;
+}
+
 function setSetting(string $key, string $value): void
 {
     $stmt = db()->prepare('INSERT INTO settings (key, value) VALUES (:key, :value)

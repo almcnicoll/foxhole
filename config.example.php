@@ -14,13 +14,11 @@ return [
         // stored in data/scheduler.sqlite. base_url is the only non-secret bit left.
         'base_url' => 'https://www.foxesscloud.com',
     ],
-    'battery' => [
-        'capacity_kwh'      => 10.0,
-        'max_charge_kw'     => 3.0,
-        'max_discharge_kw'  => 3.0,
-        'min_soc_on_grid'   => 15,   // percent, respects inverter's own floor
-        'reserve_soc'       => 15,   // percent never discharged below
-    ],
+    // Battery specs (capacity, max charge/discharge power, SoC floors) are no longer
+    // configured here — set them via settings.php's "Battery" section instead, same
+    // reason FoxESS credentials moved to settings.php: editable without a deploy, and
+    // less likely to be forgotten at some too-conservative placeholder value. See
+    // CLAUDE.md's "Battery config moved to settings".
     'strategy' => [
         'cheap_slots_to_charge'     => 6,  // upper cap on half-hour slots to force-charge, see ScheduleBuilder
         'expensive_slots_to_export' => 4,  // number of half-hour slots to force-discharge/export

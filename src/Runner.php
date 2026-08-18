@@ -152,7 +152,11 @@ function runScheduler(bool $dryRun, ?bool $forceIntelligent = null): array
         // only need battery config, not any of ScheduleBuilder's own price-selection
         // state, so both scheduler modes share this one instance for those two steps
         // rather than IntelligentScheduleBuilder duplicating them.
-        $scheduleBuilder = new ScheduleBuilder($config['strategy'], $config['battery']);
+        // getBatteryConfig() reads from the settings table (editable via settings.php),
+        // falling back to config.php's legacy 'battery' array (if still present) only
+        // for whichever keys haven't been saved via settings.php yet — see Store.php.
+        $batteryConfig = getBatteryConfig($config['battery'] ?? []);
+        $scheduleBuilder = new ScheduleBuilder($config['strategy'], $batteryConfig);
 
         $useIntelligent = $forceIntelligent ?? (getSetting('intelligent_scheduler_enabled', '1') === '1');
         $logger->info('Scheduler mode: ' . ($useIntelligent ? 'intelligent' : 'classic') . ($forceIntelligent !== null ? ' (forced via CLI flag)' : ' (from settings)'));
@@ -202,7 +206,7 @@ function runScheduler(bool $dryRun, ?bool $forceIntelligent = null): array
                 $timezone,
                 getLatestSolarForecast(),
             )];
-            $intelligentBuilder = new IntelligentScheduleBuilder($config['strategy'], $config['battery'], $usageConfig);
+            $intelligentBuilder = new IntelligentScheduleBuilder($config['strategy'], $batteryConfig, $usageConfig);
             $schedule = $intelligentBuilder->build($slots, $exportSlots, $costBasis, getLatestSolarForecast() ?: null, $currentSocPercent);
         } else {
             $schedule = $scheduleBuilder->build($slots, $exportSlots, $costBasis);
@@ -391,13 +395,14 @@ function reapplyOverrides(): array
         : null;
 
     $costBasis = (new CostBasisProvider($config['cost_basis']))->getCostBasis(count($importSlots));
+    $batteryConfig = getBatteryConfig($config['battery'] ?? []);
     // $scheduleBuilder is always constructed for applyOverrides() below (a pure
     // group/interval transform, same reasoning as runScheduler()) but the base schedule
     // it overlays onto must come from whichever builder run-now/cron actually use —
     // this used to always call ScheduleBuilder::build() regardless of the
     // intelligent_scheduler_enabled setting, so saving an override produced a
     // classic-heuristic schedule even when the rest of the app was running intelligent.
-    $scheduleBuilder = new ScheduleBuilder($config['strategy'], $config['battery']);
+    $scheduleBuilder = new ScheduleBuilder($config['strategy'], $batteryConfig);
     if (getSetting('intelligent_scheduler_enabled', '1') === '1') {
         $socApiKey = getSetting('foxess_api_key', '');
         $socDeviceSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('foxess_device_sns', '')))));
@@ -420,7 +425,7 @@ function reapplyOverrides(): array
             $timezone,
             getLatestSolarForecast(),
         )];
-        $base = (new IntelligentScheduleBuilder($config['strategy'], $config['battery'], $usageConfig))
+        $base = (new IntelligentScheduleBuilder($config['strategy'], $batteryConfig, $usageConfig))
             ->build($importSlots, $exportSlots, $costBasis, getLatestSolarForecast() ?: null, $currentSocPercent);
     } else {
         $base = $scheduleBuilder->build($importSlots, $exportSlots, $costBasis);

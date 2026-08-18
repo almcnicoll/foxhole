@@ -261,7 +261,7 @@ tinted purple along with everything else.
   arithmetic and `style.css` just maps each class to a colour via
   `::-webkit-progress-value`/`::-moz-progress-bar` (the two vendor
   pseudo-elements that actually control fill colour — there's no
-  unprefixed standard one). Bands split `config.battery.min_soc_on_grid`
+  unprefixed standard one). Bands split `getBatteryConfig()['min_soc_on_grid']`
   (the bottom of "red") to 100% (the top of "green") into equal thirds —
   `min_soc_on_grid` specifically, not `reserve_soc`: both represent some
   kind of floor and happen to be equal in the current config, but
@@ -272,12 +272,17 @@ tinted purple along with everything else.
 - **`settings.php`** — FoxESS `api_key`/`device_sns` (pre-filled from
   `Store`, plain text — the user themself set them, no reason to hide them
   from themself; `device_sns` is a `<textarea>`, one serial per line — see
-  "Multi-inverter support" below), import/export price source (API vs. fixed
-  pence/kWh, one `<select>` + one `<input>` per side, no JS toggling — the
-  fixed-price input is simply ignored server-side when mode is `api`), and
-  an optional password change (blank = unchanged, 8-char minimum, must be
-  confirmed twice). No CSRF token — same reasoning as the brute-force point
-  above.
+  "Multi-inverter support" below), battery hardware specs (see "Battery
+  config moved to settings" below), import/export price source (API vs.
+  fixed pence/kWh, one `<select>` + one `<input>` per side, no JS toggling —
+  the fixed-price input is simply ignored server-side when mode is `api`),
+  and an optional password change (blank = unchanged, 8-char minimum, must
+  be confirmed twice). No CSRF token — same reasoning as the brute-force
+  point above. Its fieldsets are laid out via `.settings-grid` (`style.css`,
+  a plain `display: grid; grid-template-columns: repeat(auto-fit,
+  minmax(320px, 1fr))`) instead of one long vertical stack — no JS, each
+  fieldset just flows into however many columns the viewport fits, matching
+  the app's "simplest thing that works" bias over a JS tab widget.
 
 Auth is a native PHP session (`src/Auth.php`, `session_start()` +
 `$_SESSION['authed']`) — no token store, no "remember me," nothing custom.
@@ -531,7 +536,46 @@ retry/backoff beyond a single retry." Only retries cURL-level failures
 change from the original spec, so they're editable from `settings.php`
 without touching a file on the server. `config.php` keeps everything that
 isn't secret and isn't meant to be UI-editable (Octopus product/tariff
-codes, battery/strategy tunables, `foxess.base_url`, notification email).
+codes, `strategy` tunables, `foxess.base_url`, notification email).
+
+**Battery config moved to settings.** User-reported bug (GitHub issue #1,
+"Maximum discharge levels not set"): force-discharge slots weren't shifting
+as much power as they should. Root cause turned out not to be a code bug at
+all — `max_discharge_kw` was set in `config.php` (a file only editable via
+SSH/FTP on the live host) to a conservative placeholder mirrored from
+`max_charge_kw`, rather than the inverter's actual rated maximum discharge
+power, and the user had simply forgotten it was there to check. Confirmed
+against FoxESS community documentation (forum posts + TonyM1958's
+FoxESS-Cloud) while investigating: `fdPwr` is the scheduler's hard ceiling
+on force-discharge power, defaults to 0 if omitted entirely, and the
+community's own guidance is to set it to the inverter's true rated max —
+FoxESS's own house-load-aware logic does the real-time limiting, so a
+conservative value here only ever leaves power on the table, never protects
+anything.
+
+The fix (issue retitled/redirected to be about config discoverability, not
+code — see the issue for the full before/after) was to move the whole
+`battery` config section (`capacity_kwh`, `max_charge_kw`,
+`max_discharge_kw`, `min_soc_on_grid`, `reserve_soc`) out of `config.php`
+into the settings table, editable from settings.php's new "Battery"
+section, same reasoning and pattern as the FoxESS-credentials move above:
+a value worth tuning without a deploy shouldn't live somewhere the user can
+forget about it. `Store::getBatteryConfig(array $legacyConfig = [])` is the
+single read path every caller (`Runner.php`, `index.php`) now goes through;
+`$legacyConfig` is `config.php`'s old `battery` array, read once per key as
+a migration fallback for whatever hasn't been saved via settings.php yet —
+same "read the old location once, so an upgrade doesn't reset a working
+install to defaults" pattern as `foxess_device_sns`' fallback to the old
+singular `foxess_device_sn` key. `config.example.php` no longer has a
+`battery` section at all; a live `config.php` that still has one keeps
+working (via the fallback) until the user visits settings.php and saves
+over it, at which point the settings-table value wins for good.
+
+While in there, `settings.php`'s previously one-column stack of fieldsets
+was also reorganised into the `.settings-grid` responsive grid described
+above — the Battery section was one more fieldset to add to an already
+fairly long single-column page, and "tidy it up while adding a section"
+was explicitly the ask, not a separate cleanup.
 
 **Multi-inverter support: one setting holding a newline-separated list, not a
 devices table.** User has two inverters and wants the same schedule pushed to
@@ -668,11 +712,14 @@ equivalent `location` block instead; `.htaccess` does nothing there.
 ## Config & secrets
 
 `config.php` is real and gitignored; `config.example.php` is the committed
-template — both hold only non-secret tunables now (FoxESS `api_key`/
-`device_sn` moved to `data/scheduler.sqlite`, managed via `settings.php`).
-If you add a new config key, update both files and the shape described in
-the spec's §4. If you add a new *secret*, it belongs in the `settings` table
-via `Store`, not in `config.php`.
+template — both hold only non-secret, not-meant-to-be-UI-editable tunables
+now (FoxESS `api_key`/`device_sn` and the whole `battery` section moved to
+`data/scheduler.sqlite`, managed via `settings.php` — see "Battery config
+moved to settings" above). If you add a new config key that's fine to leave
+in a file only editable via SSH/FTP on the live host, update both files and
+the shape described in the spec's §4. If you add a new *secret*, or a value
+someone might reasonably want to tune without a deploy, it belongs in the
+`settings` table via `Store`, not in `config.php`.
 
 ## Running
 

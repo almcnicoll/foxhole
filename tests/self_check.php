@@ -427,6 +427,22 @@ check(getSetting('foxess_api_key') === 'abc123', 'setting round-trips through th
 setSetting('foxess_api_key', 'replaced');
 check(getSetting('foxess_api_key') === 'replaced', 're-setting a key updates rather than duplicates (upsert)');
 
+// --- Store: getBatteryConfig() — settings table first, then legacy config.php array, then hardcoded default ---
+check(
+    getBatteryConfig() == ['capacity_kwh' => 10.0, 'max_charge_kw' => 3.0, 'max_discharge_kw' => 3.0, 'min_soc_on_grid' => 15, 'reserve_soc' => 15],
+    'getBatteryConfig() falls back to hardcoded defaults with no setting and no legacy config'
+);
+check(
+    getBatteryConfig(['max_discharge_kw' => 5.0, 'capacity_kwh' => 8.0]) == ['capacity_kwh' => 8.0, 'max_charge_kw' => 3.0, 'max_discharge_kw' => 5.0, 'min_soc_on_grid' => 15, 'reserve_soc' => 15],
+    'getBatteryConfig() falls back to the legacy config.php array for keys not yet saved as settings'
+);
+setSetting('battery_max_discharge_kw', '6.5');
+check(
+    getBatteryConfig(['max_discharge_kw' => 5.0])['max_discharge_kw'] === 6.5,
+    'getBatteryConfig() prefers a saved setting over the legacy config.php value'
+);
+check(getBatteryConfig(['max_discharge_kw' => 5.0])['capacity_kwh'] === 10.0, 'getBatteryConfig() still falls back per-key for anything not individually saved');
+
 check(verifySystemPassword('foxhole') === true, 'default password "foxhole" works before any password is set');
 check(verifySystemPassword('wrong') === false, 'wrong password rejected under the default');
 setSystemPassword('a-real-password');
