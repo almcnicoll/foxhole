@@ -1219,14 +1219,41 @@ hits the data horizon.** `HistoryFetcher::fetchGenerationHistory()` is called fr
 - *Forward catch-up*: from the latest stored day through today (today's not-yet-elapsed
   hours are never written — see `storeDay()` — so a run partway through the day only
   trusts hours strictly before the current local hour, same reasoning as the "partial-day
-  data" handling elsewhere in this file).
-- *Backward backfill*: one day further back than anything stored, up to
-  `HISTORY_BACKWARD_BACKFILL_MAX_DAYS_PER_CALL` (20) per call. The moment FoxESS reports no
-  data at all for a day, that's recorded as `settings.history_backfill_exhausted_before`
-  and never probed again — this is the literal reading of "historic data won't change so
-  once we have data up to point x we never need to go back earlier than that". A single
-  cron day (or button click) only advances the boundary by one call's worth of days;
-  mash the button (or just wait) to walk further back faster.
+  data" handling elsewhere in this file). Still generation-bounds-driven only
+  (`getHistoricGenerationBounds()`) — usage rides along inside it exactly as it always has.
+- *Backward backfill* (`HistoryFetcher::backfillHistoryBackward()`, split into its own
+  function specifically so it can be exercised in tests with a scripted `FoxessClient`
+  rather than a live connection): user-requested rework — generation and usage now each
+  have their own independent limit (`Store::getHistoryBackfillLimit()`/
+  `setHistoryBackfillLimit()`, `settings.history_{generation,usage}_backfill_limit`), the
+  earliest day that variable has been confirmed back to. The original design tracked one
+  combined, generation-only horizon (`settings.history_backfill_exhausted_before`) — which
+  meant a real install, where generation backfill had already finished *before* usage
+  tracking was even added (GitHub issue #5), could never backfill usage at all: the single
+  gate was already permanently closed. `getHistoryBackfillLimit('generation')` falls back
+  to that old setting once, read-time only (same pattern `foxess_device_sns`' fallback to
+  `foxess_device_sn` already uses) — an already-exhausted install keeps that state, mapped
+  to the epoch sentinel below rather than the old setting's own recorded day.
+
+  Each call's walk starts from whichever of the two limits is *later* (closer to today —
+  the less-backfilled variable) and proceeds one calendar day at a time, up to
+  `HISTORY_BACKWARD_BACKFILL_MAX_DAYS_PER_CALL` (20) *API calls*, not days — a variable is
+  only actually fetched once the walk passes *its own* limit, so days the more-advanced
+  variable already covers cost it nothing (no wasted call), while the lagging variable
+  spends the whole budget catching up; once the walk reaches the earlier limit too, both
+  proceed together from there. This is the literal mechanism behind "backfill usage data
+  for the period for which we already have generation data (and vice versa)". The moment a
+  variable's fetch genuinely returns no data at all, its own limit is set to
+  `Store::HISTORY_BACKFILL_EPOCH` (1970-01-01) rather than the actual horizon day — a
+  sentinel chosen specifically so an exhausted variable can never again be "the later of
+  the two limits" and start soaking up call budget for no reason; the two variables stop
+  independently on their own error or exhaustion, never affecting each other. Generation
+  and usage are still upserted independently per day
+  (`upsertHistoricGeneration()`/`upsertHistoricUsage()`, each touching only their own
+  column) — a day where only one variable has data never writes a `NULL` over the other,
+  same non-clobbering pattern `forecast_kwh`/`generation_kwh` already established. A single
+  cron day (or button click) only advances by one call's worth of work; mash the button (or
+  just wait) to walk further back faster.
 
 **A day, once stored, is never re-fetched — so a transient per-device error must never get
 silently written as an undercount.** With two configured inverters, each day's fetch is

@@ -18,14 +18,30 @@ require_once __DIR__ . '/FoxessClient.php';
  *    until the day rolls over — only completed local hours are written, see storeDay())
  *    and re-touches the latest already-stored day too, cheap insurance against a previous
  *    run that landed mid-hour.
- *  - Backward backfill: walks one day at a time further into the past than anything
- *    stored, up to HISTORY_BACKWARD_BACKFILL_MAX_DAYS_PER_CALL days per call, stopping
- *    early and *permanently* (recorded in settings.history_backfill_exhausted_before) the
- *    moment FoxESS reports no data for a day — that's the device's own history horizon
- *    (install date, or whenever FoxESS Cloud itself started retaining data), and it never
- *    moves, so there's no reason to ever probe further back again. A single click of
- *    "Fetch history now" only advances this by one call's worth of days; click it again
- *    (or just wait for the next scheduled run) to keep walking back.
+ *  - Backward backfill: walks further into the past than anything stored, up to
+ *    HISTORY_BACKWARD_BACKFILL_MAX_DAYS_PER_CALL API calls per call. Generation and usage
+ *    each have their own independent backfill limit (Store::getHistoryBackfillLimit()) —
+ *    the earliest day that variable has been confirmed back to, or Store::HISTORY_BACKFILL_EPOCH
+ *    (1970-01-01) once FoxESS genuinely has no data left for it, a sentinel chosen
+ *    specifically so an exhausted variable can never again be "the later of the two limits"
+ *    (see below). A single click of "Fetch history now" only advances this by one call's
+ *    worth of work; click it again (or just wait for the next scheduled run) to keep
+ *    walking back.
+ *
+ *    User-requested (originally generation-only tracking meant a real install could exhaust
+ *    generation's backfill — the common case, since it existed long before usage tracking
+ *    did — and then never be able to backfill usage at all, even though FoxESS would happily
+ *    return usage for exactly the same already-covered days): the walk starts from whichever
+ *    of the two limits is *later* (closer to today, i.e. the less-backfilled variable) and
+ *    proceeds one calendar day at a time, but each variable is only actually fetched once
+ *    the walk passes *its own* limit — so days already covered by the more-advanced variable
+ *    are skipped for that variable (no wasted API call) while the lagging one catches up,
+ *    and once the walk reaches the earlier limit too, both proceed together from there. This
+ *    is what "backfill usage data for the period for which we already have generation data
+ *    (and vice versa)" means in practice — one shared walk, two independently-tracked
+ *    frontiers. Generation and usage are upserted independently per day (upsertHistoricGeneration()/
+ *    upsertHistoricUsage(), each touching only their own column) — a day where only one
+ *    variable has data never writes a NULL over the other.
  *
  * Forecast data is deliberately NOT backfilled here — Forecast.Solar only exposes
  * *historic* forecasts on a paid tier, so there's nothing to fetch. Instead, Runner.php
@@ -41,13 +57,12 @@ require_once __DIR__ . '/FoxessClient.php';
  * hour at the solar panels, not wherever a browser happens to be.
  *
  * GitHub issue #5 ("Modelling scheduler") added household usage history alongside
- * generation, in the same table (historic_generation.usage_kwh — see Store.php). Usage
- * fetching rides along inside this file's existing per-day loops but deliberately doesn't
- * touch their control flow at all: generation stays the sole source of truth for the
- * backward-backfill horizon (getHistoricGenerationBounds() is unchanged, generation-only),
- * and every usage fetch/store is independently try/caught (fetchAndStoreUsageForDay()) so
- * a usage-side failure or "no data" can never affect whether a day's generation gets
- * stored or whether the backfill loop keeps walking back.
+ * generation, in the same table (historic_generation.usage_kwh — see Store.php). The
+ * *forward* catch-up pass below still treats generation as the sole source of truth for its
+ * own window (getHistoricGenerationBounds() only) — usage rides along inside it exactly as
+ * before, independently try/caught (fetchAndStoreUsageForDay()) so a usage-side failure or
+ * "no data" can never affect whether a day's generation gets stored. Only the *backward*
+ * pass tracks the two independently, per the above.
  */
 
 const HISTORY_FORWARD_CATCHUP_MAX_DAYS = 14;
@@ -97,28 +112,84 @@ function fetchGenerationHistory(array $config, Logger $logger): array
         fetchAndStoreUsageForDay($clients, $day, $timezone, $day == $today, $logger);
     }
 
-    // --- Backward backfill: only runs until the data horizon is found once, ever ---
-    if (getSetting('history_backfill_exhausted_before') === null) {
-        $bounds = getHistoricGenerationBounds(); // re-read: the forward pass above may have set 'earliest' on a first-ever run
-        $cursor = $bounds['earliest'] !== null ? $bounds['earliest']->setTimezone($timezone)->setTime(0, 0) : $today;
-        for ($i = 0; $i < HISTORY_BACKWARD_BACKFILL_MAX_DAYS_PER_CALL; $i++) {
-            $cursor = $cursor->modify('-1 day');
-            $result = fetchDayAcrossDevices($clients, $cursor, $logger);
+    $daysStored += backfillHistoryBackward($clients, $today, $timezone, $logger);
+
+    return ['ok' => true, 'message' => "Generation history: fetched $daysStored day(s)."];
+}
+
+/**
+ * The backward-backfill pass, split out from fetchGenerationHistory() specifically so it can
+ * be exercised in tests with mock FoxessClient subclasses (same pattern the pushToDevices()
+ * tests already use) without a live FoxESS connection — the day-by-day "skip an
+ * already-covered variable until the walk reaches its own frontier, shared call budget, each
+ * variable stops independently on its own error/exhaustion" logic is intricate enough to be
+ * worth verifying directly. See this file's own top doc comment for the full rationale.
+ *
+ * @param array<string, FoxessClient> $clients
+ * @return int days actually stored (generation + usage writes combined)
+ */
+function backfillHistoryBackward(array $clients, DateTimeImmutable $today, DateTimeZone $timezone, Logger $logger): int
+{
+    $genLimit = getHistoryBackfillLimit('generation');
+    $usageLimit = getHistoryBackfillLimit('usage');
+    $genExhausted = $genLimit !== null && $genLimit->format('Y-m-d') <= HISTORY_BACKFILL_EPOCH;
+    $usageExhausted = $usageLimit !== null && $usageLimit->format('Y-m-d') <= HISTORY_BACKFILL_EPOCH;
+    $daysStored = 0;
+
+    if ($genExhausted && $usageExhausted) {
+        return 0;
+    }
+
+    // Only consulted when a variable has never been tracked under this scheme before, to
+    // seed a starting point from what's actually stored. Falls back to $today (nothing to
+    // seed from at all) if the table is genuinely empty.
+    $genCursor = $genLimit ?? (getHistoricGenerationBounds()['earliest'] ?? $today)->setTimezone($timezone)->setTime(0, 0);
+    $usageCursor = $usageLimit ?? (getHistoricUsageBounds()['earliest'] ?? $today)->setTimezone($timezone)->setTime(0, 0);
+    $genActive = !$genExhausted;
+    $usageActive = !$usageExhausted;
+    $day = $genCursor > $usageCursor ? $genCursor : $usageCursor;
+    $callsUsed = 0;
+
+    while ($callsUsed < HISTORY_BACKWARD_BACKFILL_MAX_DAYS_PER_CALL && ($genActive || $usageActive)) {
+        $day = $day->modify('-1 day');
+
+        if ($genActive && $day < $genCursor) {
+            $callsUsed++;
+            $result = fetchDayAcrossDevices($clients, $day, $logger);
             if ($result === false) {
-                break; // transient error — stop for this call, retry the same day next time
+                $genActive = false; // transient error — stop for this call, retry from here next time
+            } elseif ($result === null) {
+                $genActive = false;
+                $genExhausted = true;
+                $logger->info('Generation history backfill reached the data horizon at ' . $day->format('Y-m-d') . '; will not probe further back.');
+            } else {
+                storeDay($day, $result, $timezone, false, 'upsertHistoricGeneration');
+                $daysStored++;
+                $genCursor = $day;
             }
-            if ($result === null) {
-                setSetting('history_backfill_exhausted_before', $cursor->modify('+1 day')->format('Y-m-d'));
-                $logger->info('Generation history backfill reached the data horizon at ' . $cursor->format('Y-m-d') . '; will not probe further back.');
-                break;
+        }
+
+        if ($usageActive && $day < $usageCursor) {
+            $callsUsed++;
+            $result = fetchUsageDayAcrossDevices($clients, $day, $logger);
+            if ($result === false) {
+                $usageActive = false;
+            } elseif ($result === null) {
+                $usageActive = false;
+                $usageExhausted = true;
+                $logger->info('Usage history backfill reached the data horizon at ' . $day->format('Y-m-d') . '; will not probe further back.');
+            } else {
+                storeDay($day, $result, $timezone, false, 'upsertHistoricUsage');
+                $daysStored++;
+                $usageCursor = $day;
             }
-            storeDay($cursor, $result, $timezone, false, 'upsertHistoricGeneration');
-            $daysStored++;
-            fetchAndStoreUsageForDay($clients, $cursor, $timezone, false, $logger);
         }
     }
 
-    return ['ok' => true, 'message' => "Generation history: fetched $daysStored day(s)."];
+    setHistoryBackfillLimit('generation', $genExhausted ? new DateTimeImmutable(HISTORY_BACKFILL_EPOCH) : $genCursor);
+    setHistoryBackfillLimit('usage', $usageExhausted ? new DateTimeImmutable(HISTORY_BACKFILL_EPOCH) : $usageCursor);
+
+    return $daysStored;
 }
 
 /**

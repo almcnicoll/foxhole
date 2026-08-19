@@ -704,6 +704,157 @@ $hour3 = new DateTimeImmutable('2026-01-05 09:00', $londonTzForSolar);
 upsertHistoricUsage($hour3, $hour3->modify('+1 hour'), 0.8, $pushedAt);
 $usageRows = getHistoricGeneration($hour3, $hour3->modify('+1 hour'));
 check($usageRows[0]['usage_kwh'] === 0.8 && $usageRows[0]['generation_kwh'] === null, 'usage_kwh upserts independently, same non-clobbering pattern as forecast_kwh (GitHub issue #5)');
+check(
+    getHistoricUsageBounds()['earliest']->getTimestamp() === $hour3->getTimestamp() && getHistoricUsageBounds()['latest']->getTimestamp() === $hour3->getTimestamp(),
+    'getHistoricUsageBounds() mirrors getHistoricGenerationBounds() but for usage_kwh — only the usage row counts, not the earlier generation-only ones',
+);
+
+// --- Store: per-variable history backfill limits (independent generation/usage backfill) ---
+check(getHistoryBackfillLimit('generation') === null, 'no generation backfill limit set yet, and no legacy setting to fall back to');
+check(getHistoryBackfillLimit('usage') === null, 'no usage backfill limit set yet either');
+setHistoryBackfillLimit('generation', new DateTimeImmutable('2024-03-15'));
+check(getHistoryBackfillLimit('generation')->format('Y-m-d') === '2024-03-15', 'a set generation backfill limit round-trips');
+check(getHistoryBackfillLimit('usage') === null, 'setting generation\'s limit leaves usage\'s independent and untouched');
+setHistoryBackfillLimit('usage', new DateTimeImmutable(HISTORY_BACKFILL_EPOCH));
+check(getHistoryBackfillLimit('usage')->format('Y-m-d') === HISTORY_BACKFILL_EPOCH, 'the epoch sentinel round-trips like any other date');
+
+// A pre-existing install that already exhausted the old, single, generation-only setting
+// must read as exhausted under the new per-variable scheme too — mapped straight to the
+// epoch sentinel, not the old setting's own recorded horizon day (see
+// getHistoryBackfillLimit()'s doc comment for why the exact day isn't preserved). Run in a
+// separate throwaway DB (same isolation pattern the usage_kwh ALTER TABLE migration test
+// above uses) so writing the legacy setting here can't leak into any other test's state.
+$legacyDbPath = sys_get_temp_dir() . '/foxhole_self_check_' . getmypid() . '_legacy_backfill.sqlite';
+@unlink($legacyDbPath);
+db($legacyDbPath);
+setSetting('history_backfill_exhausted_before', '2023-01-01');
+$migratedLimit = getHistoryBackfillLimit('generation');
+check($migratedLimit !== null && $migratedLimit->format('Y-m-d') === HISTORY_BACKFILL_EPOCH, 'the old history_backfill_exhausted_before setting falls back to the epoch sentinel for generation specifically, not its own recorded day (2023-01-01)');
+check(getHistoryBackfillLimit('usage') === null, 'the old generation-only setting has no bearing on usage\'s own limit');
+@unlink($legacyDbPath);
+db($testDbPath); // switch back to the main throwaway DB for everything below
+
+// --- HistoryFetcher: backfillHistoryBackward() — independent generation/usage backfill
+// (user-requested), exercised with a scripted FoxessClient so the tricky "skip an
+// already-covered variable until the walk reaches its own frontier, shared call budget,
+// each variable stops independently on its own error/exhaustion" logic can be verified
+// without a live FoxESS connection. Throws for any (day, variable) pair not explicitly
+// scripted, so an assertion failure here usually means the code under test made an
+// unexpected call, not just a wrong one.
+class ScriptedHistoryFoxessClient extends FoxessClient
+{
+    public array $generationCalls = [];
+    public array $usageCalls = [];
+
+    /** @param array<string, array|null|'ERROR'> $generationByDate 'Y-m-d' => hourly kWh array, null (NO_DATA), or 'ERROR' */
+    public function __construct(private readonly array $generationByDate, private readonly array $usageByDate)
+    {
+        parent::__construct('key', 'SN-HIST-TEST', 'https://example.invalid');
+    }
+
+    public function getGenerationReport(int $year, int $month, int $day): ?array
+    {
+        $key = sprintf('%04d-%02d-%02d', $year, $month, $day);
+        $this->generationCalls[] = $key;
+        if (!array_key_exists($key, $this->generationByDate)) {
+            throw new FoxessPushException("unscripted generation call for $key — test expected this day to be skipped");
+        }
+        $v = $this->generationByDate[$key];
+        if ($v === 'ERROR') {
+            throw new FoxessPushException('simulated transient error');
+        }
+        return $v;
+    }
+
+    public function getUsageReport(int $year, int $month, int $day): ?array
+    {
+        $key = sprintf('%04d-%02d-%02d', $year, $month, $day);
+        $this->usageCalls[] = $key;
+        if (!array_key_exists($key, $this->usageByDate)) {
+            throw new FoxessPushException("unscripted usage call for $key — test expected this day to be skipped");
+        }
+        $v = $this->usageByDate[$key];
+        if ($v === 'ERROR') {
+            throw new FoxessPushException('simulated transient error');
+        }
+        return $v;
+    }
+}
+
+$histTz = new DateTimeZone('Europe/London');
+$histToday = new DateTimeImmutable('2026-02-15', $histTz);
+$histLogger = new Logger(sys_get_temp_dir() . '/foxhole_self_check_history.log');
+
+// Both already exhausted: must return immediately, making zero API calls at all.
+setHistoryBackfillLimit('generation', new DateTimeImmutable(HISTORY_BACKFILL_EPOCH));
+setHistoryBackfillLimit('usage', new DateTimeImmutable(HISTORY_BACKFILL_EPOCH));
+$bothDoneClient = new ScriptedHistoryFoxessClient([], []); // throws on any call
+check(
+    backfillHistoryBackward(['SN' => $bothDoneClient], $histToday, $histTz, $histLogger) === 0,
+    'both variables already exhausted (epoch sentinel) short-circuits to zero days stored',
+);
+check($bothDoneClient->generationCalls === [] && $bothDoneClient->usageCalls === [], 'and makes no API calls at all — the exhausted state alone is enough to know there is nothing left to do');
+
+// The core scenario this feature exists for: generation already exhausted (the common case,
+// since generation backfill existed long before usage tracking did), usage still has real
+// backfilling left to do. Generation must never be called at all.
+setHistoryBackfillLimit('generation', new DateTimeImmutable(HISTORY_BACKFILL_EPOCH));
+setHistoryBackfillLimit('usage', new DateTimeImmutable('2026-02-10'));
+$usageOnlyClient = new ScriptedHistoryFoxessClient([], [
+    '2026-02-09' => array_fill(0, 24, 0.3),
+    '2026-02-08' => array_fill(0, 24, 0.3),
+    '2026-02-07' => array_fill(0, 24, 0.3),
+    '2026-02-06' => null, // usage's own horizon
+]);
+$usageOnlyStored = backfillHistoryBackward(['SN' => $usageOnlyClient], $histToday, $histTz, $histLogger);
+check($usageOnlyStored === 3, "3 usage days stored (Feb 7-9), generation untouched: got $usageOnlyStored");
+check($usageOnlyClient->generationCalls === [], 'generation is never called once its own limit is the epoch sentinel — the whole point of tracking it independently');
+check($usageOnlyClient->usageCalls === ['2026-02-09', '2026-02-08', '2026-02-07', '2026-02-06'], 'usage walks back day by day and stops the call after the one that discovers its own horizon: got ' . json_encode($usageOnlyClient->usageCalls));
+check(getHistoryBackfillLimit('generation')->format('Y-m-d') === HISTORY_BACKFILL_EPOCH, 'generation\'s limit is untouched by a call where it was never active');
+check(getHistoryBackfillLimit('usage')->format('Y-m-d') === HISTORY_BACKFILL_EPOCH, 'usage\'s limit is now the epoch sentinel too, having just discovered its own horizon');
+$usageStoredRow = getHistoricGeneration(new DateTimeImmutable('2026-02-07', $histTz), new DateTimeImmutable('2026-02-10', $histTz));
+check(count($usageStoredRow) === 3 * 24 && $usageStoredRow[0]['generation_kwh'] === null, 'the stored usage-only days have real usage_kwh but null generation_kwh — no NULL was upserted over a generation column that was simply never touched');
+
+// Skip-until-frontier: generation is further back (more advanced) than usage, so days
+// between the two limits must only ever call usage — generation only starts being called
+// once the walk actually reaches its own, earlier frontier. A day in the "usage only" range
+// (2026-01-03) is pre-seeded with an existing generation_kwh value to prove the independent
+// upsert never overwrites it with NULL just because this call didn't fetch generation for it.
+setHistoryBackfillLimit('generation', new DateTimeImmutable('2026-01-01'));
+setHistoryBackfillLimit('usage', new DateTimeImmutable('2026-01-05'));
+upsertHistoricGeneration(new DateTimeImmutable('2026-01-03 06:00', $histTz), new DateTimeImmutable('2026-01-03 07:00', $histTz), 9.9, $pushedAt);
+$frontierClient = new ScriptedHistoryFoxessClient(
+    ['2025-12-31' => null], // generation's own horizon, reached only once the walk gets there
+    [
+        '2026-01-04' => array_fill(0, 24, 0.2),
+        '2026-01-03' => array_fill(0, 24, 0.2),
+        '2026-01-02' => array_fill(0, 24, 0.2),
+        '2026-01-01' => array_fill(0, 24, 0.2),
+        '2025-12-31' => null, // usage's own horizon, reached at the same day here
+    ],
+);
+backfillHistoryBackward(['SN' => $frontierClient], $histToday, $histTz, $histLogger);
+check($frontierClient->generationCalls === ['2025-12-31'], 'generation is skipped for every day still within its already-confirmed range (down to and including 2026-01-01) and only actually called once the walk passes it: got ' . json_encode($frontierClient->generationCalls));
+check($frontierClient->usageCalls === ['2026-01-04', '2026-01-03', '2026-01-02', '2026-01-01', '2025-12-31'], 'usage is called for every day it still needs, including the ones generation already has: got ' . json_encode($frontierClient->usageCalls));
+$preSeededRow = getHistoricGeneration(new DateTimeImmutable('2026-01-03 06:00', $histTz), new DateTimeImmutable('2026-01-03 07:00', $histTz));
+check(count($preSeededRow) === 1 && $preSeededRow[0]['generation_kwh'] === 9.9 && $preSeededRow[0]['usage_kwh'] === 0.2, 'backfilling usage for a day generation already covers preserves the pre-existing generation_kwh — the independent-upsert requirement');
+check(getHistoryBackfillLimit('generation')->format('Y-m-d') === HISTORY_BACKFILL_EPOCH, 'generation reached its own horizon once the walk finally passed its frontier');
+check(getHistoryBackfillLimit('usage')->format('Y-m-d') === HISTORY_BACKFILL_EPOCH, 'usage reached its own horizon on the same day here');
+
+// A transient error (not genuine exhaustion) on one variable must stop only that variable
+// for this call, without recording it as exhausted — the failed day is retried next time,
+// same as the pre-existing single-variable behaviour this replaces.
+setHistoryBackfillLimit('generation', new DateTimeImmutable('2026-01-10'));
+setHistoryBackfillLimit('usage', new DateTimeImmutable('2026-01-10'));
+$errorClient = new ScriptedHistoryFoxessClient(
+    ['2026-01-09' => array_fill(0, 24, 0.1), '2026-01-08' => array_fill(0, 24, 0.1), '2026-01-07' => null],
+    ['2026-01-09' => 'ERROR'],
+);
+backfillHistoryBackward(['SN' => $errorClient], $histToday, $histTz, $histLogger);
+check($errorClient->usageCalls === ['2026-01-09'], 'usage stops immediately after its transient error, never trying an earlier day this call');
+check(getHistoryBackfillLimit('usage')->format('Y-m-d') === '2026-01-10', 'usage\'s limit is unchanged by a transient error — the failed day was never confirmed, so the frontier does not advance past it');
+check($errorClient->generationCalls === ['2026-01-09', '2026-01-08', '2026-01-07'], 'generation is entirely unaffected by usage\'s error and keeps walking back on its own, reaching its own horizon at 2026-01-07');
+check(getHistoryBackfillLimit('generation')->format('Y-m-d') === HISTORY_BACKFILL_EPOCH, 'generation\'s limit reaches the epoch sentinel independently, regardless of usage\'s unrelated failure');
 
 // --- Store: historic_generation.usage_kwh is added via a real ALTER TABLE on an existing
 // install, preserving pre-existing rows — this table is real history, so this must never

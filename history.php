@@ -128,7 +128,12 @@ foreach ($buckets as $b) {
 }
 
 $bounds = getHistoricGenerationBounds();
-$exhaustedBefore = getSetting('history_backfill_exhausted_before');
+// Generation specifically — this page only ever displays generation/forecast, not usage
+// (see HalfHourlyUsageEstimator for where usage history actually gets consumed). Generation
+// and usage now backfill independently (Store::getHistoryBackfillLimit()) but share the same
+// "reached the horizon" sentinel (Store::HISTORY_BACKFILL_EPOCH).
+$generationLimit = getHistoryBackfillLimit('generation');
+$generationExhausted = $generationLimit !== null && $generationLimit->format('Y-m-d') <= HISTORY_BACKFILL_EPOCH;
 
 /**
  * Same hand-rolled inline-SVG approach as index.php's renderPriceChart() (see that
@@ -333,7 +338,7 @@ $fetchedMsg = (string) ($_GET['msg'] ?? '');
     <?php else: ?>
     Generation history covers <?= htmlspecialchars($bounds['earliest']->setTimezone($timezone)->format('j M Y')) ?>
     to <?= htmlspecialchars($bounds['latest']->setTimezone($timezone)->format('j M Y')) ?>.
-    <?= $exhaustedBefore !== null
+    <?= $generationExhausted
         ? 'Backfill complete — FoxESS has no earlier data to fetch.'
         : 'Still backfilling further back — click "Fetch history now" (or just wait for the next scheduled run) to advance it.' ?>
     <?php endif; ?>

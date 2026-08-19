@@ -494,6 +494,57 @@ function getHistoricGenerationBounds(): array
     ];
 }
 
+/** @return array{earliest: ?DateTimeImmutable, latest: ?DateTimeImmutable} same as getHistoricGenerationBounds(), for usage_kwh instead — used as HistoryFetcher's seed for usage's own independent backfill limit (see getHistoryBackfillLimit()) the first time it's ever tracked. */
+function getHistoricUsageBounds(): array
+{
+    $row = db()->query('SELECT MIN(slot_from) AS earliest, MAX(slot_from) AS latest FROM historic_generation WHERE usage_kwh IS NOT NULL')->fetch(PDO::FETCH_ASSOC);
+    return [
+        'earliest' => $row['earliest'] !== null ? new DateTimeImmutable($row['earliest']) : null,
+        'latest' => $row['latest'] !== null ? new DateTimeImmutable($row['latest']) : null,
+    ];
+}
+
+/** Sentinel written by setHistoryBackfillLimit() once a variable's backfill genuinely runs out of data to fetch — see getHistoryBackfillLimit()'s doc comment for why the exact horizon day isn't worth keeping past that point. */
+const HISTORY_BACKFILL_EPOCH = '1970-01-01';
+
+/**
+ * The earliest day generation's or usage's history backfill (HistoryFetcher.php) has been
+ * confirmed back to — null if that variable's backfill has never run under this (per-variable)
+ * tracking scheme yet, in which case the caller seeds a starting point itself (from
+ * getHistoricGenerationBounds()/getHistoricUsageBounds()'s own 'earliest', or today if nothing
+ * is stored at all). Once FoxESS genuinely has no data at all for a day, HistoryFetcher sets
+ * this to HISTORY_BACKFILL_EPOCH (1970-01-01) instead of that day — a value guaranteed to
+ * never be the *later* of the two variables' limits again, which is what lets
+ * HistoryFetcher's shared walk-back naturally stop bothering with an exhausted variable and
+ * spend its whole day-budget on the other one instead (see that file's own doc comment).
+ *
+ * $variable is 'generation' or 'usage'. 'generation' has one extra fallback: an install that
+ * exhausted its backfill under the old design (a single, generation-only
+ * `history_backfill_exhausted_before` setting, predating independent per-variable tracking)
+ * keeps that exhausted state — mapped straight to the epoch sentinel, not the old setting's
+ * actual recorded horizon day, same reasoning as a freshly-discovered exhaustion. This is a
+ * read-time-only fallback (same pattern `foxess_device_sns`' fallback to the old singular
+ * `foxess_device_sn` key already uses) — it becomes permanent the next time
+ * setHistoryBackfillLimit('generation', ...) actually runs, which happens automatically
+ * whenever usage still has backfilling left to do even though generation doesn't.
+ */
+function getHistoryBackfillLimit(string $variable): ?DateTimeImmutable
+{
+    $value = getSetting("history_{$variable}_backfill_limit");
+    if ($value !== null) {
+        return new DateTimeImmutable($value);
+    }
+    if ($variable === 'generation' && getSetting('history_backfill_exhausted_before') !== null) {
+        return new DateTimeImmutable(HISTORY_BACKFILL_EPOCH);
+    }
+    return null;
+}
+
+function setHistoryBackfillLimit(string $variable, DateTimeImmutable $limit): void
+{
+    setSetting("history_{$variable}_backfill_limit", $limit->format('Y-m-d'));
+}
+
 /**
  * @return array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, generation_kwh: ?float, forecast_kwh: ?float, usage_kwh: ?float}>
  *         Raw hourly rows in [$from, $to), ascending. Aggregation into day/week/month/year
