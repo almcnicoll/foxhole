@@ -734,10 +734,13 @@ split. Cost per transition is net grid flow × that slot's import price (net
 import) or export price (net export, i.e. a negative cost/credit). A
 forward Bellman recursion fills a `cost`/`backpointer` grid across the
 whole window in one pass; the terminal state prefers the minimum-cost
-end-of-horizon bin that meets `modelling_min_end_soc_pct`, falling back to
-the global minimum-cost end state (flagged in the summary, not thrown) on
-the rare horizon too tight to meet it exactly — reconstruction then walks
-the backpointers from that terminal bin back to the known starting SoC.
+end-of-horizon bin that meets `modelling_min_end_soc_pct` — with SoC held
+above that floor credited at the horizon's own cheapest import rate (see
+"A second live-verification bug" below for why that credit exists at all)
+— falling back to the global minimum-cost end state (flagged in the
+summary, not thrown) on the rare horizon too tight to meet it exactly;
+reconstruction then walks the backpointers from that terminal bin back to
+the known starting SoC.
 Contiguous same-action slots are merged into absolute intervals the same
 way the other schedulers merge contiguous slots, just over real instants
 instead of a single day's array indices, since a merged run can itself span
@@ -758,6 +761,38 @@ unavailable) — satisfying the issue's "re-evaluate on a rolling basis"
 requirement for free, since nothing needs to persist state between runs to
 make that work, same reasoning issue #4 already established for why
 recomputing fresh each run is safe for the other two schedulers.
+
+*A real bug found only after deployment, against real Octopus rates: the
+DP would force-discharge a fully-charged battery down to the configured
+minimum end-of-horizon SoC purely to sell the excess at a flat, low fixed
+export rate — even with nothing to offset and that stored energy plainly
+worth more than the export price once you account for what it costs to buy
+back.* Root cause: `pickTerminalBin()` originally scored candidate
+end-of-horizon bins on raw cost alone, treating any SoC held above
+`modelling_min_end_soc_pct` as worth precisely nothing — so *any*
+non-negative export price looked like free money, and the optimiser
+happily "spent down" every kWh it wasn't strictly required to keep,
+regardless of how low the export price actually was. This is the classic
+finite-horizon battery-arbitrage trap: without a terminal value function,
+an optimiser that re-solves a rolling window fresh every run has no reason
+to hold energy past the edge of what it can currently see. Fixed by
+crediting SoC held above the floor at the horizon's own cheapest import
+rate — a self-contained, no-new-config proxy for "the least this energy
+could plausibly cost to replace" — when choosing which terminal bin to
+prefer; genuine self-consumption offsetting (avoiding an expensive import
+right now) is untouched, since that was never routed through
+`pickTerminalBin()` in the first place. A secondary tiebreaker (prefer the
+lower *raw*-cost bin among ties on adjusted cost) was needed alongside
+this: a near-flat market can leave several end states genuinely
+economically indifferent once credited at the same reference price, and
+without the tiebreaker the DP would pick whichever tied bin the scan
+happened to reach last — occasionally a real but pointless no-op force
+action — rather than the cheaper, simpler path. Both fixes are covered by
+regression tests built at the production-default `soc_bin_kwh` (0.1) — an
+earlier draft of the second test used a much coarser bin size and
+produced a *different*, misleading failure purely from compounding
+discretisation rounding at that scale, not the bug itself; worth
+remembering if tests here ever seem to fail for the "wrong" reason again.
 
 **A real bug found via live verification, not by inspection: SQLite TEXT
 comparison of ISO 8601 datetime strings isn't chronologically correct

@@ -166,7 +166,10 @@ class ModellingScheduleBuilder
         }
 
         $minEndSocKwh = $capacityKwh * ((int) ($this->modellingConfig['min_end_soc_pct'] ?? 0)) / 100;
-        [$bestBin, $constraintRelaxed] = $this->pickTerminalBin($cost[$n], $binKwh, $numBins, $minEndSocKwh);
+        // Stored energy above the floor is valued at this horizon's own cheapest import
+        // rate — see pickTerminalBin()'s doc comment for why that's necessary at all.
+        $cheapestImportRate = min($importRates);
+        [$bestBin, $constraintRelaxed] = $this->pickTerminalBin($cost[$n], $binKwh, $numBins, $minEndSocKwh, $cheapestImportRate);
 
         // --- Reconstruct the action sequence via backpointers ---
         $actionByIndex = [];
@@ -279,24 +282,55 @@ class ModellingScheduleBuilder
      * than throwing — SelfUse the whole way is always reachable, so some finite-cost state
      * always exists.
      *
+     * A real bug found via live verification (not by inspection): scoring candidate bins on
+     * $terminalCosts alone treats any SoC above the floor as worth exactly nothing — so
+     * whenever the DP could reach the floor exactly, it would happily force-discharge every
+     * kWh above it "for free" at whatever the export price was, even a low flat rate well
+     * below what that energy would cost to buy back later, because holding it carried no
+     * offsetting value in the comparison. $referencePrice (the horizon's own cheapest import
+     * rate — the least this energy could plausibly be replaced for) is credited against each
+     * candidate bin's cost per kWh held above the floor, so a discharge is only preferred
+     * when the price actually received for it beats that replacement cost, not merely
+     * whenever it's non-negative. Genuine self-consumption offsetting (avoiding an
+     * expensive import right now) is untouched — this only discourages exporting stored
+     * capacity beyond that for a price that isn't actually worth it.
+     *
      * @return array{0: int, 1: bool} [bestBin, constraintWasRelaxed]
      */
-    private function pickTerminalBin(array $terminalCosts, Closure $binKwh, int $numBins, float $minEndSocKwh): array
+    private function pickTerminalBin(array $terminalCosts, Closure $binKwh, int $numBins, float $minEndSocKwh, float $referencePrice): array
     {
-        $bestBin = null;
-        $bestCost = INF;
+        // Pass 1: the lowest adjusted cost among feasible bins.
+        $bestAdjustedCost = INF;
         for ($b = 0; $b < $numBins; $b++) {
             if ($terminalCosts[$b] === INF || $binKwh($b) < $minEndSocKwh - 1e-9) {
                 continue;
             }
-            if ($terminalCosts[$b] < $bestCost) {
-                $bestCost = $terminalCosts[$b];
+            $adjustedCost = $terminalCosts[$b] - ($binKwh($b) - $minEndSocKwh) * $referencePrice;
+            $bestAdjustedCost = min($bestAdjustedCost, $adjustedCost);
+        }
+        // Pass 2: among bins tied on that adjusted cost, prefer the lower *raw* cost. A
+        // near-flat market (or one that happens to match $referencePrice exactly) can leave
+        // several bins genuinely tied on adjusted cost — e.g. "hold this kWh" vs "spend it
+        // and buy an equivalent kWh back" cost the same when the buy-back price equals
+        // $referencePrice. Without this tiebreaker the loop would just keep whichever bin it
+        // reaches last, which can be an arbitrary no-op force action that costs real money
+        // for no benefit instead of the cheaper actual path (typically SelfUse).
+        $bestBin = null;
+        $bestRawCost = INF;
+        for ($b = 0; $b < $numBins; $b++) {
+            if ($terminalCosts[$b] === INF || $binKwh($b) < $minEndSocKwh - 1e-9) {
+                continue;
+            }
+            $adjustedCost = $terminalCosts[$b] - ($binKwh($b) - $minEndSocKwh) * $referencePrice;
+            if ($adjustedCost < $bestAdjustedCost + 1e-9 && $terminalCosts[$b] < $bestRawCost) {
+                $bestRawCost = $terminalCosts[$b];
                 $bestBin = $b;
             }
         }
         if ($bestBin !== null) {
             return [$bestBin, false];
         }
+        $bestCost = INF;
         for ($b = 0; $b < $numBins; $b++) {
             if ($terminalCosts[$b] < $bestCost) {
                 $bestCost = $terminalCosts[$b];

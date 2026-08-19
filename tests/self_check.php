@@ -1178,6 +1178,35 @@ check(
     'starting exactly at the reserve floor with no way to actually discharge, a cost tie between ForceDischarge and SelfUse resolves to SelfUse (no pushed group), not a no-op ForceDischarge: got ' . json_encode(array_column($tieResult['intervals'], 'workMode')),
 );
 
+// A second real bug found via live verification against actual Agile prices (production
+// data, not this fixture): a battery starting full, with a flat/fixed export price well
+// below the day's import rate, was force-discharging down to the minimum end-of-horizon
+// SoC purely to "sell" the stored energy at that flat export rate — even though nothing
+// needed offsetting (self-use alone comfortably covers usage without ever touching the
+// grid) and that stored energy is worth strictly more than the flat export rate once you
+// account for what it would cost to buy it back later. Root cause: pickTerminalBin() only
+// compared *ending SoC ≥ floor*, treating anything held above the floor as worth nothing —
+// so any non-negative export price looked like free money. Fixed by crediting SoC held
+// above the floor at the horizon's own cheapest import rate (see pickTerminalBin()'s doc
+// comment) — a proxy for what that energy would actually cost to replace.
+$dumpBattery = ['capacity_kwh' => 10.0, 'max_charge_kw' => 3.0, 'max_discharge_kw' => 3.0, 'min_soc_on_grid' => 15, 'reserve_soc' => 15, 'round_trip_efficiency_pct' => 100.0];
+$dumpModelling = ['soc_bin_kwh' => 0.1, 'min_end_soc_pct' => 20];
+$dumpImportRates = array_fill(0, 10, 25.0);
+$dumpExportRates = array_fill(0, 10, 12.0); // flat, well below import — the reported scenario
+$dumpImportSlots = buildSlotsFrom($dumpImportRates, new DateTimeImmutable('2026-08-19 12:00:00', $mTz));
+$dumpExportSlots = buildSlotsFrom($dumpExportRates, new DateTimeImmutable('2026-08-19 12:00:00', $mTz));
+$dumpUsage = array_fill(0, 10, 0.3); // modest, well below the 1.5kWh/slot rated discharge
+$dumpResult = (new ModellingScheduleBuilder($mStrategy, $dumpBattery, $dumpModelling))->build($dumpImportSlots, $dumpExportSlots, $dumpUsage, null, 100.0);
+check(
+    count($dumpResult['intervals']) === 0,
+    'a fully-charged battery with a flat export rate below import stays on self-use rather than force-discharging to sell stored energy at a loss: got ' . json_encode(array_column($dumpResult['intervals'], 'workMode')),
+);
+check(
+    $dumpResult['finalSocPercent'] > 20.0 + 1.0,
+    "self-use alone ends well above the 20% floor (usage is fully covered by the 100%-charged battery) rather than being drained down to it: got {$dumpResult['finalSocPercent']}%",
+);
+check(abs($dumpResult['totalCostPence'] - 0.0) < 0.5, "self-use alone costs nothing (no grid import, no needless export): got {$dumpResult['totalCostPence']}p");
+
 // The optimiser's own reported cost must genuinely beat a naive always-idle baseline
 // (every slot just imports exactly what covers usage at that slot's own price) — proves
 // it's actually solving, not just producing *a* valid schedule.
