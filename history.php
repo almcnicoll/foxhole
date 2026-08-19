@@ -128,12 +128,17 @@ foreach ($buckets as $b) {
 }
 
 $bounds = getHistoricGenerationBounds();
-// Generation specifically — this page only ever displays generation/forecast, not usage
-// (see HalfHourlyUsageEstimator for where usage history actually gets consumed). Generation
-// and usage now backfill independently (Store::getHistoryBackfillLimit()) but share the same
-// "reached the horizon" sentinel (Store::HISTORY_BACKFILL_EPOCH).
+// This page's chart/table only ever show generation/forecast, not usage (see
+// HalfHourlyUsageEstimator for where usage history actually gets consumed) — but generation
+// and usage now backfill independently (Store::getHistoryBackfillLimit()), so the coverage
+// summary below reports both, otherwise usage's own backfill progress would be invisible
+// anywhere in the UI. Both share the same "reached the horizon" sentinel
+// (Store::HISTORY_BACKFILL_EPOCH).
 $generationLimit = getHistoryBackfillLimit('generation');
 $generationExhausted = $generationLimit !== null && $generationLimit->format('Y-m-d') <= HISTORY_BACKFILL_EPOCH;
+$usageBounds = getHistoricUsageBounds();
+$usageLimit = getHistoryBackfillLimit('usage');
+$usageExhausted = $usageLimit !== null && $usageLimit->format('Y-m-d') <= HISTORY_BACKFILL_EPOCH;
 
 /**
  * Same hand-rolled inline-SVG approach as index.php's renderPriceChart() (see that
@@ -339,6 +344,16 @@ $fetchedMsg = (string) ($_GET['msg'] ?? '');
     Generation history covers <?= htmlspecialchars($bounds['earliest']->setTimezone($timezone)->format('j M Y')) ?>
     to <?= htmlspecialchars($bounds['latest']->setTimezone($timezone)->format('j M Y')) ?>.
     <?= $generationExhausted
+        ? 'Backfill complete — FoxESS has no earlier data to fetch.'
+        : 'Still backfilling further back — click "Fetch history now" (or just wait for the next scheduled run) to advance it.' ?>
+    <?php endif; ?>
+    <br>
+    <?php if ($usageBounds['earliest'] === null): ?>
+    No usage history fetched yet.
+    <?php else: ?>
+    Usage history covers <?= htmlspecialchars($usageBounds['earliest']->setTimezone($timezone)->format('j M Y')) ?>
+    to <?= htmlspecialchars($usageBounds['latest']->setTimezone($timezone)->format('j M Y')) ?>.
+    <?= $usageExhausted
         ? 'Backfill complete — FoxESS has no earlier data to fetch.'
         : 'Still backfilling further back — click "Fetch history now" (or just wait for the next scheduled run) to advance it.' ?>
     <?php endif; ?>
