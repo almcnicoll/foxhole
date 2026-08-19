@@ -1207,6 +1207,47 @@ check(
 );
 check(abs($dumpResult['totalCostPence'] - 0.0) < 0.5, "self-use alone costs nothing (no grid import, no needless export): got {$dumpResult['totalCostPence']}p");
 
+// A third real bug, found chasing the second one against real Agile prices with a real
+// solar forecast: even after capping ForceDischarge's export at that reference price, a
+// near-full battery (minimal headroom) with an early solar surplus was still being
+// force-discharged — not to sell stored energy at a bad price directly, but to *manufacture
+// headroom* so more of the forecast solar would land in the battery instead of spilling to
+// the flat export rate. That's a real edge, but it's a bet on the solar forecast being
+// accurate, not a price the optimiser actually knows — and self-use's own natural
+// absorption already captures a solar surplus for free whenever there's genuine headroom,
+// so nothing was actually being gained here that self-use wouldn't already do. Root cause:
+// the cap added for the second bug only capped the *discharge* amount at zero when selling
+// wasn't worthwhile — it didn't make ForceDischarge absorb the surplus into the battery the
+// way self-use does, so even a "capped to zero" ForceDischarge still quietly dumped a
+// sliver of solar as export instead of storing it, coming out very slightly cheaper than
+// self-use and winning the tie. Fixed by making the no-sell/surplus case degenerate to
+// self-use's own absorption formula exactly (see transitionForceDischarge()'s doc comment).
+$solarBattery = ['capacity_kwh' => 10.0, 'max_charge_kw' => 3.0, 'max_discharge_kw' => 3.0, 'min_soc_on_grid' => 15, 'reserve_soc' => 15, 'round_trip_efficiency_pct' => 100.0];
+$solarModelling = ['soc_bin_kwh' => 0.1, 'min_end_soc_pct' => 20];
+// A real Agile day's shape (not flat, and a fuller 20-slot/10h horizon) is what actually
+// triggers this bug — a flat rate, or a too-short horizon, gives the DP no reason to
+// manufacture headroom at all, so smaller/flatter drafts of this fixture passed even on the
+// unfixed code, proving nothing. This is the exact rate sequence pulled live from Octopus
+// that first reproduced the bug against production data.
+$solarImportRates = [22.2495, 22.1235, 22.2495, 22.2495, 22.323, 22.533, 37.443, 38.178, 40.173, 41.8215, 44.6775, 46.221, 35.343, 35.343, 35.343, 35.1225, 35.133, 32.613, 32.613, 29.736];
+$solarExportRates = array_fill(0, 20, 12.0); // flat, well below import
+$solarStart = new DateTimeImmutable('2026-08-19 13:00:00', $mTz);
+$solarImportSlots = buildSlotsFrom($solarImportRates, $solarStart);
+$solarExportSlots = buildSlotsFrom($solarExportRates, $solarStart);
+$solarUsage = array_fill(0, 20, 7.5 / 20);
+// Declining solar (afternoon into evening), summing to ~11.9kWh — the live forecast total.
+$solarShape = [1.4, 1.3, 1.2, 1.1, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.05, 0.02, 0.0, 0.0, 0.0, 0.0];
+$solarScale = 11.9 / array_sum($solarShape);
+$solarForecastSlots = [];
+foreach ($solarImportSlots as $i => $slot) {
+    $solarForecastSlots[] = ['from' => $slot['from'], 'to' => $slot['to'], 'watt_hours' => $solarShape[$i] * $solarScale * 1000.0];
+}
+$solarResult = (new ModellingScheduleBuilder($mStrategy, $solarBattery, $solarModelling))->build($solarImportSlots, $solarExportSlots, $solarUsage, $solarForecastSlots, 99.0);
+check(
+    count($solarResult['intervals']) === 0,
+    'a near-full battery with an early solar surplus and a flat export rate below import stays on self-use — no force-discharge to manufacture headroom for forecast solar: got ' . json_encode(array_column($solarResult['intervals'], 'workMode')),
+);
+
 // The optimiser's own reported cost must genuinely beat a naive always-idle baseline
 // (every slot just imports exactly what covers usage at that slot's own price) — proves
 // it's actually solving, not just producing *a* valid schedule.

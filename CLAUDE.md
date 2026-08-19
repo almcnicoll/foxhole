@@ -794,6 +794,45 @@ produced a *different*, misleading failure purely from compounding
 discretisation rounding at that scale, not the bug itself; worth
 remembering if tests here ever seem to fail for the "wrong" reason again.
 
+*A third bug, found chasing the second one with a real solar forecast
+added back in: the terminal-value credit above stops the DP selling stored
+energy at a bad price to satisfy the end-of-horizon floor, but it doesn't
+stop the DP selling energy* mid-*horizon at a bad price if doing so
+manufactures headroom that a **forecast** solar surplus later refills —
+the terminal credit only ever looks at the single ending state, so a path
+that sells cheap now and gets "topped back up for free" by solar a few
+slots later can still look better in the raw ledger than never having sold
+at all.* This is a real edge a genuine solver can find, but it's a bet on
+solar forecast accuracy, not on a price the DP actually knows — and
+user-rejected on exactly that basis: force-discharge should only ever be
+justified by a price the optimiser can already see (either the immediate
+export is itself worth taking, or a cheaper rebuy is reachable within the
+same horizon), never by speculating that a forecast will bail out an
+otherwise-unjustified sale. Fixed in `transitionForceDischarge()` directly
+rather than only at the terminal boundary: discharge may only exceed what
+a slot's own `usage - solar` needs when `exportPrice >= ` the horizon's
+cheapest import rate (the same reference price the terminal fix already
+established) — otherwise it's capped at exactly that need, same as
+self-consumption offsetting, never manufacturing a deliberate export.
+Getting this right also exposed a smaller sibling bug: when the cap forces
+zero discharge and there's a solar surplus, the transition must degenerate
+to *exactly* self-use's own absorption formula (crediting the surplus into
+the battery, not just discharging nothing) — an earlier version of this
+fix capped the discharge amount correctly but kept the plain
+`usage - solar - energyOut` formula regardless, which silently failed to
+credit any surplus into the battery and so still came out fractionally
+cheaper than self-use by dumping a sliver of solar as export instead of
+storing it, quietly winning what should have been an exact tie. Reproduced
+against the real Octopus rates and forecast totals that first surfaced it
+(a near-full battery, a genuine solar forecast, and export flat well below
+import) — this specific fixture is what `tests/self_check.php`'s third
+regression test uses, after a smaller/flatter synthetic fixture was tried
+first and found not to reproduce the bug at all, i.e. it would have passed
+on the broken code too. Worth remembering: a regression test for a DP bug
+like this is only as good as its price/solar shape — flat or too-short
+fixtures can fail to exercise the exact multi-step trade the bug depends
+on, and will pass regardless of whether the fix is actually present.
+
 **A real bug found via live verification, not by inspection: SQLite TEXT
 comparison of ISO 8601 datetime strings isn't chronologically correct
 unless every value shares the same UTC offset.** `price_slots.slot_from` is

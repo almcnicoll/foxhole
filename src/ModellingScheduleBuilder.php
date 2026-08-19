@@ -99,6 +99,11 @@ class ModellingScheduleBuilder
         $timezone = new DateTimeZone($this->strategyConfig['timezone'] ?? 'Europe/London');
         $importRates = array_column($importSlots, 'rate');
         $exportRates = $exportSlots !== null ? array_column($exportSlots, 'rate') : null;
+        // The least this horizon suggests a kWh could cost to replace — used both as the
+        // gate on ForceDischarge selling beyond what a slot's own usage needs (below) and
+        // to value SoC held above the floor when picking the terminal state (see
+        // pickTerminalBin()'s doc comment).
+        $cheapestImportRate = min($importRates);
 
         $capacityKwh = (float) ($this->batteryConfig['capacity_kwh'] ?? 0);
         $chargeKw = (float) ($this->batteryConfig['max_charge_kw'] ?? 0);
@@ -153,6 +158,8 @@ class ModellingScheduleBuilder
                         $capacityKwh,
                         $reserveSocKwh,
                         $minSocOnGridKwh,
+                        $exportPrice,
+                        $cheapestImportRate,
                     );
                     $stepCost = $netGridKwh >= 0 ? $netGridKwh * $importPrice : $netGridKwh * $exportPrice;
                     $totalCost = $cost[$t][$b] + $stepCost;
@@ -166,9 +173,6 @@ class ModellingScheduleBuilder
         }
 
         $minEndSocKwh = $capacityKwh * ((int) ($this->modellingConfig['min_end_soc_pct'] ?? 0)) / 100;
-        // Stored energy above the floor is valued at this horizon's own cheapest import
-        // rate — see pickTerminalBin()'s doc comment for why that's necessary at all.
-        $cheapestImportRate = min($importRates);
         [$bestBin, $constraintRelaxed] = $this->pickTerminalBin($cost[$n], $binKwh, $numBins, $minEndSocKwh, $cheapestImportRate);
 
         // --- Reconstruct the action sequence via backpointers ---
@@ -231,10 +235,12 @@ class ModellingScheduleBuilder
         float $capacityKwh,
         float $reserveSocKwh,
         float $minSocOnGridKwh,
+        float $exportPrice,
+        float $cheapestImportRate,
     ): array {
         return match ($action) {
             'ForceCharge' => $this->transitionForceCharge($socKwh, $usage, $solar, $chargeEnergyKwh, $efficiency, $capacityKwh),
-            'ForceDischarge' => $this->transitionForceDischarge($socKwh, $usage, $solar, $dischargeEnergyKwh, $reserveSocKwh),
+            'ForceDischarge' => $this->transitionForceDischarge($socKwh, $usage, $solar, $dischargeEnergyKwh, $reserveSocKwh, $capacityKwh, $exportPrice, $cheapestImportRate),
             default => $this->transitionSelfUse($socKwh, $usage, $solar, $capacityKwh, $minSocOnGridKwh),
         };
     }
@@ -248,10 +254,42 @@ class ModellingScheduleBuilder
         return [$newSoc, $netGrid];
     }
 
-    private function transitionForceDischarge(float $socKwh, float $usage, float $solar, float $dischargeEnergyKwh, float $reserveSocKwh): array
+    /**
+     * A real bug found via live verification: with no cap here, force-discharge would
+     * happily sell far more than a slot's own usage needed at whatever the (often low,
+     * flat) export price was, betting that the resulting headroom would just get refilled
+     * by *forecast* solar later in the horizon — a speculative bet on a forecast, not a
+     * price the DP actually knows, and precisely the kind of move that isn't honestly
+     * narratable as "the highest-value point to discharge" (it wasn't; the price alone
+     * didn't justify it). Reflects the user's own stated rule: force-discharge is only
+     * for genuinely profitable trades — either the export price itself is worth taking
+     * ($exportPrice >= $cheapestImportRate, i.e. selling now for at least as much as it
+     * would cost to buy an equivalent kWh back within this same horizon), or covering the
+     * slot's own usage, which self-use would do for free anyway but at rated power rather
+     * than the natural drift rate.
+     *
+     * When selling isn't worthwhile and there's a solar surplus (solar >= usage), this
+     * must degenerate to *exactly* self-use's own absorption formula, not just "discharge
+     * nothing" — an earlier version of this fix capped the discharge at zero here but kept
+     * the plain usage-solar-energyOut formula regardless, which silently skipped crediting
+     * any of that surplus into the battery (self-use would store what headroom allows) and
+     * so still came out very slightly cheaper than self-use by dumping a sliver of "free"
+     * headroom-worth of solar as export instead — a real, if small, instance of the same
+     * "must never beat self-use for no reason" bug the SelfUse-first action ordering above
+     * exists to prevent, just not an exact tie this time so that fix alone didn't catch it.
+     */
+    private function transitionForceDischarge(float $socKwh, float $usage, float $solar, float $dischargeEnergyKwh, float $reserveSocKwh, float $capacityKwh, float $exportPrice, float $cheapestImportRate): array
     {
+        $sellingIsWorthwhile = $exportPrice >= $cheapestImportRate;
+        $net = $solar - $usage;
+        if ($net >= 0 && !$sellingIsWorthwhile) {
+            $absorbed = min($net, max(0.0, $capacityKwh - $socKwh));
+            $newSoc = $socKwh + $absorbed;
+            $netGrid = -($net - $absorbed);
+            return [$newSoc, $netGrid];
+        }
         $available = max(0.0, $socKwh - $reserveSocKwh);
-        $energyOut = min($dischargeEnergyKwh, $available);
+        $energyOut = min($sellingIsWorthwhile ? $dischargeEnergyKwh : max(0.0, -$net), $available);
         $newSoc = max($reserveSocKwh, $socKwh - $energyOut);
         $netGrid = $usage - $solar - $energyOut;
         return [$newSoc, $netGrid];
