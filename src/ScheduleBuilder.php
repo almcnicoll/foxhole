@@ -317,18 +317,24 @@ class ScheduleBuilder
 
     /**
      * Like intervalsToGroups(), but for real DateTimeImmutable instants rather than
-     * minutes since a conceptual single day's midnight — used only by buildPushWindow(),
-     * whose window doesn't necessarily start at midnight, so "minutes since window start"
-     * would map to the wrong hour/minute-of-day (FoxESS's fields are literal local clock
-     * time, not elapsed time from some reference point). A real midnight instant already
-     * formats as hour 0 / minute 0 via DateTimeImmutable::format(), which happens to be
-     * exactly FoxESS's own "end of day" convention — no 24*60-\>0 wraparound special-case
-     * needed here, unlike intervalsToGroups() above.
+     * minutes since a conceptual single day's midnight — used by buildPushWindow(), whose
+     * window doesn't necessarily start at midnight, so "minutes since window start" would
+     * map to the wrong hour/minute-of-day (FoxESS's fields are literal local clock time,
+     * not elapsed time from some reference point). A real midnight instant already formats
+     * as hour 0 / minute 0 via DateTimeImmutable::format(), which happens to be exactly
+     * FoxESS's own "end of day" convention — no 24*60-\>0 wraparound special-case needed
+     * here, unlike intervalsToGroups() above.
+     *
+     * Public (not private) so Schedulers.php's buildModellingSchedule() can reuse it too —
+     * the modelling scheduler's own rolling horizon can cross midnight, so it already
+     * produces this same absolute-interval shape rather than calendar-day-relative groups,
+     * and splitting it into per-date storage needs the exact same instant-to-hour/minute
+     * conversion this method already does correctly (see GitHub issue #5).
      *
      * @param array<int, array{start: DateTimeImmutable, end: DateTimeImmutable, workMode: string, explanation: string}> $absoluteIntervals
      * @return array{groups: array, explanations: string[]}
      */
-    private function absoluteIntervalsToGroups(array $absoluteIntervals): array
+    public function absoluteIntervalsToGroups(array $absoluteIntervals): array
     {
         $chargeKw = (float) ($this->batteryConfig['max_charge_kw'] ?? 0);
         $dischargeKw = (float) ($this->batteryConfig['max_discharge_kw'] ?? 0);

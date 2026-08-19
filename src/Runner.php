@@ -204,21 +204,23 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
         $schedulerName = SCHEDULER_DEFINITIONS[$schedulerId]['name'] ?? $schedulerId;
         $logger->info("Scheduler: $schedulerName" . ($forceSchedulerId !== null ? ' (forced via CLI flag)' : ' (from settings)') . ', covering ' . implode(', ', array_keys($slotsByDate)) . '.');
 
-        // The forecast-weighted scheduler is the only one that currently needs solar
-        // forecast, live battery SoC or an estimated usage profile — gathered here rather
-        // than unconditionally so a run using any other scheduler doesn't pay for a live
-        // FoxESS SoC call it has no use for. Gathered once for the whole run, not per
-        // day: the live SoC reading only seeds day one (buildMultiDaySchedule() carries
-        // each day's own projected finalSocPercent into the next), and the day-length
-        // difference between adjacent calendar days is immaterial to the usage estimate.
-        $forecastExtras = [];
-        if ($schedulerId === 'forecast_weighted_price_model') {
+        // The forecast-weighted and modelling schedulers are the only ones that currently
+        // need solar forecast or live battery SoC — gathered here rather than
+        // unconditionally so a run using the classic scheduler doesn't pay for a live
+        // FoxESS SoC call it has no use for. Gathered once for the whole run, not per day:
+        // the live SoC reading only seeds day one (buildMultiDaySchedule() carries each
+        // day's own projected finalSocPercent into the next; the modelling scheduler
+        // always re-solves its whole rolling window fresh, so it only ever needs this
+        // once anyway), and the day-length difference between adjacent calendar days is
+        // immaterial to the usage estimate.
+        $currentSocPercent = null;
+        $solarSlots = null;
+        if ($schedulerId === 'forecast_weighted_price_model' || $schedulerId === 'modelling') {
             // Real battery SoC makes the projected-energy simulation meaningfully more
             // accurate, but reading it means touching FoxESS credentials — skipped for a
             // dry run so `--dry-run` keeps working with no FoxESS config at all (see
-            // CLAUDE.md's "Running" section); IntelligentScheduleBuilder falls back to
-            // assuming the reserve floor when SoC is null, same as it does if every
-            // device is unreachable below.
+            // CLAUDE.md's "Running" section); both schedulers fall back to assuming the
+            // reserve floor when SoC is null, same as if every device is unreachable below.
             //
             // Multi-device installs (settings.php's device_sns) share one modelled
             // "battery" — config.battery is one combined capacity, and the same schedule
@@ -231,7 +233,6 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
             // here has exactly that device, and averaging its permanent 0% in against a
             // real battery elsewhere on the same account produced a nonsense low starting
             // point for the simulation.
-            $currentSocPercent = null;
             if (!$dryRun) {
                 $socApiKey = getSetting('foxess_api_key', '');
                 $socDeviceSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('foxess_device_sns', '')))));
@@ -250,7 +251,14 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
                     $currentSocPercent = array_sum($socReadings) / count($socReadings);
                 }
             }
-            $forecastExtras = [
+            $solarSlots = getLatestSolarForecast() ?: null;
+        }
+
+        if ($schedulerId === 'modelling') {
+            $modellingConfig = getModellingConfig();
+            $scheduleByDate = buildModellingScheduleForRun($config['strategy'], $batteryConfig, $modellingConfig, $knownSlots, $now, $timezone, $solarSlots, $currentSocPercent);
+        } else {
+            $forecastExtras = $schedulerId === 'forecast_weighted_price_model' ? [
                 'usageConfig' => ['avg_daily_kwh' => UsageEstimator::estimateDailyKwh(
                     (float) getSetting('usage_summer_kwh_month', '300'),
                     (float) getSetting('usage_winter_kwh_month', '700'),
@@ -258,12 +266,11 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
                     $timezone,
                     getLatestSolarForecast(),
                 )],
-                'solarSlots' => getLatestSolarForecast() ?: null,
+                'solarSlots' => $solarSlots,
                 'currentSocPercent' => $currentSocPercent,
-            ];
+            ] : [];
+            $scheduleByDate = buildMultiDaySchedule($schedulerId, $config['strategy'], $batteryConfig, $slotsByDate, $forecastExtras);
         }
-
-        $scheduleByDate = buildMultiDaySchedule($schedulerId, $config['strategy'], $batteryConfig, $slotsByDate, $forecastExtras);
 
         // Any "Fill your boots" / "Power down" override saved for a known date
         // (override.php) gets carved into that date's schedule here — after the price
@@ -472,8 +479,9 @@ function reapplyOverrides(): array
     $scheduleBuilder = new ScheduleBuilder($config['strategy'], $batteryConfig);
     $schedulerId = resolveSchedulerId();
 
-    $forecastExtras = [];
-    if ($schedulerId === 'forecast_weighted_price_model') {
+    $currentSocPercent = null;
+    $solarSlots = null;
+    if ($schedulerId === 'forecast_weighted_price_model' || $schedulerId === 'modelling') {
         $socApiKey = getSetting('foxess_api_key', '');
         $socDeviceSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('foxess_device_sns', '')))));
         $socReadings = [];
@@ -487,8 +495,16 @@ function reapplyOverrides(): array
                 $logger->warn("Battery SoC read from $sn failed, excluding from average: " . $e->getMessage());
             }
         }
-        $forecastExtras = [
-            'currentSocPercent' => $socReadings ? array_sum($socReadings) / count($socReadings) : null,
+        $currentSocPercent = $socReadings ? array_sum($socReadings) / count($socReadings) : null;
+        $solarSlots = getLatestSolarForecast() ?: null;
+    }
+
+    if ($schedulerId === 'modelling') {
+        $modellingConfig = getModellingConfig();
+        $scheduleByDate = buildModellingScheduleForRun($config['strategy'], $batteryConfig, $modellingConfig, $knownSlots, $now, $timezone, $solarSlots, $currentSocPercent);
+    } else {
+        $forecastExtras = $schedulerId === 'forecast_weighted_price_model' ? [
+            'currentSocPercent' => $currentSocPercent,
             'usageConfig' => ['avg_daily_kwh' => UsageEstimator::estimateDailyKwh(
                 (float) getSetting('usage_summer_kwh_month', '300'),
                 (float) getSetting('usage_winter_kwh_month', '700'),
@@ -496,11 +512,10 @@ function reapplyOverrides(): array
                 $timezone,
                 getLatestSolarForecast(),
             )],
-            'solarSlots' => getLatestSolarForecast() ?: null,
-        ];
+            'solarSlots' => $solarSlots,
+        ] : [];
+        $scheduleByDate = buildMultiDaySchedule($schedulerId, $config['strategy'], $batteryConfig, $slotsByDate, $forecastExtras);
     }
-
-    $scheduleByDate = buildMultiDaySchedule($schedulerId, $config['strategy'], $batteryConfig, $slotsByDate, $forecastExtras);
 
     foreach ($scheduleByDate as $forDate => &$daySchedule) {
         $overridesForDate = getOverridesForDate($forDate);

@@ -1,7 +1,10 @@
 <?php
 
+require_once __DIR__ . '/Store.php';
 require_once __DIR__ . '/ScheduleBuilder.php';
 require_once __DIR__ . '/IntelligentScheduleBuilder.php';
+require_once __DIR__ . '/ModellingScheduleBuilder.php';
+require_once __DIR__ . '/HalfHourlyUsageEstimator.php';
 
 /**
  * Pluggable scheduler registry (GitHub issue #2). The source of truth for which
@@ -33,6 +36,12 @@ const SCHEDULER_DEFINITIONS = [
         'name' => 'Forecast-weighted price model',
         'description' => 'Uses export price, import price and solar forecast to work out demand levels and buy '
             . 'up electricity when it’s below export price.',
+    ],
+    'modelling' => [
+        'name' => 'Modelling scheduler',
+        'description' => 'Solves for the exact lowest-cost charge/discharge sequence via dynamic programming '
+            . 'over discretised battery SoC, using a half-hourly usage forecast sampled from historical data, '
+            . 'solar forecast, and import/export price — not a heuristic, an optimiser.',
     ],
 ];
 
@@ -124,4 +133,157 @@ function buildMultiDaySchedule(string $schedulerId, array $strategyConfig, array
         }
     }
     return $result;
+}
+
+/**
+ * The "Modelling scheduler" (GitHub issue #5) doesn't fit buildMultiDaySchedule()'s
+ * per-calendar-day loop — its horizon is a rolling window from now, which may cross a
+ * midnight boundary, and ModellingScheduleBuilder::build() runs once over the whole
+ * window rather than once per day (see its own class doc comment for why this is a
+ * deliberate departure from the "per calendar day" decision the other two schedulers
+ * follow). This is its own parallel dispatch path: run the DP once, then split its
+ * absolute-instant intervals back into the same per-date {groups, explanations, summary}
+ * shape buildMultiDaySchedule() produces, so the rest of the pipeline (saveSchedule(),
+ * display) doesn't need to know this scheduler works differently under the hood. Every
+ * calendar date the window itself spans gets an entry — even one with zero force
+ * activity — same as the other schedulers always producing a (possibly empty) plan for
+ * every known day. The whole-window summary is attached to every date touched, since the
+ * DP doesn't compute a separate per-date breakdown of it.
+ *
+ * @param array $importSlots the rolling-window slots (from Runner.php/schedulers.php's own
+ *        window derivation — same bounds ScheduleBuilder::buildPushWindow() uses),
+ *        possibly spanning more than one calendar date
+ * @param float[] $halfHourlyUsageKwh aligned to $importSlots (see HalfHourlyUsageEstimator)
+ * @return array<string, array{groups: array, explanations: string[], summary: string}> for_date => schedule
+ */
+function buildModellingSchedule(
+    array $strategyConfig,
+    array $batteryConfig,
+    array $modellingConfig,
+    array $importSlots,
+    ?array $exportSlots,
+    array $halfHourlyUsageKwh,
+    ?array $solarSlots,
+    ?float $currentSocPercent,
+    DateTimeZone $timezone,
+): array {
+    $result = (new ModellingScheduleBuilder($strategyConfig, $batteryConfig, $modellingConfig))
+        ->build($importSlots, $exportSlots, $halfHourlyUsageKwh, $solarSlots, $currentSocPercent);
+
+    // Clip each of the DP's absolute intervals at calendar-date boundaries — one interval
+    // can itself span midnight, so keying by its start date alone would silently drop the
+    // portion that belongs to the next date.
+    $intervalsByDate = [];
+    foreach ($result['intervals'] as $interval) {
+        $cursor = $interval['start'];
+        while ($cursor < $interval['end']) {
+            $dayKey = $cursor->setTimezone($timezone)->format('Y-m-d');
+            $dayEnd = (new DateTimeImmutable($dayKey, $timezone))->modify('+1 day');
+            $segmentEnd = min($interval['end'], $dayEnd);
+            $intervalsByDate[$dayKey][] = [
+                'start' => $cursor,
+                'end' => $segmentEnd,
+                'workMode' => $interval['workMode'],
+                'explanation' => $interval['explanation'],
+            ];
+            $cursor = $segmentEnd;
+        }
+    }
+
+    $touchedDates = [];
+    foreach ($importSlots as $slot) {
+        $touchedDates[$slot['from']->setTimezone($timezone)->format('Y-m-d')] = true;
+    }
+
+    $scheduleBuilder = new ScheduleBuilder($strategyConfig, $batteryConfig);
+    $byDate = [];
+    foreach (array_keys($touchedDates) as $forDate) {
+        $converted = $scheduleBuilder->absoluteIntervalsToGroups($intervalsByDate[$forDate] ?? []);
+        $byDate[$forDate] = ['groups' => $converted['groups'], 'explanations' => $converted['explanations'], 'summary' => $result['summary']];
+    }
+    ksort($byDate);
+    return $byDate;
+}
+
+/**
+ * Gathers the modelling scheduler's own rolling-window inputs and calls
+ * buildModellingSchedule() — shared by Runner.php's runScheduler()/reapplyOverrides() and
+ * schedulers.php's preview, so the window-bounds math (which must stay consistent with
+ * ScheduleBuilder::buildPushWindow()'s own derivation, or the modelling scheduler would be
+ * optimising over a different horizon than what actually ends up pushed) isn't duplicated
+ * at each call site.
+ *
+ * @param array $knownSlots getPriceSlotsFrom()-shaped rows — every currently-known slot
+ *        from local midnight today onward; this slices out just the rolling window itself
+ *        (start of the current hour through 24h ahead or the end of known pricing,
+ *        whichever is sooner)
+ * @return array<string, array{groups: array, explanations: string[], summary: string}> for_date => schedule
+ */
+function buildModellingScheduleForRun(
+    array $strategyConfig,
+    array $batteryConfig,
+    array $modellingConfig,
+    array $knownSlots,
+    DateTimeImmutable $now,
+    DateTimeZone $timezone,
+    ?array $solarSlots,
+    ?float $currentSocPercent,
+): array {
+    $localNow = $now->setTimezone($timezone);
+    $windowStart = $localNow->setTime((int) $localNow->format('G'), 0, 0);
+    $windowEnd = $windowStart->modify('+24 hours');
+    $knownDataEnd = getLatestPriceHorizon();
+    if ($knownDataEnd !== null && $knownDataEnd < $windowEnd) {
+        $windowEnd = $knownDataEnd;
+    }
+
+    $importSlots = [];
+    $exportSlots = [];
+    $exportComplete = true;
+    foreach ($knownSlots as $slot) {
+        if ($slot['from'] < $windowStart || $slot['from'] >= $windowEnd) {
+            continue;
+        }
+        $importSlots[] = ['from' => $slot['from'], 'to' => $slot['to'], 'rate' => $slot['import_rate']];
+        if ($slot['export_rate'] !== null) {
+            $exportSlots[] = ['from' => $slot['from'], 'to' => $slot['to'], 'rate' => $slot['export_rate']];
+        } else {
+            $exportComplete = false;
+        }
+    }
+    if (!$importSlots) {
+        throw new ScheduleBuildException('No known price slots fall within the modelling scheduler\'s rolling window');
+    }
+    $exportSlots = $exportComplete && $exportSlots ? $exportSlots : null;
+
+    // Broad enough to cover HalfHourlyUsageEstimator's own multi-year tier-1 search;
+    // passing more history than actually exists is harmless, just an unused query range —
+    // same "even years of hourly rows is trivial for SQLite/PHP to sum" precedent
+    // getHistoricGeneration() is already documented with elsewhere.
+    $historicUsageRows = getHistoricGeneration((new DateTimeImmutable('-10 years', $timezone))->setTime(0, 0), $now);
+    $usageSummer = (float) getSetting('usage_summer_kwh_month', '300');
+    $usageWinter = (float) getSetting('usage_winter_kwh_month', '700');
+
+    // One HalfHourlyUsageEstimator call per calendar date the window touches (typically
+    // just one, occasionally two if the window crosses midnight), each producing that
+    // date's own 48-slot forecast — picking the matching half-hour-of-day value per slot.
+    $usageForecastByDate = [];
+    $halfHourlyUsageKwh = [];
+    foreach ($importSlots as $slot) {
+        $localFrom = $slot['from']->setTimezone($timezone);
+        $forDate = $localFrom->format('Y-m-d');
+        if (!isset($usageForecastByDate[$forDate])) {
+            $usageForecastByDate[$forDate] = HalfHourlyUsageEstimator::estimateHalfHourly(
+                new DateTimeImmutable($forDate, $timezone),
+                $timezone,
+                $historicUsageRows,
+                $usageSummer,
+                $usageWinter,
+            );
+        }
+        $halfHourIndex = ((int) $localFrom->format('G')) * 2 + ((int) $localFrom->format('i') >= 30 ? 1 : 0);
+        $halfHourlyUsageKwh[] = $usageForecastByDate[$forDate][$halfHourIndex] ?? 0.0;
+    }
+
+    return buildModellingSchedule($strategyConfig, $batteryConfig, $modellingConfig, $importSlots, $exportSlots, $halfHourlyUsageKwh, $solarSlots, $currentSocPercent, $timezone);
 }

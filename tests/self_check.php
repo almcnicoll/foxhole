@@ -1180,6 +1180,36 @@ check(
 check(isset($optimised['finalSocPercent']), 'finalSocPercent is present in the return value');
 check(count($optimised['intervals']) > 0, 'the cost-beating schedule actually contains some force-charge/discharge activity, not an empty plan');
 
+// --- Schedulers.php: buildModellingSchedule() (GitHub issue #5) ---
+check(isset(SCHEDULER_DEFINITIONS['modelling']), 'the modelling scheduler is registered');
+check(resolveSchedulerId('modelling') === 'modelling', 'resolveSchedulerId() accepts the modelling scheduler as an override');
+
+// The two cheapest slots straddle a UTC midnight boundary — the DP should charge in
+// exactly those two (to satisfy the min-end-SoC target at lowest cost), producing one
+// merged ForceCharge interval that crosses midnight. buildModellingSchedule() must split
+// that single interval into two correctly-clipped per-date entries, not silently drop the
+// portion on the far side of the boundary or misattribute the whole thing to one date.
+$midnightTz = new DateTimeZone('UTC');
+$midnightImport = buildSlotsFrom([50.0, 10.0, 10.0, 50.0], new DateTimeImmutable('2026-03-01 23:00:00', $midnightTz));
+$midnightUsage = [0.0, 0.0, 0.0, 0.0];
+$midnightBattery = ['capacity_kwh' => 10.0, 'max_charge_kw' => 4.0, 'max_discharge_kw' => 4.0, 'min_soc_on_grid' => 0, 'reserve_soc' => 0, 'round_trip_efficiency_pct' => 100.0];
+$midnightModelling = ['soc_bin_kwh' => 1.0, 'min_end_soc_pct' => 40];
+$midnightSchedule = buildModellingSchedule($mStrategy, $midnightBattery, $midnightModelling, $midnightImport, null, $midnightUsage, null, 0.0, $midnightTz);
+
+check(array_keys($midnightSchedule) === ['2026-03-01', '2026-03-02'], 'buildModellingSchedule() produces one entry per calendar date the rolling window touches: got ' . json_encode(array_keys($midnightSchedule)));
+
+$day1Charge = array_values(array_filter($midnightSchedule['2026-03-01']['groups'], fn($g) => $g['workMode'] === 'ForceCharge'));
+$day2Charge = array_values(array_filter($midnightSchedule['2026-03-02']['groups'], fn($g) => $g['workMode'] === 'ForceCharge'));
+check(
+    count($day1Charge) === 1 && $day1Charge[0]['startHour'] === 23 && $day1Charge[0]['startMinute'] === 30 && $day1Charge[0]['endHour'] === 0 && $day1Charge[0]['endMinute'] === 0,
+    'a ForceCharge interval crossing midnight is clipped to end at 00:00 on the first date: got ' . json_encode($day1Charge),
+);
+check(
+    count($day2Charge) === 1 && $day2Charge[0]['startHour'] === 0 && $day2Charge[0]['startMinute'] === 0 && $day2Charge[0]['endHour'] === 0 && $day2Charge[0]['endMinute'] === 30,
+    'the same interval continues from 00:00 on the second date: got ' . json_encode($day2Charge),
+);
+check($midnightSchedule['2026-03-01']['summary'] === $midnightSchedule['2026-03-02']['summary'], 'the whole-window summary is attached identically to every touched date, since the DP doesn\'t compute a separate per-date breakdown');
+
 if ($failures > 0) {
     fwrite(STDERR, "\n$failures/$checks checks failed\n");
     exit(1);

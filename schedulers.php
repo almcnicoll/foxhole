@@ -86,9 +86,17 @@ if ($knownSlots) {
         'solarSlots' => getLatestSolarForecast() ?: null,
     ];
 
+    $now = new DateTimeImmutable('now', $timezone);
+    $modellingConfig = getModellingConfig();
+
     foreach (SCHEDULER_DEFINITIONS as $id => $definition) {
         try {
-            $previews[$id] = ['scheduleByDate' => buildMultiDaySchedule($id, $config['strategy'], $batteryConfig, $slotsByDate, $forecastExtras), 'error' => null];
+            if ($id === 'modelling') {
+                $scheduleByDate = buildModellingScheduleForRun($config['strategy'], $batteryConfig, $modellingConfig, $knownSlots, $now, $timezone, $forecastExtras['solarSlots'], $forecastExtras['currentSocPercent']);
+            } else {
+                $scheduleByDate = buildMultiDaySchedule($id, $config['strategy'], $batteryConfig, $slotsByDate, $forecastExtras);
+            }
+            $previews[$id] = ['scheduleByDate' => $scheduleByDate, 'error' => null];
         } catch (Throwable $e) {
             $previews[$id] = ['scheduleByDate' => null, 'error' => $e->getMessage()];
         }
