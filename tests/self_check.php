@@ -10,6 +10,7 @@ require_once __DIR__ . '/../src/ScheduleBuilder.php';
 require_once __DIR__ . '/../src/IntelligentScheduleBuilder.php';
 require_once __DIR__ . '/../src/Schedulers.php';
 require_once __DIR__ . '/../src/UsageEstimator.php';
+require_once __DIR__ . '/../src/HalfHourlyUsageEstimator.php';
 require_once __DIR__ . '/../src/Logger.php';
 require_once __DIR__ . '/../src/Store.php';
 require_once __DIR__ . '/../src/OctopusClient.php';
@@ -1032,6 +1033,87 @@ $twoDayForecast = [
 ];
 $day2Daily = UsageEstimator::estimateDailyKwh(300.0, 700.0, $day2Dawn, $usageTz, $twoDayForecast);
 check(abs($day2Daily - 300.0 / 30.44) < 0.01, "a multi-day forecast uses the target date's own dawn/dusk pair, not the first day's: got $day2Daily");
+
+// --- HalfHourlyUsageEstimator (GitHub issue #5) ---
+/** @param array<string, float|array<int,float>> $dateToHourly Y-m-d => flat hourly kWh, or [hour => kWh] for a specific shape */
+function buildHistoricUsageRows(array $dateToHourly, DateTimeZone $timezone): array
+{
+    $rows = [];
+    foreach ($dateToHourly as $dateStr => $hourlyOrFlat) {
+        $dayStart = new DateTimeImmutable($dateStr, $timezone);
+        for ($h = 0; $h < 24; $h++) {
+            $value = is_array($hourlyOrFlat) ? ($hourlyOrFlat[$h] ?? null) : $hourlyOrFlat;
+            if ($value === null) {
+                continue;
+            }
+            $from = $dayStart->setTime($h, 0);
+            $rows[] = ['from' => $from, 'to' => $from->modify('+1 hour'), 'generation_kwh' => null, 'forecast_kwh' => null, 'usage_kwh' => $value];
+        }
+    }
+    return $rows;
+}
+
+// 2026-01-07 is a Wednesday (a weekday); its ISO week (Mon-Fri) falls on clean weekday-only
+// weeks for at least 6 years back — confirmed live before writing this fixture.
+$refWednesday = new DateTimeImmutable('2026-01-07', $usageTz);
+check((int) $refWednesday->format('N') === 3, 'sanity: the reference fixture date is genuinely a Wednesday');
+
+// Fewer than 3 valid days anywhere in history -> flat 8am-20:00 fallback, using the
+// existing UsageEstimator's daily estimate, zero outside that window.
+$noHistory = HalfHourlyUsageEstimator::estimateHalfHourly($refWednesday, $usageTz, [], 300.0, 700.0);
+check(count($noHistory) === 48, 'estimateHalfHourly() always returns exactly 48 values');
+check($noHistory[0] === 0.0 && $noHistory[15] === 0.0 && $noHistory[47] === 0.0, 'the <3-days fallback is zero outside 8am-20:00: got ' . json_encode([$noHistory[0], $noHistory[15], $noHistory[47]]));
+$fallbackDaily = UsageEstimator::estimateDailyKwh(300.0, 700.0, $refWednesday, $usageTz, []);
+check(abs($noHistory[16] - $fallbackDaily / 24) < 0.001, '8am (index 16) in the fallback is the existing UsageEstimator daily estimate spread flat across the 24 daytime half-hours: got ' . $noHistory[16] . ' vs expected ' . ($fallbackDaily / 24));
+check(abs(array_sum($noHistory) - $fallbackDaily) < 0.001, 'the fallback\'s 48 values sum back to the same daily total UsageEstimator would give');
+
+// Exactly 2 valid weekday days (below the 3-day minimum) -> still falls back, even though data exists.
+$almostEnough = buildHistoricUsageRows(['2026-01-06' => 4.0, '2026-01-05' => 4.0], $usageTz); // Tue, Mon before the reference Wednesday
+$stillFallback = HalfHourlyUsageEstimator::estimateHalfHourly($refWednesday, $usageTz, $almostEnough, 300.0, 700.0);
+check($stillFallback[16] === $noHistory[16], 'exactly 2 valid days (below MIN_VALID_DAYS=3) still falls back to the flat estimate, not a 2-day average');
+
+// Day-type filtering: a block of Saturday history with a wildly different value must never
+// leak into a weekday forecast, even when it's the only data available.
+$saturdayOnly = buildHistoricUsageRows(['2026-01-03' => 50.0, '2025-12-27' => 50.0, '2025-12-20' => 50.0], $usageTz); // three Saturdays
+$weekdayFromSaturdays = HalfHourlyUsageEstimator::estimateHalfHourly($refWednesday, $usageTz, $saturdayOnly, 300.0, 700.0);
+check($weekdayFromSaturdays[16] === $noHistory[16], 'Saturday-only history never satisfies a weekday forecast\'s day-type filter, so it still falls back rather than averaging in mismatched days');
+
+// Basic averaging: 3 valid weekdays with known, distinct flat hourly values average correctly,
+// and each hour splits into two equal half-hour values.
+$threeWeekdays = buildHistoricUsageRows([
+    '2026-01-06' => 2.0, // Tue
+    '2026-01-05' => 4.0, // Mon
+    '2025-12-31' => 6.0, // Wed (last Wednesday, tier 2)
+], $usageTz);
+$averaged = HalfHourlyUsageEstimator::estimateHalfHourly($refWednesday, $usageTz, $threeWeekdays, 300.0, 700.0);
+check(abs($averaged[0] - 2.0) < 0.001 && abs($averaged[1] - 2.0) < 0.001, "average of 2.0/4.0/6.0 flat-hourly is 4.0/hour = 2.0/half-hour, and both half-hours of hour 0 match: got {$averaged[0]}, {$averaged[1]}");
+
+// Tier 1 (same ISO week, previous years) fills the 30-candidate cap on its own for a
+// weekday reference (5 weekday candidates/year x 6 years = 30 exactly), so tier 2 (last 28
+// days) must be entirely excluded once that happens, even though it's also present.
+// $refWednesday's own ISO week (confirmed live: it's week 2, not week 1 — Jan 4 2026 is a
+// Sunday, so week 1 is Dec 29 2025-Jan 4 2026 and week 2 starts Jan 5) — must match
+// exactly, or the fixture lands on the wrong week and this test would silently exercise
+// the empty-tier-1 case instead of the cap-exclusion behaviour it's meant to prove.
+$refIsoWeek = (int) $refWednesday->format('W');
+$tier1Fixture = [];
+foreach ([2025, 2024, 2023, 2022, 2021, 2020] as $isoYear) {
+    $jan4 = new DateTimeImmutable("$isoYear-01-04", $usageTz);
+    $week1Monday = $jan4->modify('-' . ((int) $jan4->format('N') - 1) . ' days');
+    $weekMonday = $week1Monday->modify('+' . (($refIsoWeek - 1) * 7) . ' days');
+    for ($offset = 0; $offset <= 4; $offset++) { // Mon-Fri
+        $tier1Fixture[$weekMonday->modify("+$offset days")->format('Y-m-d')] = 10.0;
+    }
+}
+$tier2Fixture = [];
+for ($daysBack = 1; $daysBack <= 28; $daysBack++) {
+    $d = $refWednesday->modify("-$daysBack days");
+    if ((int) $d->format('N') <= 5) {
+        $tier2Fixture[$d->format('Y-m-d')] = 99.0; // dramatically different from tier 1's 10.0
+    }
+}
+$tierMix = HalfHourlyUsageEstimator::estimateHalfHourly($refWednesday, $usageTz, buildHistoricUsageRows($tier1Fixture + $tier2Fixture, $usageTz), 300.0, 700.0);
+check(abs($tierMix[0] - 5.0) < 0.001, 'tier 1 alone reaches the 30-day cap for a weekday reference, so tier 2\'s 99.0 never gets averaged in: got ' . $tierMix[0] . ', expected 5.0 (half of 10.0/hour)');
 
 if ($failures > 0) {
     fwrite(STDERR, "\n$failures/$checks checks failed\n");
