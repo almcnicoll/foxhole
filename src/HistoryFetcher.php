@@ -39,6 +39,15 @@ require_once __DIR__ . '/FoxessClient.php';
  * fixed-location timezone every other scheduling decision in this app uses — never the
  * browser's or server's local timezone. An hour typed/read anywhere in this app means that
  * hour at the solar panels, not wherever a browser happens to be.
+ *
+ * GitHub issue #5 ("Modelling scheduler") added household usage history alongside
+ * generation, in the same table (historic_generation.usage_kwh — see Store.php). Usage
+ * fetching rides along inside this file's existing per-day loops but deliberately doesn't
+ * touch their control flow at all: generation stays the sole source of truth for the
+ * backward-backfill horizon (getHistoricGenerationBounds() is unchanged, generation-only),
+ * and every usage fetch/store is independently try/caught (fetchAndStoreUsageForDay()) so
+ * a usage-side failure or "no data" can never affect whether a day's generation gets
+ * stored or whether the backfill loop keeps walking back.
  */
 
 const HISTORY_FORWARD_CATCHUP_MAX_DAYS = 14;
@@ -83,8 +92,9 @@ function fetchGenerationHistory(array $config, Logger $logger): array
         if ($result === false || $result === null) {
             continue; // error: leave the gap, next call's forward window covers it again. No data: nothing to store.
         }
-        storeDay($day, $result, $timezone, $day == $today);
+        storeDay($day, $result, $timezone, $day == $today, 'upsertHistoricGeneration');
         $daysStored++;
+        fetchAndStoreUsageForDay($clients, $day, $timezone, $day == $today, $logger);
     }
 
     // --- Backward backfill: only runs until the data horizon is found once, ever ---
@@ -102,8 +112,9 @@ function fetchGenerationHistory(array $config, Logger $logger): array
                 $logger->info('Generation history backfill reached the data horizon at ' . $cursor->format('Y-m-d') . '; will not probe further back.');
                 break;
             }
-            storeDay($cursor, $result, $timezone, false);
+            storeDay($cursor, $result, $timezone, false, 'upsertHistoricGeneration');
             $daysStored++;
+            fetchAndStoreUsageForDay($clients, $cursor, $timezone, false, $logger);
         }
     }
 
@@ -168,15 +179,16 @@ function combineDeviceGenerationResults(array $deviceResults): array|null|false
 }
 
 /**
- * Persists one day's combined hourly kWh values. For today specifically, only hours
- * strictly before the current local hour are trusted — FoxESS's report/query can return 0
- * (not absent) for hours that simply haven't happened yet, and writing those as real zeros
- * would understate today permanently once it's no longer "today" and stops being
- * re-fetched by the forward pass. Values beyond HISTORY_MAX_PLAUSIBLE_HOURLY_KWH are
- * treated as the known FoxESS energy-total corruption bug (see this file's top comment)
- * and dropped to 0 rather than trusted.
+ * Persists one day's combined hourly kWh values via $upsert (upsertHistoricGeneration() or
+ * upsertHistoricUsage() — both take the same (slotFrom, slotTo, kwh, updatedAt) shape). For
+ * today specifically, only hours strictly before the current local hour are trusted —
+ * FoxESS's report/query can return 0 (not absent) for hours that simply haven't happened
+ * yet, and writing those as real zeros would understate today permanently once it's no
+ * longer "today" and stops being re-fetched by the forward pass. Values beyond
+ * HISTORY_MAX_PLAUSIBLE_HOURLY_KWH are treated as the known FoxESS energy-total corruption
+ * bug (see this file's top comment) and dropped to 0 rather than trusted.
  */
-function storeDay(DateTimeImmutable $day, array $hourlyKwh, DateTimeZone $timezone, bool $isToday): void
+function storeDay(DateTimeImmutable $day, array $hourlyKwh, DateTimeZone $timezone, bool $isToday, callable $upsert): void
 {
     $now = new DateTimeImmutable('now', $timezone);
     $trustUpTo = $isToday ? (int) $now->format('G') : count($hourlyKwh);
@@ -188,6 +200,47 @@ function storeDay(DateTimeImmutable $day, array $hourlyKwh, DateTimeZone $timezo
             $kwh = 0.0;
         }
         $slotFrom = $day->setTime($hour, 0);
-        upsertHistoricGeneration($slotFrom, $slotFrom->modify('+1 hour'), $kwh, $now);
+        $upsert($slotFrom, $slotFrom->modify('+1 hour'), $kwh, $now);
     }
+}
+
+/**
+ * Best-effort household usage fetch+store for one day, ridden along inside
+ * fetchGenerationHistory()'s existing per-day loops (GitHub issue #5) — deliberately
+ * independent of generation's own control flow: a failure or "no data" here is caught and
+ * logged, never allowed to affect whether generation was stored or whether the backward
+ * backfill loop keeps walking back (that stays governed entirely by generation's own
+ * NO_DATA signal). See FoxessClient::getUsageReport()'s doc comment for the `loads`
+ * variable's known undercount caveat.
+ */
+function fetchAndStoreUsageForDay(array $clients, DateTimeImmutable $day, DateTimeZone $timezone, bool $isToday, Logger $logger): void
+{
+    try {
+        $result = fetchUsageDayAcrossDevices($clients, $day, $logger);
+        if ($result === false || $result === null) {
+            return; // error or no usage data for this day/these devices — fine, just skip
+        }
+        storeDay($day, $result, $timezone, $isToday, 'upsertHistoricUsage');
+    } catch (Throwable $e) {
+        $logger->warn('Usage history fetch for ' . $day->format('Y-m-d') . ' failed, skipping: ' . $e->getMessage());
+    }
+}
+
+/**
+ * @param array<string, FoxessClient> $clients
+ * @return array|null|false see combineDeviceGenerationResults() — reused as-is, it's
+ *         generic over "an array of hourly kWh values per device" despite its name
+ */
+function fetchUsageDayAcrossDevices(array $clients, DateTimeImmutable $day, Logger $logger): array|null|false
+{
+    $perDevice = [];
+    foreach ($clients as $sn => $client) {
+        try {
+            $perDevice[] = $client->getUsageReport((int) $day->format('Y'), (int) $day->format('n'), (int) $day->format('j'));
+        } catch (FoxessPushException $e) {
+            $logger->warn("Usage history fetch for $sn on " . $day->format('Y-m-d') . ' failed: ' . $e->getMessage());
+            $perDevice[] = false;
+        }
+    }
+    return combineDeviceGenerationResults($perDevice);
 }

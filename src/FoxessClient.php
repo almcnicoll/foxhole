@@ -108,6 +108,43 @@ class FoxessClient
     }
 
     /**
+     * Hourly household consumption (kWh) for one calendar day — same report/query endpoint
+     * and shape as getGenerationReport() above, just the `loads` variable instead of
+     * `generation`. Added for GitHub issue #5 ("Modelling scheduler") — see
+     * HistoryFetcher.php and HalfHourlyUsageEstimator. Deliberately its own method/own API
+     * call rather than folding `loads` into getGenerationReport()'s existing `variables`
+     * array: generation history is a real, permanent, never-re-fetched record, so this
+     * stays zero-risk to that already-working path rather than sharing a code path with it.
+     *
+     * Known caveat, not confirmed further: community reports describe the OpenAPI `loads`
+     * variable undercounting versus the FoxESS mobile app's own "load today" register (one
+     * reported case: ~10.1 vs ~12.5 kWh) — the OpenAPI implementation doesn't appear to
+     * read the same register the app does. Still the best available source through this
+     * API; treat as directionally useful, not exact.
+     */
+    public function getUsageReport(int $year, int $month, int $day): ?array
+    {
+        $response = $this->post('/op/v0/device/report/query', [
+            'sn' => $this->deviceSn,
+            'dimension' => 'day',
+            'variables' => ['loads'],
+            'year' => $year,
+            'month' => $month,
+            'day' => $day,
+        ]);
+        $result = $response['result'] ?? [];
+        if (!$result) {
+            return null;
+        }
+        foreach ($result as $entry) {
+            if (($entry['variable'] ?? null) === 'loads') {
+                return array_map(fn($v) => $v !== null ? (float) $v : 0.0, $entry['values'] ?? []);
+            }
+        }
+        return null;
+    }
+
+    /**
      * Current battery state of charge (0-100), or null if this device didn't report one.
      * Field name per community reference implementations: 'SoC' for a single battery,
      * 'SoC_1' for the first battery on a multi-battery inverter — not in FoxESS's own

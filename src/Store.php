@@ -108,6 +108,17 @@ function db(?string $overridePath = null): PDO
         forecast_kwh REAL,
         updated_at TEXT NOT NULL
     )');
+    // usage_kwh added for GitHub issue #5 ("Modelling scheduler") — household consumption
+    // history, needed to sample real historical usage instead of a flat daily estimate.
+    // This table is real, populated history (unlike the disposable ones elsewhere in this
+    // file), so this is a genuine ALTER TABLE, guarded by a column-existence check, never
+    // a drop-and-recreate — dropping would destroy real generation/forecast history that
+    // has nothing to do with this column. Written independently of generation_kwh/
+    // forecast_kwh, same non-clobbering pattern as those two (see upsertHistoricUsage()).
+    $hasUsageColumn = (int) $pdo->query("SELECT COUNT(*) FROM pragma_table_info('historic_generation') WHERE name = 'usage_kwh'")->fetchColumn();
+    if ($hasUsageColumn === 0) {
+        $pdo->exec('ALTER TABLE historic_generation ADD COLUMN usage_kwh REAL');
+    }
     // One row per (date, kind) — a date-linked exception to the normal schedule, not
     // history, so it's fine as a plain upsertable table rather than the disposable
     // replace-all pattern rate_slots/schedule_groups use.
@@ -424,6 +435,25 @@ function upsertHistoricForecast(DateTimeImmutable $slotFrom, DateTimeImmutable $
 }
 
 /**
+ * Upserts one local hour's actual household consumption (summed across every configured
+ * device — see HistoryFetcher), touching only usage_kwh/slot_to/updated_at. Added for
+ * GitHub issue #5 ("Modelling scheduler") — see HalfHourlyUsageEstimator, which samples
+ * this history instead of a flat daily estimate. Written independently of generation_kwh/
+ * forecast_kwh, same non-clobbering pattern as those two.
+ */
+function upsertHistoricUsage(DateTimeImmutable $slotFrom, DateTimeImmutable $slotTo, float $kwh, DateTimeImmutable $updatedAt): void
+{
+    $stmt = db()->prepare('INSERT INTO historic_generation (slot_from, slot_to, usage_kwh, updated_at) VALUES (:from, :to, :kwh, :updated_at)
+        ON CONFLICT(slot_from) DO UPDATE SET slot_to = excluded.slot_to, usage_kwh = excluded.usage_kwh, updated_at = excluded.updated_at');
+    $stmt->execute([
+        'from' => $slotFrom->format(DATE_ATOM),
+        'to' => $slotTo->format(DATE_ATOM),
+        'kwh' => $kwh,
+        'updated_at' => $updatedAt->format(DATE_ATOM),
+    ]);
+}
+
+/**
  * @return array{earliest: ?DateTimeImmutable, latest: ?DateTimeImmutable} slot_from range
  *         of rows with a real (non-null) generation reading — forecast-only rows don't
  *         count, since HistoryFetcher uses this purely to know where to resume backfilling/
@@ -439,7 +469,7 @@ function getHistoricGenerationBounds(): array
 }
 
 /**
- * @return array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, generation_kwh: ?float, forecast_kwh: ?float}>
+ * @return array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, generation_kwh: ?float, forecast_kwh: ?float, usage_kwh: ?float}>
  *         Raw hourly rows in [$from, $to), ascending. Aggregation into day/week/month/year
  *         buckets (summed, not averaged — see history.php) happens in PHP on top of this,
  *         same as every other table in this app; even a few years of hourly rows is a
@@ -454,6 +484,7 @@ function getHistoricGeneration(DateTimeImmutable $from, DateTimeImmutable $to): 
         'to' => new DateTimeImmutable($row['slot_to']),
         'generation_kwh' => $row['generation_kwh'] !== null ? (float) $row['generation_kwh'] : null,
         'forecast_kwh' => $row['forecast_kwh'] !== null ? (float) $row['forecast_kwh'] : null,
+        'usage_kwh' => $row['usage_kwh'] !== null ? (float) $row['usage_kwh'] : null,
     ], $stmt->fetchAll(PDO::FETCH_ASSOC));
 }
 

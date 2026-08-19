@@ -692,6 +692,38 @@ check(
     'bounds only consider rows with a real (non-null) generation reading — the later forecast-only hour is excluded from "latest"',
 );
 
+$hour3 = new DateTimeImmutable('2026-01-05 09:00', $londonTzForSolar);
+upsertHistoricUsage($hour3, $hour3->modify('+1 hour'), 0.8, $pushedAt);
+$usageRows = getHistoricGeneration($hour3, $hour3->modify('+1 hour'));
+check($usageRows[0]['usage_kwh'] === 0.8 && $usageRows[0]['generation_kwh'] === null, 'usage_kwh upserts independently, same non-clobbering pattern as forecast_kwh (GitHub issue #5)');
+
+// --- Store: historic_generation.usage_kwh is added via a real ALTER TABLE on an existing
+// install, preserving pre-existing rows — this table is real history, so this must never
+// be a drop-and-recreate like the disposable tables elsewhere use for schema changes.
+$migrationDbPath = sys_get_temp_dir() . '/foxhole_self_check_' . getmypid() . '_migration.sqlite';
+@unlink($migrationDbPath);
+$oldSchemaPdo = new PDO('sqlite:' . $migrationDbPath);
+$oldSchemaPdo->exec('CREATE TABLE historic_generation (
+    slot_from TEXT PRIMARY KEY,
+    slot_to TEXT NOT NULL,
+    generation_kwh REAL,
+    forecast_kwh REAL,
+    updated_at TEXT NOT NULL
+)');
+$oldSchemaPdo->exec("INSERT INTO historic_generation (slot_from, slot_to, generation_kwh, forecast_kwh, updated_at)
+    VALUES ('2025-01-01T06:00:00+00:00', '2025-01-01T07:00:00+00:00', 4.2, NULL, '2025-01-01T08:00:00+00:00')");
+$oldSchemaPdo = null; // close before Store's db() opens its own connection to the same file
+
+db($migrationDbPath); // triggers the guarded ALTER TABLE ... ADD COLUMN usage_kwh
+$migratedRows = getHistoricGeneration(new DateTimeImmutable('2025-01-01', new DateTimeZone('UTC')), new DateTimeImmutable('2025-01-02', new DateTimeZone('UTC')));
+check(count($migratedRows) === 1 && $migratedRows[0]['generation_kwh'] === 4.2, 'ALTER TABLE ADD COLUMN usage_kwh preserves a pre-existing row from before the migration');
+check($migratedRows[0]['usage_kwh'] === null, 'the pre-existing row has null usage_kwh after migrating, not 0 or an error');
+upsertHistoricUsage(new DateTimeImmutable('2025-01-01 06:00', new DateTimeZone('UTC')), new DateTimeImmutable('2025-01-01 07:00', new DateTimeZone('UTC')), 1.1, $pushedAt);
+$afterMigrationUpsert = getHistoricGeneration(new DateTimeImmutable('2025-01-01', new DateTimeZone('UTC')), new DateTimeImmutable('2025-01-02', new DateTimeZone('UTC')));
+check($afterMigrationUpsert[0]['usage_kwh'] === 1.1 && $afterMigrationUpsert[0]['generation_kwh'] === 4.2, 'writing usage_kwh after the migration does not disturb the pre-existing generation_kwh');
+@unlink($migrationDbPath);
+db($testDbPath); // db()'s path is sticky — switch back to the main throwaway DB for everything below
+
 // --- ScheduleBuilder: buildPushWindow() (GitHub issue #4, replaces the old today+tomorrow-only spliceForPush()) ---
 $pushTz = new DateTimeZone('Europe/London');
 $todayGroups = [['enable' => 1, 'startHour' => 20, 'startMinute' => 0, 'endHour' => 0, 'endMinute' => 0, 'workMode' => 'ForceDischarge', 'minSocOnGrid' => 15, 'fdSoc' => 15, 'fdPwr' => 3000]];
