@@ -52,9 +52,11 @@ src/
   CostBasisProvider.php # resolves the "worth charging below this" reference price
   ScheduleBuilder.php   # rates + cost basis -> FoxESS scheduler groups (the "classic" scheduler)
   IntelligentScheduleBuilder.php # solar/usage/SoC-aware scheduler (the "forecast-weighted" scheduler)
+  ModellingScheduleBuilder.php # exact DP/Bellman solver over discretised SoC bins (the "modelling" scheduler)
+  HalfHourlyUsageEstimator.php # half-hour-by-half-hour usage forecast sampled from historic_generation.usage_kwh
   Schedulers.php        # pluggable scheduler registry — see "Pluggable schedulers" below
   FoxessClient.php      # signs + sends requests to the FoxESS OpenAPI
-  HistoryFetcher.php    # backfills/catches up historic_generation from FoxESS's report/query endpoint
+  HistoryFetcher.php    # backfills/catches up historic_generation (generation + usage) from FoxESS's report/query endpoint
 tests/
   self_check.php        # standalone assert-style test for ScheduleBuilder/CostBasisProvider/Store
 logs/
@@ -514,14 +516,18 @@ what each algorithm would actually do before switching. `settings.php`'s old
 area called 'Schedulers'," not folded into general settings.
 
 Deliberately still a plain array + a small `switch`-shaped dispatch
-function, not a class-per-scheduler interface: the two implementations
-already existed with genuinely different `build()` signatures
-(`IntelligentScheduleBuilder` takes two more parameters, for solar forecast
-and current SoC, that `ScheduleBuilder` has no use for) before this registry
-did, and forcing a shared interface would mean either widening one's
-signature to accept inputs it ignores or narrowing the other's to lose real
-ones — busywork, not a real abstraction. Same "greedy heuristic, not a
-solver" philosophy as the schedulers themselves.
+function, not a class-per-scheduler interface: the two original
+implementations already existed with genuinely different `build()`
+signatures (`IntelligentScheduleBuilder` takes two more parameters, for
+solar forecast and current SoC, that `ScheduleBuilder` has no use for)
+before this registry did, and forcing a shared interface would mean either
+widening one's signature to accept inputs it ignores or narrowing the
+other's to lose real ones — busywork, not a real abstraction. Same "greedy
+heuristic, not a solver" philosophy as the schedulers themselves (the third
+scheduler, added later, breaks that philosophy on purpose — see "Modelling
+scheduler" below — and for exactly the same "genuinely different inputs"
+reason gets its own parallel dispatch path rather than being folded into
+`buildScheduleWithScheduler()`/`buildMultiDaySchedule()`).
 
 **No live battery SoC in `ScheduleBuilder` (the "classic" scheduler) — the
 "spare energy" question there is still decided by battery capacity/power
@@ -605,6 +611,153 @@ Three changes, confirmed with the user before building:
    deterministic given the same inputs, and `IntelligentScheduleBuilder`
    *should* re-adapt to a changed real battery SoC between runs — that's a
    feature, not drift to guard against.
+
+**Modelling scheduler (GitHub issue #5): an exact DP solver, not a third
+heuristic.** User-requested: a third scheduler that actually solves for the
+lowest-cost charge/discharge sequence via dynamic programming over a
+discretised battery-SoC grid, rather than another set of hand-tuned rules.
+Confirmed with the user before building: three discrete per-slot actions
+only (force-charge/force-discharge at rated power/idle — no intermediate
+power levels); the sub-3-historical-days usage fallback is flat 8am–20:00
+only, zero elsewhere; the new tunables it needs
+(`round_trip_efficiency_pct`, `modelling_soc_bin_kwh`,
+`modelling_min_end_soc_pct`) live in `settings.php`, not `config.php` —
+consistent with "a value worth tuning without a deploy shouldn't live
+somewhere the user can forget about it" (see "Battery config moved to
+settings" above), even though these are new rather than migrated values.
+
+*Rolling window, not per-calendar-day — its own dispatch path, not a branch
+inside `buildMultiDaySchedule()`.* Issue #4 deliberately made
+`ScheduleBuilder`/`IntelligentScheduleBuilder` run once per **calendar
+day**, unchanged, specifically to avoid rewriting either heuristic to
+reason across a multi-day array. This issue's own spec asks for the
+opposite for itself: "the rest of today plus overnight, up to 48 slots" — a
+rolling 24h window from *now*, which routinely crosses a midnight boundary.
+Forcing that into the existing per-day loop would contradict the issue
+directly, so `Schedulers.php` gives it a parallel pair of functions instead
+of a third scheduler branch inside `buildMultiDaySchedule()`:
+`buildModellingScheduleForRun()` computes the same rolling window
+`ScheduleBuilder::buildPushWindow()` already computes for the actual push —
+`[start of current hour, min(+24h, latest known price horizon)]` — slices
+`getPriceSlotsFrom()`'s results to it, builds the half-hourly usage forecast
+for whichever calendar date(s) the window touches, and calls
+`buildModellingSchedule()`, which runs `ModellingScheduleBuilder::build()`
+**once** over the whole window (its output is absolute-instant intervals,
+the same `{start, end, workMode, explanation}` shape
+`buildPushWindow()`/issue #4 already established for anything that can
+cross a calendar-date boundary — see "Date-time-aware scheduling" above),
+then clips those intervals at each touched date's midnight boundary and
+converts each date's slice via `ScheduleBuilder::absoluteIntervalsToGroups()`
+(changed from `private` to `public` specifically for this reuse) so the
+result drops into the exact same `$scheduleByDate` shape every other caller
+(`saveSchedule()`, `buildPushWindow()`, `index.php`, `schedulers.php`)
+already expects. `Runner.php`'s `runScheduler()` and `reapplyOverrides()`,
+and `schedulers.php`'s preview loop, each get one
+`if ($schedulerId === 'modelling') { buildModellingScheduleForRun(...) }
+else { buildMultiDaySchedule(...) }` branch at the point they already called
+`buildMultiDaySchedule()` — the same "special-case per scheduler at the call
+site" pattern `Runner.php` already used for gathering live SoC/solar only
+when the forecast-weighted scheduler is selected, just extended to also
+cover this one.
+
+*New data: half-hourly household usage history, from FoxESS's `loads`
+variable.* Nothing in this app tracked household consumption before this —
+`historic_generation` only had `generation_kwh`/`forecast_kwh`. Researched
+live (same "check community references before building" pattern as
+`fdSoc`/`fdPwr` and the SoC field names elsewhere in this file): FoxESS's
+`report/query` endpoint — the same one `FoxessClient::getGenerationReport()`
+already calls — also supports a `loads` variable for hourly household
+consumption, same response shape as `generation`. Known caveat, forum-
+confirmed, not independently verified against this project's own hardware:
+OpenAPI `loads` can undercount vs the FoxESS mobile app's own "load today"
+figure by a meaningful margin. Treated as "good enough for a usage
+*shape*, not a billing-accuracy figure" — the DP only needs relative
+half-hour-to-half-hour proportions, not an absolute kWh figure it depends
+on being exact. `FoxessClient::getUsageReport()` is a deliberately separate
+method from `getGenerationReport()` (own call, own `variables: ['loads']`)
+rather than one shared multi-variable call, to keep zero risk to the
+already-working, never-re-fetched generation history while adding this.
+`historic_generation` gained a third nullable `usage_kwh` column via a
+guarded `ALTER TABLE ... ADD COLUMN` (checked via `pragma_table_info`,
+never a drop-and-recreate — this table is real, accumulated history, unlike
+the disposable ones elsewhere in this app) and `Store::upsertHistoricUsage()`
+mirrors `upsertHistoricGeneration()` exactly, written independently so it
+never clobbers the generation/forecast columns on the same row.
+`HistoryFetcher::fetchGenerationHistory()`'s existing forward-catch-up/
+backward-backfill control flow is completely untouched and stays the sole
+source of truth for the backfill horizon; a best-effort, independently
+try/caught usage fetch+store call rides along inside the same per-day loop
+iterations — a usage-fetch failure or "no data for this day" can never
+affect the generation loop's own control flow or backfill-horizon logic.
+
+*Half-hourly usage forecast, sampled from real history
+(`src/HalfHourlyUsageEstimator.php`, new — deliberately separate from the
+existing `UsageEstimator`, which stays untouched and still backs the other
+two schedulers' flat daily estimate).* Per the issue's literal sampling
+rule: for the target date's day-type (weekday/Saturday/Sunday, via ISO `N` —
+matched exactly, not "weekday vs weekend"), tier 1 is the same ISO week
+number in each previous year that has stored `usage_kwh` data
+(nearest-year-first), tier 2 is the most recent 28 days before the target
+date with data (most-recent-first); take the first 30 candidates found,
+tier 1 before tier 2, average matching half-hour-of-day across them (each
+historical hour splits into two equal half-hours, since hourly is
+`report/query`'s native resolution — the same accepted limitation
+`historic_generation` already documents for generation). Fewer than 3
+candidates with data anywhere: flat fallback using the *existing*
+`UsageEstimator::estimateDailyKwh()` (so the summer/winter kWh/month
+settings stay the single source of truth for "how much does this house
+use") spread flat across 8am–20:00 only, zero elsewhere — per the
+confirmed answer above, not an interpolated shape. ISO week-of-year
+arithmetic is done properly (Jan 4th is always in ISO week 1, computed
+arithmetically) rather than via a format-string that assumes the reference
+date itself is in week 1 — a real bug in this feature's own test fixture
+during development, caught because the test's expected numbers didn't
+match until the fixture's own week arithmetic was fixed.
+
+*`ModellingScheduleBuilder`: the DP core.* Grid = SoC bins from the
+existing reserve-SoC floor to full capacity, step `modelling_soc_bin_kwh`;
+starting bin = nearest bin to the current live SoC reading (or the reserve
+floor if unavailable, same fallback `IntelligentScheduleBuilder` already
+uses). Three transitions per slot, reusing/extending the same physics
+`IntelligentScheduleBuilder`'s natural-trajectory simulation already
+validates rather than inventing new formulas: force-charge draws at the
+configured rated charge power (capped by remaining headroom to full
+capacity), force-discharge supplies at rated discharge power (capped by
+headroom down to the reserve floor), idle follows solar-minus-usage,
+floored at `min_soc_on_grid` — not `reserve_soc` (the same floor
+distinction CLAUDE.md already documents elsewhere: `min_soc_on_grid` is the
+general system floor, `reserve_soc` is specifically how far *forced*
+discharge may drain the battery). Round-trip efficiency is applied once, on
+the charge side only — a standard, defensible simplification, not literal
+battery physics, and worth revisiting if real-world figures ever justify a
+split. Cost per transition is net grid flow × that slot's import price (net
+import) or export price (net export, i.e. a negative cost/credit). A
+forward Bellman recursion fills a `cost`/`backpointer` grid across the
+whole window in one pass; the terminal state prefers the minimum-cost
+end-of-horizon bin that meets `modelling_min_end_soc_pct`, falling back to
+the global minimum-cost end state (flagged in the summary, not thrown) on
+the rare horizon too tight to meet it exactly — reconstruction then walks
+the backpointers from that terminal bin back to the known starting SoC.
+Contiguous same-action slots are merged into absolute intervals the same
+way the other schedulers merge contiguous slots, just over real instants
+instead of a single day's array indices, since a merged run can itself span
+midnight here. Explanations are cost/price-driven per interval, same
+narration style as the other two schedulers' `explainPeriods()`; the DP's
+`totalCostPence` (an addition beyond what the issue asked for, added purely
+to make a genuine "beats an always-idle baseline" test possible — see
+`tests/self_check.php`) isn't surfaced in the UI, just used internally for
+this correctness check.
+
+*Still "exact/deterministic, cheap to compute," per the issue's own
+framing — genuinely a solver, unlike the other two.* This is the one
+scheduler in this codebase that isn't a "greedy heuristic, not a solver" —
+see the issue's own explicit ask and the "Pluggable scheduler architecture"
+note above. It re-solves the whole rolling window fresh on every run from
+whatever the current live SoC reading is (or the reserve floor, if
+unavailable) — satisfying the issue's "re-evaluate on a rolling basis"
+requirement for free, since nothing needs to persist state between runs to
+make that work, same reasoning issue #4 already established for why
+recomputing fresh each run is safe for the other two schedulers.
 
 **A real bug found via live verification, not by inspection: SQLite TEXT
 comparison of ISO 8601 datetime strings isn't chronologically correct
@@ -881,6 +1034,12 @@ not half-hourly (48) — that's the API's native resolution, not a choice this a
 — confirmed against `TonyM1958/FoxESS-Cloud` (the same community reference this file
 already leans on for the scheduler endpoint and SoC field names).
 
+The same `report/query` endpoint also has a `loads` variable for hourly household
+consumption — `FoxessClient::getUsageReport()` (GitHub issue #5, added alongside the
+modelling scheduler) wraps it as its own separate call, stored in `historic_generation`'s
+`usage_kwh` column. See "Modelling scheduler" below for the full story, including a known
+community-reported undercount caveat for `loads` specifically.
+
 **Storage is a genuinely accumulating table** — `price_slots` and `api_log` (see
 "Date-time-aware scheduling" and "API call log" respectively) are the only other two, as
 of this writing; everything else stays disposable (`schedule_groups`/`solar_forecast`,
@@ -1080,14 +1239,23 @@ shared cache for no benefit.
   when a time-banded tariff like Flux goes live) is stubbed with a `TODO`,
   deliberately not implemented against guessed API shapes. See spec §13 and
   [roadmap.MD](roadmap.MD).
-- **Scheduling algorithm**: see "Pluggable schedulers" below — there are two
-  today (`ScheduleBuilder`, `IntelligentScheduleBuilder`), both greedy,
-  explainable heuristics by design, not a global optimiser (spec §7 wants
-  price-threshold logic, and explanations need to be narratable). Adding a
-  third means a new class plus one entry in `SCHEDULER_DEFINITIONS` and one
-  branch in `buildScheduleWithScheduler()` (`src/Schedulers.php`) — nothing
-  else (`run.php`, `Runner.php`'s control flow, `schedulers.php`) needs to
-  change, since all of them just iterate the registry.
+- **Scheduling algorithm**: see "Pluggable schedulers" below — there are
+  three today. `ScheduleBuilder` and `IntelligentScheduleBuilder` are both
+  greedy, explainable heuristics by design, not a global optimiser (spec §7
+  wants price-threshold logic, and explanations need to be narratable);
+  `ModellingScheduleBuilder` (GitHub issue #5, see "Modelling scheduler"
+  below) deliberately breaks that pattern and is a genuine DP/Bellman
+  solver. A new scheduler with a `build()` signature compatible with the
+  existing per-calendar-day dispatch just needs a new class, one entry in
+  `SCHEDULER_DEFINITIONS`, and one branch in `buildScheduleWithScheduler()`
+  (`src/Schedulers.php`) — `run.php`, `Runner.php`'s control flow, and
+  `schedulers.php` need no change, since all of them just iterate the
+  registry. A scheduler that needs a genuinely different shape of inputs or
+  horizon (as the modelling one does — a rolling window rather than one
+  calendar day at a time) instead gets its own parallel dispatch path, same
+  as `buildModellingSchedule()`/`buildModellingScheduleForRun()` did — see
+  "Modelling scheduler" for why that isn't shoehorned into the registry's
+  existing per-day contract.
 - **More settings-table config**: if more of `config.php` ends up needing a
   UI (see roadmap), it follows the same pattern `foxess_api_key` already
   does — `getSetting()`/`setSetting()`, no schema change needed for a plain
