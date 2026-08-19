@@ -690,6 +690,22 @@ than the actual inverter serial number — the account legitimately has no
 write permission over a "device" that isn't a real device it owns. Worth
 checking first if this recurs, before assuming it's account-level.
 
+**`pushSchedule()` clears the existing schedule before pushing the real one.**
+User-reported, confirmed live: stale slots from a previous push have been observed
+persisting and blocking the desired new ones on the inverter, even though the push call
+nominally sends a full replacement `groups` array. Community reports confirm pushing an
+empty `groups: []` array is FoxESS's own documented way to clear everything, so
+`FoxessClient::pushSchedule()` now does that as a separate call immediately before the
+real push — two calls per device per push, both going through `post()` so both get
+logged (see "API call log" below) and get the existing single-retry handling. The clear
+call is deliberately *not* best-effort: if it fails, the whole push fails, same as if the
+one real push call had failed — silently skipping it on failure would risk exactly the
+stale-slot bug this exists to fix. `post()` changed from `private` to `protected`
+specifically so `tests/self_check.php` can subclass it to verify the two-call sequence
+(order, and that a failed clear aborts before the real push) without touching the network
+— the existing `pushToDevices()` tests, which subclass the public `pushSchedule()`
+itself, didn't need this and are unaffected.
+
 **API call log (GitHub issue #3).** User-requested: every FoxESS API call logged —
 datetime, request body, endpoint, response code, response body — visible in a new
 "API log" area, most recent first, expandable, with the collapsed row colour-coded

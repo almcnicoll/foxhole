@@ -27,9 +27,25 @@ class FoxessClient
         return $this->callCount;
     }
 
-    /** Push a computed schedule. $groups is the array built by ScheduleBuilder. */
+    /**
+     * Push a computed schedule. $groups is the array built by ScheduleBuilder.
+     *
+     * Clears any existing schedule first — a separate push with an empty `groups` array —
+     * before sending the real one. Confirmed live (and via community reports): stale slots
+     * from a previous push have been observed persisting and blocking the desired new ones
+     * even though this call nominally sends a full replacement `groups` array; an empty
+     * array is FoxESS's own documented way to clear everything. Both calls go through
+     * post(), so both get logged (see api-log.php) and the existing single-retry-on-
+     * transient-failure handling. Deliberately not best-effort: if the clear call itself
+     * fails, the whole push fails (same as today when the one push call fails) rather than
+     * silently risking the exact stale-slot bug this exists to fix.
+     */
     public function pushSchedule(array $groups): array
     {
+        $this->post('/op/v1/device/scheduler/enable', [
+            'deviceSN' => $this->deviceSn,
+            'groups' => [],
+        ]);
         return $this->post('/op/v1/device/scheduler/enable', [
             'deviceSN' => $this->deviceSn,
             'groups' => $groups,
@@ -112,7 +128,12 @@ class FoxessClient
         return null;
     }
 
-    private function post(string $path, array $body, bool $isRetry = false): array
+    /**
+     * Protected, not private, specifically so tests can subclass FoxessClient and override
+     * this to intercept calls (e.g. counting/recording pushSchedule()'s two-step clear+push)
+     * without touching the network — see tests/self_check.php.
+     */
+    protected function post(string $path, array $body, bool $isRetry = false): array
     {
         $this->callCount++;
 

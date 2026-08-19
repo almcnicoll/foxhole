@@ -359,6 +359,44 @@ $overlay2 = (new ScheduleBuilder($strategy, $battery))->applyOverrides([], [], $
 check(count($overlay2['groups']) === 1 && $overlay2['groups'][0]['workMode'] === 'ForceCharge', 'fill_your_boots with no prep window adds a single ForceCharge event group');
 check($overlay2['groups'][0]['fdSoc'] === 100 && $overlay2['groups'][0]['fdPwr'] === 3000, 'override group power/SoC fields are set from battery config, same as a normal group');
 
+// --- FoxessClient: pushSchedule() clears existing slots before pushing the real ones ---
+// Confirmed live: stale slots from a previous push have blocked new ones even though the
+// push call nominally replaces the whole schedule — see FoxessClient::pushSchedule()'s own
+// doc comment. post() is protected (not private) specifically so this can subclass and
+// intercept it, rather than the public pushSchedule() itself, to actually verify the
+// two-call sequence without touching the network.
+$recordingClient = new class('key', 'SN-REC', 'https://example.invalid') extends FoxessClient {
+    public array $calls = []; // each entry: that call's 'groups' body value
+    protected function post(string $path, array $body, bool $isRetry = false): array
+    {
+        $this->calls[] = $body['groups'];
+        return ['errno' => 0];
+    }
+};
+$pushedGroups = [['enable' => 1, 'startHour' => 10, 'startMinute' => 0, 'endHour' => 11, 'endMinute' => 0, 'workMode' => 'ForceCharge', 'minSocOnGrid' => 15, 'fdSoc' => 100, 'fdPwr' => 3000]];
+$recordingClient->pushSchedule($pushedGroups);
+check(count($recordingClient->calls) === 2, 'pushSchedule() makes exactly two calls: a clear, then the real push');
+check($recordingClient->calls[0] === [], 'the first call clears the schedule with an empty groups array');
+check($recordingClient->calls[1] === $pushedGroups, 'the second call sends the real computed groups');
+
+$abortingClearClient = new class('key', 'SN-ABORT', 'https://example.invalid') extends FoxessClient {
+    public array $calls = [];
+    protected function post(string $path, array $body, bool $isRetry = false): array
+    {
+        $this->calls[] = $body['groups'];
+        if ($body['groups'] === []) {
+            throw new FoxessPushException('simulated clear failure');
+        }
+        return ['errno' => 0];
+    }
+};
+try {
+    $abortingClearClient->pushSchedule($pushedGroups);
+    check(false, 'pushSchedule() should propagate a failure from the clear call');
+} catch (FoxessPushException $e) {
+    check(count($abortingClearClient->calls) === 1, 'a failed clear call aborts before attempting the real push — not best-effort');
+}
+
 // --- Runner: pushToDevices() attempts every device and reports per-device failures ---
 // Stubs override pushSchedule() directly (public, not final) rather than hitting the
 // network — this must never make a real FoxESS call.
