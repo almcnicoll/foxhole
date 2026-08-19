@@ -437,7 +437,7 @@ $fetchedMsg = (string) ($_GET['msg'] ?? '');
 $(function() {
     $('#history-table').DataTable({
         order: [],
-        paging: <?= count($buckets) > 15 ? 'true' : 'false' ?>,
+        paging: false, // always show the full table — even the largest view (a 28-31 row month) is a modest, entirely readable single page
         searching: <?= count($buckets) > 15 ? 'true' : 'false' ?>,
     });
 });
