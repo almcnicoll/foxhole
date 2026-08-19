@@ -45,7 +45,18 @@ require_once __DIR__ . '/Exceptions.php';
  */
 class ModellingScheduleBuilder
 {
-    private const ACTIONS = ['ForceCharge', 'ForceDischarge', 'SelfUse'];
+    // SelfUse first, deliberately: the DP only overwrites a (slot, bin) state on a
+    // strictly lower cost (see the `$totalCost < $cost[...] - 1e-9` check below), so
+    // evaluating SelfUse first makes it win every cost tie against ForceCharge/
+    // ForceDischarge. This matters whenever SoC is already at a floor a forced action
+    // can't usefully move past (e.g. starting exactly at reserve_soc, the common case
+    // when no live SoC reading is available) — ForceDischarge there can't actually
+    // discharge anything (available energy is 0), so it produces the *same* net grid
+    // flow and cost as SelfUse, just mislabelled as an explicit forced action pushed to
+    // the inverter with a misleading "highest-value point to discharge" explanation.
+    // Found live: a throwaway-config dry run started at the reserve floor and the
+    // optimiser picked ForceDischarge for a no-op tie purely because of array order.
+    private const ACTIONS = ['SelfUse', 'ForceCharge', 'ForceDischarge'];
 
     public function __construct(
         private readonly array $strategyConfig,
@@ -177,7 +188,7 @@ class ModellingScheduleBuilder
             $avgImport = $this->average($importRates, $range);
             $explanation = $period['mode'] === 'ForceCharge'
                 ? sprintf('Charging %s (avg %sp/kWh import) — the lowest-cost point in this horizon for the optimiser to charge.', $this->formatRange($period), number_format($avgImport, 2))
-                : sprintf('Discharging %s (avg %sp/kWh import) — the lowest-cost point in this horizon for the optimiser to discharge.', $this->formatRange($period), number_format($avgImport, 2));
+                : sprintf('Discharging %s (avg %sp/kWh import) — the highest-value point in this horizon for the optimiser to discharge.', $this->formatRange($period), number_format($avgImport, 2));
             $intervals[] = [
                 'start' => $period['start'],
                 'end' => $period['end'],

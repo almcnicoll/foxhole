@@ -1160,6 +1160,24 @@ $reserveTest = (new ModellingScheduleBuilder($mStrategy, $hugeDischargeBattery, 
 check(abs($reserveTest['finalSocPercent'] - 50.0) < 1.0, "an absurdly high max_discharge_kw (1000kW) still clamps at the reserve floor (50%), not below: got {$reserveTest['finalSocPercent']}");
 check(count($reserveTest['intervals']) === 1 && $reserveTest['intervals'][0]['workMode'] === 'ForceDischarge', 'selling at a highly favourable export price is chosen over idling');
 
+// A real bug found via live verification against actual Agile prices, not by inspection:
+// starting exactly at the reserve floor (the common case when no live SoC reading is
+// available — see the class doc comment's fallback), ForceDischarge can't actually
+// discharge anything (available energy is 0), so it produces the *same* net grid flow and
+// cost as SelfUse for that slot — a tie the DP must resolve in SelfUse's favour, since
+// ForceDischarge winning it arbitrarily would emit a real, misleadingly-explained
+// "discharge" group to push to the inverter for a slot where nothing is actually
+// discharged. ACTIONS' evaluation order (SelfUse first) is what makes this deterministic.
+$tieBattery = ['capacity_kwh' => 10.0, 'max_charge_kw' => 4.0, 'max_discharge_kw' => 4.0, 'min_soc_on_grid' => 20, 'reserve_soc' => 20, 'round_trip_efficiency_pct' => 100.0];
+$tieSlots = buildSlotsFrom([30.0, 30.0], new DateTimeImmutable('2026-03-01 00:00:00', $mTz));
+$tieUsage = [1.0, 1.0];
+$tieModelling = ['soc_bin_kwh' => 1.0, 'min_end_soc_pct' => 0];
+$tieResult = (new ModellingScheduleBuilder($mStrategy, $tieBattery, $tieModelling))->build($tieSlots, null, $tieUsage, null, 20.0);
+check(
+    count($tieResult['intervals']) === 0,
+    'starting exactly at the reserve floor with no way to actually discharge, a cost tie between ForceDischarge and SelfUse resolves to SelfUse (no pushed group), not a no-op ForceDischarge: got ' . json_encode(array_column($tieResult['intervals'], 'workMode')),
+);
+
 // The optimiser's own reported cost must genuinely beat a naive always-idle baseline
 // (every slot just imports exactly what covers usage at that slot's own price) — proves
 // it's actually solving, not just producing *a* valid schedule.
