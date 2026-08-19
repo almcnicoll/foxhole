@@ -11,7 +11,8 @@ $errors = [];
 $notice = null;
 
 $priceKinds = ['import' => ['api', '0'], 'export' => ['fixed', '12']];
-$batteryFields = ['capacity_kwh', 'max_charge_kw', 'max_discharge_kw', 'min_soc_on_grid', 'reserve_soc'];
+$batteryFields = ['capacity_kwh', 'max_charge_kw', 'max_discharge_kw', 'min_soc_on_grid', 'reserve_soc', 'round_trip_efficiency_pct'];
+$modellingFields = ['soc_bin_kwh', 'min_end_soc_pct'];
 // Only read for getBatteryConfig()'s legacy fallback below — config.php's 'battery'
 // array, if an old one is still sitting there. See Store::getBatteryConfig().
 $legacyBatteryConfig = (file_exists(__DIR__ . '/config.php') ? require __DIR__ . '/config.php' : [])['battery'] ?? [];
@@ -80,6 +81,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $errors[] = 'Battery ' . str_replace('_', ' ', $field) . ' must be a non-negative number.';
         }
     }
+    if (is_numeric($batteryValues['round_trip_efficiency_pct'] ?? null) && (float) $batteryValues['round_trip_efficiency_pct'] > 100) {
+        $errors[] = 'Battery round trip efficiency pct cannot be more than 100.';
+    }
+
+    $modellingValues = [];
+    foreach ($modellingFields as $field) {
+        $modellingValues[$field] = trim((string) ($_POST["modelling_{$field}"] ?? ''));
+        if (!is_numeric($modellingValues[$field]) || (float) $modellingValues[$field] < 0) {
+            $errors[] = 'Modelling ' . str_replace('_', ' ', $field) . ' must be a non-negative number.';
+        }
+    }
+    if (is_numeric($modellingValues['min_end_soc_pct'] ?? null) && (float) $modellingValues['min_end_soc_pct'] > 100) {
+        $errors[] = 'Modelling min end SoC pct cannot be more than 100.';
+    }
 
     $usageSummerKwhMonth = trim((string) ($_POST['usage_summer_kwh_month'] ?? ''));
     $usageWinterKwhMonth = trim((string) ($_POST['usage_winter_kwh_month'] ?? ''));
@@ -107,6 +122,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         foreach ($batteryFields as $field) {
             setSetting("battery_{$field}", (string) (float) $batteryValues[$field]);
+        }
+        foreach ($modellingFields as $field) {
+            setSetting("modelling_{$field}", (string) (float) $modellingValues[$field]);
         }
         setSetting('usage_summer_kwh_month', (string) (float) $usageSummerKwhMonth);
         setSetting('usage_winter_kwh_month', (string) (float) $usageWinterKwhMonth);
@@ -139,6 +157,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $batteryValues = [];
     foreach ($batteryFields as $field) {
         $batteryValues[$field] = (string) $batteryDefaults[$field];
+    }
+    $modellingDefaults = getModellingConfig();
+    $modellingValues = [];
+    foreach ($modellingFields as $field) {
+        $modellingValues[$field] = (string) $modellingDefaults[$field];
     }
     // Defaults are a plausible typical UK household, not this install's real figures —
     // update them to match your own bills for an accurate estimate.
@@ -193,6 +216,9 @@ renderHeader('Settings');
         <label for="battery_reserve_soc">Reserve SoC (%, force-discharge floor)</label>
         <input type="number" step="1" min="0" max="100" id="battery_reserve_soc" name="battery_reserve_soc"
             value="<?= htmlspecialchars($batteryValues['reserve_soc']) ?>">
+        <label for="battery_round_trip_efficiency_pct">Round-trip efficiency (%)</label>
+        <input type="number" step="any" min="0" max="100" id="battery_round_trip_efficiency_pct" name="battery_round_trip_efficiency_pct"
+            value="<?= htmlspecialchars($batteryValues['round_trip_efficiency_pct']) ?>">
     </fieldset>
 
     <fieldset>
@@ -217,6 +243,22 @@ renderHeader('Settings');
             schedule before you switch. <code>run.php</code> can still override the selection per-run with
             <code>--classic</code> or <code>--intelligent</code>.
         </p>
+    </fieldset>
+
+    <fieldset>
+        <legend>Modelling scheduler</legend>
+        <p class="muted">Tuning for the "Modelling scheduler" option on the <a href="schedulers.php">Schedulers</a>
+            page — it solves for the lowest-cost charge/discharge sequence by discretising battery SoC into bins
+            and searching every combination, so a smaller bin size is more precise but slower to compute.</p>
+        <label for="modelling_soc_bin_kwh">SoC bin size (kWh)</label>
+        <input type="number" step="any" min="0" id="modelling_soc_bin_kwh" name="modelling_soc_bin_kwh"
+            value="<?= htmlspecialchars($modellingValues['soc_bin_kwh']) ?>">
+        <label for="modelling_min_end_soc_pct">Minimum end-of-horizon SoC (%)</label>
+        <input type="number" step="1" min="0" max="100" id="modelling_min_end_soc_pct" name="modelling_min_end_soc_pct"
+            value="<?= htmlspecialchars($modellingValues['min_end_soc_pct']) ?>">
+        <p class="muted">Distinct from the Battery section's reserve SoC above: reserve SoC is the floor every
+            slot must respect throughout, while this is a target for where the battery should end up by the end of
+            the planning horizon — e.g. not drained flat right before dawn.</p>
     </fieldset>
 
     <fieldset>

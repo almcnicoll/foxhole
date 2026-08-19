@@ -174,7 +174,17 @@ function getSetting(string $key, ?string $default = null): ?string
  */
 function getBatteryConfig(array $legacyConfig = []): array
 {
-    $defaults = ['capacity_kwh' => 10.0, 'max_charge_kw' => 3.0, 'max_discharge_kw' => 3.0, 'min_soc_on_grid' => 15, 'reserve_soc' => 15];
+    $defaults = [
+        'capacity_kwh' => 10.0,
+        'max_charge_kw' => 3.0,
+        'max_discharge_kw' => 3.0,
+        'min_soc_on_grid' => 15,
+        'reserve_soc' => 15,
+        // Added for GitHub issue #5 ("Modelling scheduler") — the DP cost model needs a
+        // real efficiency figure, not an implicit 100%. No legacy config.php equivalent
+        // (config.php never had a battery section entry for this), so no fallback lookup.
+        'round_trip_efficiency_pct' => 90.0,
+    ];
     $result = [];
     foreach ($defaults as $key => $default) {
         $fallback = $legacyConfig[$key] ?? $default;
@@ -184,6 +194,22 @@ function getBatteryConfig(array $legacyConfig = []): array
     $result['min_soc_on_grid'] = (int) $result['min_soc_on_grid'];
     $result['reserve_soc'] = (int) $result['reserve_soc'];
     return $result;
+}
+
+/**
+ * Tuning values specific to the "Modelling scheduler" (GitHub issue #5) — kept separate
+ * from getBatteryConfig() even though both live in settings.php, since these are
+ * algorithm-tuning knobs for one specific scheduler, not battery hardware specs every
+ * scheduler cares about.
+ *
+ * @return array{soc_bin_kwh: float, min_end_soc_pct: int}
+ */
+function getModellingConfig(): array
+{
+    return [
+        'soc_bin_kwh' => (float) (getSetting('modelling_soc_bin_kwh') ?? '0.1'),
+        'min_end_soc_pct' => (int) (getSetting('modelling_min_end_soc_pct') ?? '20'),
+    ];
 }
 
 function setSetting(string $key, string $value): void

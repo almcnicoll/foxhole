@@ -474,11 +474,11 @@ check(getSetting('foxess_api_key') === 'replaced', 're-setting a key updates rat
 
 // --- Store: getBatteryConfig() — settings table first, then legacy config.php array, then hardcoded default ---
 check(
-    getBatteryConfig() == ['capacity_kwh' => 10.0, 'max_charge_kw' => 3.0, 'max_discharge_kw' => 3.0, 'min_soc_on_grid' => 15, 'reserve_soc' => 15],
+    getBatteryConfig() == ['capacity_kwh' => 10.0, 'max_charge_kw' => 3.0, 'max_discharge_kw' => 3.0, 'min_soc_on_grid' => 15, 'reserve_soc' => 15, 'round_trip_efficiency_pct' => 90.0],
     'getBatteryConfig() falls back to hardcoded defaults with no setting and no legacy config'
 );
 check(
-    getBatteryConfig(['max_discharge_kw' => 5.0, 'capacity_kwh' => 8.0]) == ['capacity_kwh' => 8.0, 'max_charge_kw' => 3.0, 'max_discharge_kw' => 5.0, 'min_soc_on_grid' => 15, 'reserve_soc' => 15],
+    getBatteryConfig(['max_discharge_kw' => 5.0, 'capacity_kwh' => 8.0]) == ['capacity_kwh' => 8.0, 'max_charge_kw' => 3.0, 'max_discharge_kw' => 5.0, 'min_soc_on_grid' => 15, 'reserve_soc' => 15, 'round_trip_efficiency_pct' => 90.0],
     'getBatteryConfig() falls back to the legacy config.php array for keys not yet saved as settings'
 );
 setSetting('battery_max_discharge_kw', '6.5');
@@ -487,6 +487,12 @@ check(
     'getBatteryConfig() prefers a saved setting over the legacy config.php value'
 );
 check(getBatteryConfig(['max_discharge_kw' => 5.0])['capacity_kwh'] === 10.0, 'getBatteryConfig() still falls back per-key for anything not individually saved');
+
+// --- Store: getModellingConfig() (GitHub issue #5) ---
+check(getModellingConfig() === ['soc_bin_kwh' => 0.1, 'min_end_soc_pct' => 20], 'getModellingConfig() falls back to hardcoded defaults with nothing saved');
+setSetting('modelling_soc_bin_kwh', '0.25');
+setSetting('modelling_min_end_soc_pct', '30');
+check(getModellingConfig() === ['soc_bin_kwh' => 0.25, 'min_end_soc_pct' => 30], 'getModellingConfig() reflects saved settings once they exist');
 
 check(verifySystemPassword('foxhole') === true, 'default password "foxhole" works before any password is set');
 check(verifySystemPassword('wrong') === false, 'wrong password rejected under the default');
