@@ -266,20 +266,24 @@ function renderHistoryChart(array $buckets, string $view): void
         }
     }
     ?>
-<svg class="price-chart" viewBox="0 0 <?= $width ?> <?= $height ?>" role="img" aria-label="Actual generation (left axis) and solar forecast (right axis) over the selected period">
+<svg class="price-chart" viewBox="0 0 <?= $width ?> <?= $height ?>" role="img"
+    aria-label="Actual generation (left axis) and solar forecast (right axis) over the selected period">
     <?= $grid ?>
     <?= $body ?>
     <g font-size="10" fill="var(--color-muted)">
         <?php if ($hasGeneration): ?>
-        <line x1="<?= $marginLeft ?>" y1="12" x2="<?= $marginLeft + 16 ?>" y2="12" stroke="var(--color-generation)" stroke-width="2" /><text x="<?= $marginLeft + 20 ?>" y="15">Generation (left axis)</text>
+        <line x1="<?= $marginLeft ?>" y1="12" x2="<?= $marginLeft + 16 ?>" y2="12" stroke="var(--color-generation)"
+            stroke-width="2" /><text x="<?= $marginLeft + 20 ?>" y="15">Generation (left axis)</text>
         <?php endif; ?>
         <?php if ($hasForecast): ?>
-        <line x1="<?= $marginLeft + 170 ?>" y1="12" x2="<?= $marginLeft + 186 ?>" y2="12" stroke="var(--color-solar)" stroke-width="2"<?= $view === 'day' ? ' stroke-dasharray="5,4"' : '' ?> /><text x="<?= $marginLeft + 190 ?>" y="15">Forecast (right axis)</text>
+        <line x1="<?= $marginLeft + 170 ?>" y1="12" x2="<?= $marginLeft + 186 ?>" y2="12" stroke="var(--color-solar)"
+            stroke-width="2" <?= $view === 'day' ? ' stroke-dasharray="5,4"' : '' ?> /><text
+            x="<?= $marginLeft + 190 ?>" y="15">Forecast (right axis)</text>
         <?php endif; ?>
     </g>
 </svg>
 <script>
-(function () {
+(function() {
     var svg = document.currentScript.previousElementSibling;
     var tooltip = document.getElementById('chart-tooltip');
     if (!tooltip) {
@@ -288,7 +292,7 @@ function renderHistoryChart(array $buckets, string $view): void
         tooltip.className = 'chart-tooltip';
         document.body.appendChild(tooltip);
     }
-    svg.addEventListener('mousemove', function (e) {
+    svg.addEventListener('mousemove', function(e) {
         var target = e.target.closest && e.target.closest('.chart-hit');
         if (!target) {
             tooltip.style.display = 'none';
@@ -299,12 +303,12 @@ function renderHistoryChart(array $buckets, string $view): void
         tooltip.style.top = (e.clientY + 12) + 'px';
         tooltip.style.display = 'block';
     });
-    svg.addEventListener('mouseleave', function () {
+    svg.addEventListener('mouseleave', function() {
         tooltip.style.display = 'none';
     });
 })();
 </script>
-    <?php
+<?php
 }
 
 function periodLink(string $view, DateTimeImmutable $date): string
@@ -324,16 +328,15 @@ $fetchedMsg = (string) ($_GET['msg'] ?? '');
 <?php endif; ?>
 
 <p class="muted">
-<?php if ($bounds['earliest'] === null): ?>
+    <?php if ($bounds['earliest'] === null): ?>
     No generation history fetched yet.
-<?php else: ?>
+    <?php else: ?>
     Generation history covers <?= htmlspecialchars($bounds['earliest']->setTimezone($timezone)->format('j M Y')) ?>
     to <?= htmlspecialchars($bounds['latest']->setTimezone($timezone)->format('j M Y')) ?>.
     <?= $exhaustedBefore !== null
         ? 'Backfill complete — FoxESS has no earlier data to fetch.'
         : 'Still backfilling further back — click "Fetch history now" (or just wait for the next scheduled run) to advance it.' ?>
-<?php endif; ?>
-    Day view is hourly, not half-hourly — FoxESS's report API reports generation per hour, not per half-hour.
+    <?php endif; ?>
 </p>
 
 <form method="post" action="history-fetch.php">
@@ -342,7 +345,8 @@ $fetchedMsg = (string) ($_GET['msg'] ?? '');
 
 <div class="view-tabs">
     <?php foreach (['day' => 'Day', 'week' => 'Week', 'month' => 'Month', 'year' => 'Year'] as $v => $label): ?>
-    <a class="view-tab<?= $v === $view ? ' view-tab-active' : '' ?>" href="<?= htmlspecialchars(periodLink($v, $anchor)) ?>"><?= $label ?></a>
+    <a class="view-tab<?= $v === $view ? ' view-tab-active' : '' ?>"
+        href="<?= htmlspecialchars(periodLink($v, $anchor)) ?>"><?= $label ?></a>
     <?php endforeach; ?>
 </div>
 
@@ -355,7 +359,8 @@ $fetchedMsg = (string) ($_GET['msg'] ?? '');
 <form method="get" action="history.php" class="history-date-form">
     <input type="hidden" name="view" value="<?= htmlspecialchars($view) ?>">
     <label for="date-picker">Jump to date</label>
-    <input type="date" id="date-picker" name="date" value="<?= htmlspecialchars($anchor->format('Y-m-d')) ?>" onchange="this.form.submit()">
+    <input type="date" id="date-picker" name="date" value="<?= htmlspecialchars($anchor->format('Y-m-d')) ?>"
+        onchange="this.form.submit()">
     <a href="<?= htmlspecialchars(periodLink($view, new DateTimeImmutable('today', $timezone))) ?>">Today</a>
 </form>
 
@@ -378,18 +383,27 @@ $fetchedMsg = (string) ($_GET['msg'] ?? '');
         <?php foreach ($buckets as $b): ?>
         <tr>
             <td><?= htmlspecialchars($b['label']) ?></td>
-            <td class="currency"><?= $b['generation_kwh'] !== null ? htmlspecialchars(number_format($b['generation_kwh'], 2)) : '—' ?></td>
-            <td class="currency"><?= $b['forecast_kwh'] !== null ? htmlspecialchars(number_format($b['forecast_kwh'], 2)) : '—' ?></td>
-            <td class="currency"><?= ($b['generation_kwh'] !== null && $b['forecast_kwh'] !== null) ? htmlspecialchars(number_format($b['generation_kwh'] - $b['forecast_kwh'], 2)) : '—' ?></td>
+            <td class="currency">
+                <?= $b['generation_kwh'] !== null ? htmlspecialchars(number_format($b['generation_kwh'], 2)) : '—' ?>
+            </td>
+            <td class="currency">
+                <?= $b['forecast_kwh'] !== null ? htmlspecialchars(number_format($b['forecast_kwh'], 2)) : '—' ?></td>
+            <td class="currency">
+                <?= ($b['generation_kwh'] !== null && $b['forecast_kwh'] !== null) ? htmlspecialchars(number_format($b['generation_kwh'] - $b['forecast_kwh'], 2)) : '—' ?>
+            </td>
         </tr>
         <?php endforeach; ?>
     </tbody>
     <tfoot>
         <tr>
             <th>Total</th>
-            <th class="currency"><?= $totalGeneration !== null ? htmlspecialchars(number_format($totalGeneration, 2)) : '—' ?></th>
-            <th class="currency"><?= $totalForecast !== null ? htmlspecialchars(number_format($totalForecast, 2)) : '—' ?></th>
-            <th class="currency"><?= ($totalGeneration !== null && $totalForecast !== null) ? htmlspecialchars(number_format($totalGeneration - $totalForecast, 2)) : '—' ?></th>
+            <th class="currency">
+                <?= $totalGeneration !== null ? htmlspecialchars(number_format($totalGeneration, 2)) : '—' ?></th>
+            <th class="currency">
+                <?= $totalForecast !== null ? htmlspecialchars(number_format($totalForecast, 2)) : '—' ?></th>
+            <th class="currency">
+                <?= ($totalGeneration !== null && $totalForecast !== null) ? htmlspecialchars(number_format($totalGeneration - $totalForecast, 2)) : '—' ?>
+            </th>
         </tr>
     </tfoot>
 </table>
@@ -408,7 +422,7 @@ $fetchedMsg = (string) ($_GET['msg'] ?? '');
 <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
 <script src="https://cdn.datatables.net/1.13.11/js/jquery.dataTables.min.js"></script>
 <script>
-$(function () {
+$(function() {
     $('#history-table').DataTable({
         order: [],
         paging: <?= count($buckets) > 15 ? 'true' : 'false' ?>,
