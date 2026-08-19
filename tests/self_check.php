@@ -11,6 +11,7 @@ require_once __DIR__ . '/../src/IntelligentScheduleBuilder.php';
 require_once __DIR__ . '/../src/Schedulers.php';
 require_once __DIR__ . '/../src/UsageEstimator.php';
 require_once __DIR__ . '/../src/HalfHourlyUsageEstimator.php';
+require_once __DIR__ . '/../src/ModellingScheduleBuilder.php';
 require_once __DIR__ . '/../src/Logger.php';
 require_once __DIR__ . '/../src/Store.php';
 require_once __DIR__ . '/../src/OctopusClient.php';
@@ -1120,6 +1121,64 @@ for ($daysBack = 1; $daysBack <= 28; $daysBack++) {
 }
 $tierMix = HalfHourlyUsageEstimator::estimateHalfHourly($refWednesday, $usageTz, buildHistoricUsageRows($tier1Fixture + $tier2Fixture, $usageTz), 300.0, 700.0);
 check(abs($tierMix[0] - 5.0) < 0.001, 'tier 1 alone reaches the 30-day cap for a weekday reference, so tier 2\'s 99.0 never gets averaged in: got ' . $tierMix[0] . ', expected 5.0 (half of 10.0/hour)');
+
+// --- ModellingScheduleBuilder (GitHub issue #5) — dynamic-programming solver ---
+$mTz = new DateTimeZone('Europe/London');
+$mStrategy = ['timezone' => 'Europe/London'];
+$mBattery = ['capacity_kwh' => 10.0, 'max_charge_kw' => 4.0, 'max_discharge_kw' => 4.0, 'min_soc_on_grid' => 0, 'reserve_soc' => 0, 'round_trip_efficiency_pct' => 100.0];
+
+// A minimum-end-of-horizon-SoC constraint forces some charging with no usage/solar to
+// justify it otherwise — the optimiser must pick the cheap slot to do it in, not the
+// expensive one, to reach the same required end state at lower cost.
+$cheapFirstSlots = buildSlotsFrom([10.0, 50.0], new DateTimeImmutable('2026-03-01 00:00:00', $mTz));
+$noUsage = [0.0, 0.0];
+$forceEndAt20pct = ['soc_bin_kwh' => 1.0, 'min_end_soc_pct' => 20];
+$cheapCharge = (new ModellingScheduleBuilder($mStrategy, $mBattery, $forceEndAt20pct))->build($cheapFirstSlots, null, $noUsage, null, 0.0);
+check(
+    count($cheapCharge['intervals']) === 1 && $cheapCharge['intervals'][0]['workMode'] === 'ForceCharge',
+    'a single ForceCharge interval satisfies the min-end-SoC constraint: got ' . json_encode(array_column($cheapCharge['intervals'], 'workMode')),
+);
+check($cheapCharge['intervals'][0]['start']->format('H:i') === '00:00', 'charging happens in the cheap first slot (10p), not the expensive second one (50p)');
+check(abs($cheapCharge['finalSocPercent'] - 20.0) < 1.0, 'finalSocPercent reaches the 20% minimum end-of-horizon target: got ' . $cheapCharge['finalSocPercent']);
+check(abs($cheapCharge['totalCostPence'] - 20.0) < 0.5, "charging 2kWh at 10p/kWh costs 20p total, cheaper than the 100p charging in the expensive slot would cost: got {$cheapCharge['totalCostPence']}");
+
+// An absurdly high max_charge_kw must still clamp the projected end SoC at 100%, not beyond.
+$hugeBattery = ['capacity_kwh' => 10.0, 'max_charge_kw' => 1000.0, 'max_discharge_kw' => 4.0, 'min_soc_on_grid' => 0, 'reserve_soc' => 0, 'round_trip_efficiency_pct' => 100.0];
+$oneSlot = buildSlotsFrom([1.0], new DateTimeImmutable('2026-03-01 00:00:00', $mTz));
+$forceFull = ['soc_bin_kwh' => 1.0, 'min_end_soc_pct' => 100];
+$capacityTest = (new ModellingScheduleBuilder($mStrategy, $hugeBattery, $forceFull))->build($oneSlot, null, [0.0], null, 0.0);
+check(abs($capacityTest['finalSocPercent'] - 100.0) < 1.0, "an absurdly high max_charge_kw (1000kW) still clamps the projected SoC at capacity (100%), not beyond: got {$capacityTest['finalSocPercent']}");
+
+// An absurdly high max_discharge_kw must still clamp at the reserve floor, not below —
+// even with a highly favourable export price making the optimiser want to sell as much as
+// possible.
+$hugeDischargeBattery = ['capacity_kwh' => 10.0, 'max_charge_kw' => 4.0, 'max_discharge_kw' => 1000.0, 'min_soc_on_grid' => 0, 'reserve_soc' => 50, 'round_trip_efficiency_pct' => 100.0];
+$sellImport = buildSlotsFrom([10.0], new DateTimeImmutable('2026-03-01 00:00:00', $mTz));
+$sellExport = buildSlotsFrom([100.0], new DateTimeImmutable('2026-03-01 00:00:00', $mTz));
+$noConstraint = ['soc_bin_kwh' => 1.0, 'min_end_soc_pct' => 0];
+$reserveTest = (new ModellingScheduleBuilder($mStrategy, $hugeDischargeBattery, $noConstraint))->build($sellImport, $sellExport, [0.0], null, 100.0);
+check(abs($reserveTest['finalSocPercent'] - 50.0) < 1.0, "an absurdly high max_discharge_kw (1000kW) still clamps at the reserve floor (50%), not below: got {$reserveTest['finalSocPercent']}");
+check(count($reserveTest['intervals']) === 1 && $reserveTest['intervals'][0]['workMode'] === 'ForceDischarge', 'selling at a highly favourable export price is chosen over idling');
+
+// The optimiser's own reported cost must genuinely beat a naive always-idle baseline
+// (every slot just imports exactly what covers usage at that slot's own price) — proves
+// it's actually solving, not just producing *a* valid schedule.
+$costBattery = ['capacity_kwh' => 10.0, 'max_charge_kw' => 4.0, 'max_discharge_kw' => 4.0, 'min_soc_on_grid' => 10, 'reserve_soc' => 10, 'round_trip_efficiency_pct' => 95.0];
+$costModelling = ['soc_bin_kwh' => 0.5, 'min_end_soc_pct' => 10];
+$costRates = [10.0, 10.0, 60.0, 60.0, 10.0, 10.0, 60.0, 60.0];
+$costSlots = buildSlotsFrom($costRates, new DateTimeImmutable('2026-03-01 00:00:00', $mTz));
+$costUsage = array_fill(0, 8, 1.0);
+$optimised = (new ModellingScheduleBuilder($mStrategy, $costBattery, $costModelling))->build($costSlots, null, $costUsage, null, 10.0);
+$idleCost = 0.0;
+for ($i = 0; $i < 8; $i++) {
+    $idleCost += $costUsage[$i] * $costRates[$i];
+}
+check(
+    $optimised['totalCostPence'] < $idleCost - 0.01,
+    "the DP's optimal cost ({$optimised['totalCostPence']}p) beats the always-idle baseline ({$idleCost}p) of buying exactly what's needed every slot at that slot's own price",
+);
+check(isset($optimised['finalSocPercent']), 'finalSocPercent is present in the return value');
+check(count($optimised['intervals']) > 0, 'the cost-beating schedule actually contains some force-charge/discharge activity, not an empty plan');
 
 if ($failures > 0) {
     fwrite(STDERR, "\n$failures/$checks checks failed\n");
