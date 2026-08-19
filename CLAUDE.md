@@ -734,13 +734,18 @@ split. Cost per transition is net grid flow × that slot's import price (net
 import) or export price (net export, i.e. a negative cost/credit). A
 forward Bellman recursion fills a `cost`/`backpointer` grid across the
 whole window in one pass; the terminal state prefers the minimum-cost
-end-of-horizon bin that meets `modelling_min_end_soc_pct` — with SoC held
-above that floor credited at the horizon's own cheapest import rate (see
-"A second live-verification bug" below for why that credit exists at all)
-— falling back to the global minimum-cost end state (flagged in the
-summary, not thrown) on the rare horizon too tight to meet it exactly;
-reconstruction then walks the backpointers from that terminal bin back to
-the known starting SoC.
+end-of-horizon bin that meets `modelling_min_end_soc_pct` — ties on that
+cost broken in favour of the *higher* SoC, a safe default with no
+downside, rather than an arbitrary pick — falling back to the global
+minimum-cost end state (flagged in the summary, not thrown) on the rare
+horizon too tight to meet it exactly; reconstruction then walks the
+backpointers from that terminal bin back to the known starting SoC. (An
+earlier version credited SoC held above the floor at a reference price
+here, specifically to stop wasteful selling — see "A real bug found only
+after deployment" below for the full story of why that approach was
+eventually abandoned in favour of gating the sale itself, in
+`transitionForceDischarge()`, rather than discouraging it after the fact
+at the terminal boundary.)
 Contiguous same-action slots are merged into absolute intervals the same
 way the other schedulers merge contiguous slots, just over real instants
 instead of a single day's array indices, since a merged run can itself span
@@ -767,71 +772,87 @@ DP would force-discharge a fully-charged battery down to the configured
 minimum end-of-horizon SoC purely to sell the excess at a flat, low fixed
 export rate — even with nothing to offset and that stored energy plainly
 worth more than the export price once you account for what it costs to buy
-back.* Root cause: `pickTerminalBin()` originally scored candidate
-end-of-horizon bins on raw cost alone, treating any SoC held above
-`modelling_min_end_soc_pct` as worth precisely nothing — so *any*
-non-negative export price looked like free money, and the optimiser
-happily "spent down" every kWh it wasn't strictly required to keep,
-regardless of how low the export price actually was. This is the classic
-finite-horizon battery-arbitrage trap: without a terminal value function,
-an optimiser that re-solves a rolling window fresh every run has no reason
-to hold energy past the edge of what it can currently see. Fixed by
-crediting SoC held above the floor at the horizon's own cheapest import
-rate — a self-contained, no-new-config proxy for "the least this energy
-could plausibly cost to replace" — when choosing which terminal bin to
-prefer; genuine self-consumption offsetting (avoiding an expensive import
-right now) is untouched, since that was never routed through
-`pickTerminalBin()` in the first place. A secondary tiebreaker (prefer the
-lower *raw*-cost bin among ties on adjusted cost) was needed alongside
-this: a near-flat market can leave several end states genuinely
-economically indifferent once credited at the same reference price, and
-without the tiebreaker the DP would pick whichever tied bin the scan
-happened to reach last — occasionally a real but pointless no-op force
-action — rather than the cheaper, simpler path. Both fixes are covered by
-regression tests built at the production-default `soc_bin_kwh` (0.1) — an
-earlier draft of the second test used a much coarser bin size and
-produced a *different*, misleading failure purely from compounding
-discretisation rounding at that scale, not the bug itself; worth
-remembering if tests here ever seem to fail for the "wrong" reason again.
+back.* This took three iterations to actually fix correctly — the first
+two attempts both introduced a new, real side effect of their own, caught
+by continuing to verify against real Octopus data (and, critically, by the
+user rejecting the first attempt's reasoning on economic grounds rather
+than by symptom) rather than declaring victory once the reported case
+looked clean:
 
-*A third bug, found chasing the second one with a real solar forecast
-added back in: the terminal-value credit above stops the DP selling stored
-energy at a bad price to satisfy the end-of-horizon floor, but it doesn't
-stop the DP selling energy* mid-*horizon at a bad price if doing so
-manufactures headroom that a **forecast** solar surplus later refills —
-the terminal credit only ever looks at the single ending state, so a path
-that sells cheap now and gets "topped back up for free" by solar a few
-slots later can still look better in the raw ledger than never having sold
-at all.* This is a real edge a genuine solver can find, but it's a bet on
-solar forecast accuracy, not on a price the DP actually knows — and
-user-rejected on exactly that basis: force-discharge should only ever be
-justified by a price the optimiser can already see (either the immediate
-export is itself worth taking, or a cheaper rebuy is reachable within the
-same horizon), never by speculating that a forecast will bail out an
-otherwise-unjustified sale. Fixed in `transitionForceDischarge()` directly
-rather than only at the terminal boundary: discharge may only exceed what
-a slot's own `usage - solar` needs when `exportPrice >= ` the horizon's
-cheapest import rate (the same reference price the terminal fix already
-established) — otherwise it's capped at exactly that need, same as
-self-consumption offsetting, never manufacturing a deliberate export.
-Getting this right also exposed a smaller sibling bug: when the cap forces
-zero discharge and there's a solar surplus, the transition must degenerate
-to *exactly* self-use's own absorption formula (crediting the surplus into
-the battery, not just discharging nothing) — an earlier version of this
-fix capped the discharge amount correctly but kept the plain
-`usage - solar - energyOut` formula regardless, which silently failed to
-credit any surplus into the battery and so still came out fractionally
-cheaper than self-use by dumping a sliver of solar as export instead of
-storing it, quietly winning what should have been an exact tie. Reproduced
-against the real Octopus rates and forecast totals that first surfaced it
-(a near-full battery, a genuine solar forecast, and export flat well below
-import) — this specific fixture is what `tests/self_check.php`'s third
-regression test uses, after a smaller/flatter synthetic fixture was tried
-first and found not to reproduce the bug at all, i.e. it would have passed
-on the broken code too. Worth remembering: a regression test for a DP bug
-like this is only as good as its price/solar shape — flat or too-short
-fixtures can fail to exercise the exact multi-step trade the bug depends
-on, and will pass regardless of whether the fix is actually present.
+1. *First attempt: value held-back SoC at the terminal boundary.*
+   `pickTerminalBin()` originally scored candidate end-of-horizon bins on
+   raw cost alone, treating any SoC held above `modelling_min_end_soc_pct`
+   as worth precisely nothing — so *any* non-negative export price looked
+   like free money, and the optimiser happily "spent down" every kWh it
+   wasn't strictly required to keep. The fix credited SoC held above the
+   floor at the horizon's own cheapest import rate when choosing the
+   terminal bin — the classic finite-horizon battery-arbitrage
+   countermeasure. It worked for the reported case, but was wrong in a way
+   that only showed up once solar was reintroduced (next point).
+2. *Second attempt: gate the sale itself, not just the terminal state.*
+   The terminal credit only ever looks at the *final* state, so a path
+   that sells cheap mid-horizon and gets "topped back up for free" by
+   **forecast** solar a few slots later could still look better in the raw
+   ledger than never selling at all — a bet on solar forecast accuracy,
+   not a price the DP actually knows, and rejected by the user on exactly
+   that basis: force-discharge should only ever be justified by a price
+   the optimiser can already see. Fixed in `transitionForceDischarge()`
+   directly: discharge may only exceed what a slot's own `usage - solar`
+   needs when `exportPrice` is at least as good as the horizon's cheapest
+   import rate; otherwise it's capped at exactly that need, same as
+   self-consumption offsetting, never manufacturing a deliberate export.
+   This also exposed a smaller sibling gap: when the cap forces zero
+   discharge and there's a solar surplus, the transition must degenerate
+   to *exactly* self-use's own absorption formula (crediting the surplus
+   into the battery), not just "discharge nothing" — an earlier draft of
+   this same fix capped the discharge amount correctly but kept the plain
+   `usage - solar - energyOut` formula regardless, silently failing to
+   credit the surplus and so still coming out fractionally cheaper than
+   self-use, quietly winning what should have been an exact tie.
+3. *Third discovery: the terminal credit itself was now not just
+   redundant but actively harmful.* With sale prices properly gated at the
+   point of sale, the terminal credit from step 1 was still active — and
+   it turned out to cut both ways: crediting held-back SoC doesn't just
+   discourage cheap sales, it also *rewards paying for real grid import
+   instead of drawing on the (already-owned, already-free) battery*,
+   whenever some slot's import price undercut the credited reference —
+   purely to inflate an ending-SoC valuation that was never going to be
+   genuinely spent or sold on anything. Caught live: a fully-charged
+   battery was choosing a no-op `ForceCharge` (headroom already zero, so
+   it draws straight from the grid instead of the battery) during a cheap
+   afternoon window, paying real money it didn't need to, specifically to
+   avoid drawing down SoC that self-use would have drawn down for free.
+   User clarification prompted the fix: self-use already sells any solar
+   surplus the battery can't absorb, and already covers usage from stored
+   energy for free — nothing left needs to *fight* for SoC by paying to
+   avoid using it. `pickTerminalBin()`'s credit was removed entirely,
+   reverting to plain minimum-cost-among-feasible-bins (with a same-cost
+   tiebreak toward the *higher* SoC, a safe default with no downside);
+   step 2's gate in `transitionForceDischarge()` was already sufficient on
+   its own to stop the original bug, since self-use's own natural
+   absorption/drawdown already handles both halves of "sell genuine
+   surplus" and "cover usage from stored energy" correctly without any
+   terminal accounting fiction. Re-running the full regression suite after
+   removing the credit outright — including the tests written for both
+   earlier attempts — confirmed every one still passed unchanged,
+   confirming the credit truly had become redundant, not just harmful.
+
+One more refinement folded in along the way: the gate's reference price is
+the horizon's cheapest import rate *inflated by round-trip efficiency*
+(`min(import) / efficiency`), not the bare rate — recharging 1kWh of
+*usable* capacity draws more than 1kWh from the grid, so a sale priced to
+just match the bare cheapest import rate is actually a guaranteed loss on
+the round trip once that's accounted for, not a break-even trade.
+
+All of this is covered by regression tests built at the production-default
+`soc_bin_kwh` (0.1) and against the real Octopus rates/solar totals that
+first surfaced each issue — smaller or flatter synthetic fixtures were
+tried first for two of these and found not to reproduce the bug at all
+(would have passed on the broken code too, proving nothing). Worth
+remembering for any future DP bug here: a regression test is only as good
+as its price/solar shape and horizon length — a fixture has to actually
+create the multi-step trade-off the bug depends on, or it's not testing
+anything.
 
 **A real bug found via live verification, not by inspection: SQLite TEXT
 comparison of ISO 8601 datetime strings isn't chronologically correct

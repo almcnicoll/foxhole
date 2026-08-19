@@ -1248,6 +1248,33 @@ check(
     'a near-full battery with an early solar surplus and a flat export rate below import stays on self-use — no force-discharge to manufacture headroom for forecast solar: got ' . json_encode(array_column($solarResult['intervals'], 'workMode')),
 );
 
+// User clarification: since self-use already sells any solar surplus the battery can't
+// absorb, deliberately selling *stored* capacity is only ever justified by a price that
+// beats what it would cost to buy an equivalent *usable* kWh back — and round-trip
+// efficiency means that's strictly more than the bare cheapest import rate (recharging
+// 1kWh of usable capacity draws more than 1kWh from the grid). A bare price-match export
+// (worthwhile under the un-adjusted threshold) is actually a guaranteed loss once
+// efficiency is accounted for, and must NOT trigger a deliberate discharge; a export price
+// that clears the efficiency-adjusted bar still should.
+$effBattery = ['capacity_kwh' => 10.0, 'max_charge_kw' => 4.0, 'max_discharge_kw' => 4.0, 'min_soc_on_grid' => 0, 'reserve_soc' => 0, 'round_trip_efficiency_pct' => 80.0];
+$effModelling = ['soc_bin_kwh' => 0.1, 'min_end_soc_pct' => 0];
+$effStart = new DateTimeImmutable('2026-03-01 00:00:00', $mTz);
+$effUsage = [0.0, 0.0];
+// Cheapest import in the horizon is 20p (slot 1) -> replacement price = 20/0.8 = 25p.
+$effImportSlots = buildSlotsFrom([999.0, 20.0], $effStart);
+$marginalExportSlots = buildSlotsFrom([22.0, 20.0], $effStart); // 22p clears 20p but not 25p
+$marginalResult = (new ModellingScheduleBuilder($mStrategy, $effBattery, $effModelling))->build($effImportSlots, $marginalExportSlots, $effUsage, null, 100.0);
+check(
+    count($marginalResult['intervals']) === 0,
+    "an export price (22p) above the bare cheapest import rate (20p) but below the efficiency-adjusted replacement cost (20p / 80% = 25p) must not trigger a deliberate discharge — it's a guaranteed loss on the round trip: got " . json_encode(array_column($marginalResult['intervals'], 'workMode')),
+);
+$profitableExportSlots = buildSlotsFrom([30.0, 20.0], $effStart); // 30p clears the 25p bar
+$profitableResult = (new ModellingScheduleBuilder($mStrategy, $effBattery, $effModelling))->build($effImportSlots, $profitableExportSlots, $effUsage, null, 100.0);
+check(
+    count($profitableResult['intervals']) === 1 && $profitableResult['intervals'][0]['workMode'] === 'ForceDischarge',
+    'an export price (30p) that clears the efficiency-adjusted replacement cost (25p) still triggers a genuine discharge: got ' . json_encode(array_column($profitableResult['intervals'], 'workMode')),
+);
+
 // The optimiser's own reported cost must genuinely beat a naive always-idle baseline
 // (every slot just imports exactly what covers usage at that slot's own price) — proves
 // it's actually solving, not just producing *a* valid schedule.

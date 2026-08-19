@@ -99,11 +99,6 @@ class ModellingScheduleBuilder
         $timezone = new DateTimeZone($this->strategyConfig['timezone'] ?? 'Europe/London');
         $importRates = array_column($importSlots, 'rate');
         $exportRates = $exportSlots !== null ? array_column($exportSlots, 'rate') : null;
-        // The least this horizon suggests a kWh could cost to replace — used both as the
-        // gate on ForceDischarge selling beyond what a slot's own usage needs (below) and
-        // to value SoC held above the floor when picking the terminal state (see
-        // pickTerminalBin()'s doc comment).
-        $cheapestImportRate = min($importRates);
 
         $capacityKwh = (float) ($this->batteryConfig['capacity_kwh'] ?? 0);
         $chargeKw = (float) ($this->batteryConfig['max_charge_kw'] ?? 0);
@@ -111,6 +106,16 @@ class ModellingScheduleBuilder
         $minSocOnGrid = (int) ($this->batteryConfig['min_soc_on_grid'] ?? 0);
         $reserveSoc = (int) ($this->batteryConfig['reserve_soc'] ?? 0);
         $efficiency = max(0.01, min(1.0, ((float) ($this->batteryConfig['round_trip_efficiency_pct'] ?? 100)) / 100));
+
+        // The least a *usable* kWh could cost to replace: the horizon's cheapest import
+        // rate, inflated by round-trip efficiency since recharging 1kWh of usable capacity
+        // draws 1/efficiency kWh from the grid (see the class doc comment — efficiency is
+        // applied once, on the charge side). Used both as the gate on ForceDischarge
+        // selling beyond what a slot's own usage needs (below) and to value SoC held above
+        // the floor when picking the terminal state (see pickTerminalBin()'s doc comment) —
+        // without the efficiency adjustment, a "sell now, rebuy later at the same price"
+        // round trip would look break-even when it's actually a guaranteed loss.
+        $replacementPrice = min($importRates) / $efficiency;
 
         $reserveSocKwh = $capacityKwh * $reserveSoc / 100;
         $minSocOnGridKwh = $capacityKwh * $minSocOnGrid / 100;
@@ -159,7 +164,7 @@ class ModellingScheduleBuilder
                         $reserveSocKwh,
                         $minSocOnGridKwh,
                         $exportPrice,
-                        $cheapestImportRate,
+                        $replacementPrice,
                     );
                     $stepCost = $netGridKwh >= 0 ? $netGridKwh * $importPrice : $netGridKwh * $exportPrice;
                     $totalCost = $cost[$t][$b] + $stepCost;
@@ -173,7 +178,7 @@ class ModellingScheduleBuilder
         }
 
         $minEndSocKwh = $capacityKwh * ((int) ($this->modellingConfig['min_end_soc_pct'] ?? 0)) / 100;
-        [$bestBin, $constraintRelaxed] = $this->pickTerminalBin($cost[$n], $binKwh, $numBins, $minEndSocKwh, $cheapestImportRate);
+        [$bestBin, $constraintRelaxed] = $this->pickTerminalBin($cost[$n], $binKwh, $numBins, $minEndSocKwh);
 
         // --- Reconstruct the action sequence via backpointers ---
         $actionByIndex = [];
@@ -236,11 +241,11 @@ class ModellingScheduleBuilder
         float $reserveSocKwh,
         float $minSocOnGridKwh,
         float $exportPrice,
-        float $cheapestImportRate,
+        float $replacementPrice,
     ): array {
         return match ($action) {
             'ForceCharge' => $this->transitionForceCharge($socKwh, $usage, $solar, $chargeEnergyKwh, $efficiency, $capacityKwh),
-            'ForceDischarge' => $this->transitionForceDischarge($socKwh, $usage, $solar, $dischargeEnergyKwh, $reserveSocKwh, $capacityKwh, $exportPrice, $cheapestImportRate),
+            'ForceDischarge' => $this->transitionForceDischarge($socKwh, $usage, $solar, $dischargeEnergyKwh, $reserveSocKwh, $capacityKwh, $exportPrice, $replacementPrice),
             default => $this->transitionSelfUse($socKwh, $usage, $solar, $capacityKwh, $minSocOnGridKwh),
         };
     }
@@ -263,10 +268,17 @@ class ModellingScheduleBuilder
      * narratable as "the highest-value point to discharge" (it wasn't; the price alone
      * didn't justify it). Reflects the user's own stated rule: force-discharge is only
      * for genuinely profitable trades — either the export price itself is worth taking
-     * ($exportPrice >= $cheapestImportRate, i.e. selling now for at least as much as it
-     * would cost to buy an equivalent kWh back within this same horizon), or covering the
-     * slot's own usage, which self-use would do for free anyway but at rated power rather
-     * than the natural drift rate.
+     * ($exportPrice >= $replacementPrice, i.e. selling now for at least as much as it
+     * would cost to buy an equivalent *usable* kWh back within this same horizon —
+     * $replacementPrice already prices in round-trip efficiency, since recharging 1kWh of
+     * usable capacity draws more than 1kWh from the grid, so a bare price match would still
+     * be a guaranteed loss on the round trip), or covering the slot's own usage, which
+     * self-use would do for free anyway but at rated power rather than the natural drift
+     * rate. Self-use already sells any solar surplus the battery can't absorb once it's
+     * full — this cap doesn't need to (and shouldn't try to) replicate that; it only
+     * governs *additional*, deliberate selling of stored capacity beyond what self-use
+     * would already do on its own, which is why the user's own framing is that genuine
+     * force-discharge should be rare.
      *
      * When selling isn't worthwhile and there's a solar surplus (solar >= usage), this
      * must degenerate to *exactly* self-use's own absorption formula, not just "discharge
@@ -278,9 +290,9 @@ class ModellingScheduleBuilder
      * "must never beat self-use for no reason" bug the SelfUse-first action ordering above
      * exists to prevent, just not an exact tie this time so that fix alone didn't catch it.
      */
-    private function transitionForceDischarge(float $socKwh, float $usage, float $solar, float $dischargeEnergyKwh, float $reserveSocKwh, float $capacityKwh, float $exportPrice, float $cheapestImportRate): array
+    private function transitionForceDischarge(float $socKwh, float $usage, float $solar, float $dischargeEnergyKwh, float $reserveSocKwh, float $capacityKwh, float $exportPrice, float $replacementPrice): array
     {
-        $sellingIsWorthwhile = $exportPrice >= $cheapestImportRate;
+        $sellingIsWorthwhile = $exportPrice >= $replacementPrice;
         $net = $solar - $usage;
         if ($net >= 0 && !$sellingIsWorthwhile) {
             $absorbed = min($net, max(0.0, $capacityKwh - $socKwh));
@@ -314,54 +326,52 @@ class ModellingScheduleBuilder
     }
 
     /**
-     * Prefers the minimum-cost terminal state whose SoC meets $minEndSocKwh. If none does
-     * (a very tight horizon can genuinely make this infeasible), falls back to the global
-     * minimum-cost terminal state regardless, flagged via the second return value, rather
-     * than throwing — SelfUse the whole way is always reachable, so some finite-cost state
-     * always exists.
+     * Prefers the minimum-cost terminal state whose SoC meets $minEndSocKwh, and among ties
+     * on that raw cost, the *highest* SoC — a safe, no-downside default (never a worse
+     * outcome, occasionally a better-positioned one for whatever run happens next) rather
+     * than an arbitrary pick. If no bin meets the floor at all (a very tight horizon can
+     * genuinely make this infeasible), falls back to the global minimum-cost terminal state
+     * regardless, flagged via the second return value, rather than throwing — SelfUse the
+     * whole way is always reachable, so some finite-cost state always exists.
      *
-     * A real bug found via live verification (not by inspection): scoring candidate bins on
-     * $terminalCosts alone treats any SoC above the floor as worth exactly nothing — so
-     * whenever the DP could reach the floor exactly, it would happily force-discharge every
-     * kWh above it "for free" at whatever the export price was, even a low flat rate well
-     * below what that energy would cost to buy back later, because holding it carried no
-     * offsetting value in the comparison. $referencePrice (the horizon's own cheapest import
-     * rate — the least this energy could plausibly be replaced for) is credited against each
-     * candidate bin's cost per kWh held above the floor, so a discharge is only preferred
-     * when the price actually received for it beats that replacement cost, not merely
-     * whenever it's non-negative. Genuine self-consumption offsetting (avoiding an
-     * expensive import right now) is untouched — this only discourages exporting stored
-     * capacity beyond that for a price that isn't actually worth it.
+     * Deliberately scores on raw cost alone, not a cost adjusted by any value credited to
+     * ending SoC above the floor. An earlier version credited each bin's SoC-above-floor at
+     * a reference "replacement price" (build()'s $replacementPrice), specifically to stop
+     * ForceDischarge selling stored energy cheaply just to satisfy this floor — a real bug,
+     * found live. But crediting ending SoC here, uniformly, created a *second* bug: whenever
+     * some slot's import price was cheaper than the reference price, the DP would rather pay
+     * that real import cost than draw down the (already-owned, already-free) battery via
+     * self-use, purely to "buy" a higher credited ending SoC that was never going to be
+     * genuinely used or sold for anything — a real, avoidable grid-import cost incurred for
+     * an accounting fiction. The actual fix for the original bug now lives one level down,
+     * in transitionForceDischarge()'s own gate on when it may deliberately create an export
+     * — which prevents a bad sale at the point it would happen, rather than trying to
+     * discourage it after the fact via a blanket value on the terminal state. That gate
+     * alone is sufficient: self-use's own natural absorption/drawdown already handles both
+     * "sell genuine solar surplus" and "cover usage from stored energy" for free, so nothing
+     * left in this function needs to fight for SoC by paying to avoid using it.
      *
      * @return array{0: int, 1: bool} [bestBin, constraintWasRelaxed]
      */
-    private function pickTerminalBin(array $terminalCosts, Closure $binKwh, int $numBins, float $minEndSocKwh, float $referencePrice): array
+    private function pickTerminalBin(array $terminalCosts, Closure $binKwh, int $numBins, float $minEndSocKwh): array
     {
-        // Pass 1: the lowest adjusted cost among feasible bins.
-        $bestAdjustedCost = INF;
+        // Pass 1: the lowest raw cost among feasible bins.
+        $bestCost = INF;
         for ($b = 0; $b < $numBins; $b++) {
             if ($terminalCosts[$b] === INF || $binKwh($b) < $minEndSocKwh - 1e-9) {
                 continue;
             }
-            $adjustedCost = $terminalCosts[$b] - ($binKwh($b) - $minEndSocKwh) * $referencePrice;
-            $bestAdjustedCost = min($bestAdjustedCost, $adjustedCost);
+            $bestCost = min($bestCost, $terminalCosts[$b]);
         }
-        // Pass 2: among bins tied on that adjusted cost, prefer the lower *raw* cost. A
-        // near-flat market (or one that happens to match $referencePrice exactly) can leave
-        // several bins genuinely tied on adjusted cost — e.g. "hold this kWh" vs "spend it
-        // and buy an equivalent kWh back" cost the same when the buy-back price equals
-        // $referencePrice. Without this tiebreaker the loop would just keep whichever bin it
-        // reaches last, which can be an arbitrary no-op force action that costs real money
-        // for no benefit instead of the cheaper actual path (typically SelfUse).
+        // Pass 2: among bins tied on that cost, prefer the highest SoC.
         $bestBin = null;
-        $bestRawCost = INF;
+        $bestSocKwh = -INF;
         for ($b = 0; $b < $numBins; $b++) {
             if ($terminalCosts[$b] === INF || $binKwh($b) < $minEndSocKwh - 1e-9) {
                 continue;
             }
-            $adjustedCost = $terminalCosts[$b] - ($binKwh($b) - $minEndSocKwh) * $referencePrice;
-            if ($adjustedCost < $bestAdjustedCost + 1e-9 && $terminalCosts[$b] < $bestRawCost) {
-                $bestRawCost = $terminalCosts[$b];
+            if ($terminalCosts[$b] < $bestCost + 1e-9 && $binKwh($b) > $bestSocKwh) {
+                $bestSocKwh = $binKwh($b);
                 $bestBin = $b;
             }
         }
