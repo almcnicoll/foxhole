@@ -1058,6 +1058,49 @@ uses. One accepted consequence: once a body is redacted past the 7-day window, `
 is no longer recoverable and the colour falls back to the coarser status-code-only
 judgement — a known, accepted trade-off of the retention rule, not a bug.
 
+**Rate-limit/quota detection surfaces on the dashboard and history page, not just the API
+log's red badge (GitHub issue #7).** The API log already coloured a rate-limited call red
+(any non-zero `errno` other than the specially-handled "Device offline" one falls into the
+generic `error` bucket) — the gap was that nothing *named* the condition anywhere a user
+would actually see without opening that page. Confirmed against
+`TonyM1958/FoxESS-Cloud`'s Error Codes wiki (the same reference this file already leans on
+for `40256`/`41811`/`41935`): errno `40400` ("Your requests are too frequent"), `40401`
+("Account login is too frequent" — the auth/token call specifically), `40402` ("Your
+request exceeds the limit" — the daily quota, reportedly 1,440 calls/device/day). Not
+independently live-verified against this project's own account the way `41935`'s exact
+wording was (see `isOfflineFailure()`'s own test, built from real observed text) — this one
+is matched on the errno itself, embedded in every `FoxessClient::post()` exception message
+as `error <errno>:`, specifically *because* that's more robust to not having confirmed
+FoxESS's exact wording than a text match would be.
+
+`Runner::isRateLimitedFailure()` is the shared detector. Two call sites:
+- **The schedule push** (`runScheduler()`): `pushToDevices()` already retains each device's
+  own failure message, so a rate-limited push gets its own explicit sentence appended to
+  the existing "still pending" dashboard message, same spot `isOfflineFailure()`'s
+  offline-is-routine carve-out already lives.
+- **Generation history fetch** (`HistoryFetcher::fetchGenerationHistory()`): its
+  forward-catchup/backward-backfill loops only ever needed success/no-data/error to decide
+  whether to keep going, not *why* an error happened, so before this the function would
+  quietly report "fetched 0 day(s)" with `ok: true` even when every call that run was
+  rejected for being rate-limited — worse than the push case, since there was no hint at
+  all anything was wrong. Rather than threading a new failure-detail signal through
+  `fetchDayAcrossDevices()`/`fetchUsageDayAcrossDevices()`/`backfillHistoryBackward()`'s
+  several existing layers just for this, `Store::wasRecentlyRateLimited()` re-checks the API
+  log itself (every `FoxessClient` call already writes there via `saveApiLogEntry()`) for
+  any `40400`/`40401`/`40402` logged since the run started — reusing infrastructure that
+  already exists rather than plumbing a new one through code that has no other reason to
+  care about failure detail.
+
+A rate limit hit during the history fetch doesn't necessarily also hit the schedule push
+later in the same run — a short burst-rate throttle (`40400`) can clear before the
+far-smaller number of push calls happen — so `runScheduler()` remembers whether the history
+step was rate-limited and appends a note to whichever message it ends up returning, even
+when the push itself goes on to succeed cleanly. Verified with a scripted `FoxessClient`
+subclass reproducing FoxESS's actual response shape (HTTP 200, `errno` wrapped in the JSON
+body) end-to-end through `backfillHistoryBackward()` → `wasRecentlyRateLimited()` → the
+final message text, rather than only unit-testing each piece in isolation — this project
+doesn't have a live FoxESS account handy to genuinely trigger the real limit against.
+
 **Nav gets `flex-wrap` rather than a redesign.** The issue flagged that adding "API log"
 might make the nav unwieldy — with `Dashboard`/`Schedulers`/`Override`/`History`/`API log`/
 `Settings`/`Log out` now seven items, a narrow viewport could genuinely overflow. Fixed

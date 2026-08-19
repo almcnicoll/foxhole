@@ -151,10 +151,18 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
         // failure here should never abort a real scheduling run. Skipped for dry runs for
         // the same reason FoxESS credentials aren't read at all in that mode (see below):
         // this needs them too. See HistoryFetcher.php for what this actually does.
+        //
+        // GitHub issue #7: a rate limit hit here doesn't necessarily also hit the schedule
+        // push below (a short burst-rate throttle can clear before the far-smaller number of
+        // push calls happen) — remembered here so the run's own final message can mention it
+        // even when the push itself goes on to succeed cleanly, rather than this being
+        // silently visible only in the log file.
+        $historyRateLimited = false;
         if (!$dryRun) {
             try {
                 $historyResult = fetchGenerationHistory($config, $logger);
                 $logger->info('Generation history: ' . $historyResult['message']);
+                $historyRateLimited = str_contains($historyResult['message'], 'rate-limiting');
             } catch (Throwable $e) {
                 $logger->warn('Generation history fetch failed, skipping: ' . $e->getMessage());
             }
@@ -363,6 +371,11 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
         // derivation, so only the push-tracking setting is left to update here.
         setSetting('last_pushed_groups_json', json_encode($pushGroups));
 
+        // GitHub issue #7: appended to whichever message below ends up returned, so a rate
+        // limit hit during the generation-history fetch stays visible even when the push
+        // itself (below) goes on to succeed cleanly — see $historyRateLimited's own comment.
+        $historyNote = $historyRateLimited ? ' (Also: FoxESS rate-limited the generation history fetch earlier this run — see the API log.)' : '';
+
         if ($stillPending) {
             // "Device offline" is expected/routine for a battery-less inverter after dark —
             // it has no power to stay connected once solar generation stops. That alone
@@ -379,6 +392,14 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
                 count($deviceSns),
                 implode(', ', $stillPending),
             );
+            // GitHub issue #7: called out explicitly, not left for the user to dig into the
+            // API log to notice — a rate-limited push will keep failing every run until
+            // FoxESS's own window resets, which looks identical to a genuine auth/permission
+            // failure from the dashboard alone otherwise.
+            if (array_filter($stillPending, fn($sn) => isRateLimitedFailure($pushResult['failureMessages'][$sn]))) {
+                $message .= ' FoxESS is rate-limiting or has hit its API quota for this account — this should resolve on its own once the limit resets.';
+            }
+            $message .= $historyNote;
             if ($hardFailureSns) {
                 $logger->error($message . ' Failure detail: ' . implode('; ', $pushResult['failures']));
                 alertOnFailure($config, 'FoxESS scheduler: push incomplete', $message);
@@ -395,7 +416,7 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
             count($pushGroups),
             $pushResult['callCount'],
             implode(' ', array_column($scheduleByDate, 'summary')),
-        );
+        ) . $historyNote;
         $logger->info($message);
         return ['ok' => true, 'dryRun' => false, 'message' => $message, 'schedule' => $scheduleByDate];
     } catch (OctopusFetchException|ScheduleBuildException|FoxessPushException $e) {
@@ -593,6 +614,23 @@ function pushToDevices(array $clients, array $groups, Logger $logger): array
 function isOfflineFailure(string $message): bool
 {
     return str_contains($message, 'Device offline');
+}
+
+/**
+ * GitHub issue #7: FoxESS rate-limits/quota-limits like any other business error — HTTP 200
+ * with a non-zero errno, not a 429 — confirmed against TonyM1958/FoxESS-Cloud's Error Codes
+ * wiki (the same reference already trusted elsewhere in this file for 40256/41811/41935):
+ * errno 40400 ("Your requests are too frequent"), 40401 ("Account login is too frequent" —
+ * the auth/token call specifically), 40402 ("Your request exceeds the limit" — the daily
+ * quota, reportedly 1,440 calls/device/day). Matched on the errno itself, embedded in every
+ * FoxessClient::post() exception message as "error <errno>:", rather than FoxESS's own
+ * wording — more robust to any future wording change on their side, and this already showed
+ * up as a red error badge in the API log (api-log.php's apiLogLevel(), same errno-in-body
+ * detection) before this function existed to give it a name callers can act on.
+ */
+function isRateLimitedFailure(string $message): bool
+{
+    return (bool) preg_match('/error 404(00|01|02):/', $message);
 }
 
 function alertOnFailure(array $config, string $subject, string $message): void

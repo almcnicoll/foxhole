@@ -92,6 +92,9 @@ function fetchGenerationHistory(array $config, Logger $logger): array
     }
     $today = new DateTimeImmutable('today', $timezone);
     $daysStored = 0;
+    // Same default-timezone construction FoxessClient::post() uses for the api_log rows
+    // this timestamps against — see wasRecentlyRateLimited()'s own doc comment.
+    $runStartedAt = new DateTimeImmutable('now');
 
     // --- Forward catch-up: latest stored day (or yesterday, if nothing stored yet) through today ---
     $bounds = getHistoricGenerationBounds();
@@ -113,6 +116,18 @@ function fetchGenerationHistory(array $config, Logger $logger): array
     }
 
     $daysStored += backfillHistoryBackward($clients, $today, $timezone, $logger);
+
+    // GitHub issue #7: FoxESS wraps rate-limit/quota errors inside an HTTP 200 (see
+    // Runner::isRateLimitedFailure()'s doc comment), so neither loop above ever saw a
+    // hard error to react to — they'd just quietly stop making progress, and this
+    // function would report "fetched 0 day(s)" with no hint why. Surfaced from the API
+    // log (see wasRecentlyRateLimited()) rather than a per-call return signal, since
+    // both loops only ever needed success/no-data/error to decide whether to keep going.
+    if (wasRecentlyRateLimited($runStartedAt)) {
+        $message = "Generation history: fetched $daysStored day(s), but FoxESS is rate-limiting or has hit its API quota for this account — some fetches this run may have been skipped. This should resolve on its own once the limit resets.";
+        $logger->warn($message);
+        return ['ok' => $daysStored > 0, 'message' => $message];
+    }
 
     return ['ok' => true, 'message' => "Generation history: fetched $daysStored day(s)."];
 }

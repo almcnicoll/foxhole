@@ -437,6 +437,15 @@ check(isOfflineFailure('FoxESS /op/v1/device/scheduler/enable error 41935: Devic
 check(!isOfflineFailure('FoxESS /op/v1/device/scheduler/enable error 41811: User permissions do not allow this operation'), 'a permissions error is not treated as a routine offline failure');
 check(!isOfflineFailure('cURL error fetching Octopus rates: Could not resolve host'), 'an unrelated cURL error is not treated as a routine offline failure');
 
+// --- Runner: isRateLimitedFailure() (GitHub issue #7) recognises FoxESS's rate-limit/quota
+// errno family (40400/40401/40402), matched on the errno FoxessClient::post() always embeds
+// in its exception message, not FoxESS's own wording ---
+check(isRateLimitedFailure('FoxESS /op/v1/device/scheduler/enable error 40400: Your requests are too frequent. Please try again later'), 'errno 40400 (too frequent) is recognised as rate-limited');
+check(isRateLimitedFailure('FoxESS /op/v0/user/token error 40401: Account login is too frequent. Please try again later'), 'errno 40401 (login too frequent) is recognised as rate-limited too');
+check(isRateLimitedFailure('FoxESS /op/v1/device/real/query error 40402: Your request exceeds the limit. Please try again later'), 'errno 40402 (quota exceeded) is recognised as rate-limited too');
+check(!isRateLimitedFailure('FoxESS /op/v1/device/scheduler/enable error 41935: Device offline, Please connect and retry'), 'an unrelated errno (even one starting with a similar digit pattern) is not treated as rate-limited');
+check(!isRateLimitedFailure('cURL error fetching Octopus rates: Could not resolve host'), 'a transport-level cURL error is not treated as rate-limited');
+
 // --- HistoryFetcher: combineDeviceGenerationResults() SUCCESS/NO_DATA/ERROR semantics ---
 check(
     combineDeviceGenerationResults([[1.0, 2.0], [0.5, 0.5]]) === [1.5, 2.5],
@@ -619,6 +628,20 @@ check(
 
 check(count(getApiLogEntries(1)) === 1, 'getApiLogEntries() respects its $limit argument');
 check(count(getApiLogEntries(10, 1)) === 2, 'getApiLogEntries() respects its $offset argument');
+
+// --- Store: wasRecentlyRateLimited() (GitHub issue #7) — surfaces a rate-limit/quota errno
+// from the API log so HistoryFetcher can report it even though its own loops only ever
+// needed success/no-data/error to decide whether to keep going, not why ---
+$rateLimitWindowStart = $logNow->modify('+9 days');
+check(!wasRecentlyRateLimited($rateLimitWindowStart), 'no rate-limited calls logged yet within the window');
+saveApiLogEntry('/op/v1/device/scheduler/enable', '{}', 200, '{"errno":40400,"msg":"Your requests are too frequent. Please try again later"}', $rateLimitWindowStart->modify('+1 minute'));
+check(wasRecentlyRateLimited($rateLimitWindowStart), 'a 40400 errno logged after the window start is detected');
+check(!wasRecentlyRateLimited($rateLimitWindowStart->modify('+2 minutes')), 'the same call is not "recent" relative to a window starting after it happened');
+saveApiLogEntry('/op/v1/device/real/query', '{}', 200, '{"errno":0}', $rateLimitWindowStart->modify('+3 minutes'));
+check(wasRecentlyRateLimited($rateLimitWindowStart), 'a later plain success call does not mask an earlier rate-limit hit still within the window');
+saveApiLogEntry('/op/v1/device/scheduler/get', '{}', 200, '{"errno":41935,"msg":"Device offline, Please connect and retry"}', $rateLimitWindowStart->modify('+4 minutes'));
+check(wasRecentlyRateLimited($rateLimitWindowStart), 'an unrelated errno logged even later still does not mask the earlier rate-limit hit');
+check(!wasRecentlyRateLimited($rateLimitWindowStart->modify('+5 minutes')), 'a window starting after every logged call finds nothing, even though rate-limiting did happen earlier');
 
 // --- PriceProvider: fixed mode (default + override), api mode without a configured product/tariff ---
 $priceLogger = new Logger(sys_get_temp_dir() . '/foxhole_self_check_' . getmypid() . '.log');

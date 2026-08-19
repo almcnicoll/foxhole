@@ -648,6 +648,32 @@ function countApiLogEntries(): int
     return (int) db()->query('SELECT COUNT(*) FROM api_log')->fetchColumn();
 }
 
+/**
+ * GitHub issue #7: whether any FoxESS API call logged since $since came back rate-limited or
+ * over quota (errno 40400/40401/40402 — see Runner::isRateLimitedFailure()'s doc comment).
+ * HistoryFetcher::fetchGenerationHistory()'s forward-catchup/backward-backfill loops don't
+ * retain per-call failure detail themselves (they only need success/no-data/error to decide
+ * whether to keep going, not why an error happened) — this reuses the API log every
+ * FoxessClient call already writes to (saveApiLogEntry()) rather than threading a new signal
+ * through several layers of existing functions just for this one, occasional case. $since
+ * must come from the same default-timezone `new DateTimeImmutable('now')` construction
+ * FoxessClient::post() uses for `called_at` — see CLAUDE.md's "SQLite TEXT comparison" note
+ * on why comparing across mismatched offsets silently breaks.
+ */
+function wasRecentlyRateLimited(DateTimeImmutable $since): bool
+{
+    $stmt = db()->prepare("SELECT response_body FROM api_log WHERE called_at >= :since AND status_code = 200 AND response_body IS NOT NULL");
+    $stmt->execute(['since' => $since->format(DATE_ATOM)]);
+    foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $body) {
+        $decoded = json_decode($body, true);
+        $errno = is_array($decoded) ? ($decoded['errno'] ?? 0) : 0;
+        if (in_array($errno, [40400, 40401, 40402], true)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function verifySystemPassword(string $attempt): bool
 {
     $hash = getSetting('system_password_hash');
