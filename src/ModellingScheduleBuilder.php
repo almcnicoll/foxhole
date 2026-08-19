@@ -75,6 +75,17 @@ class ModellingScheduleBuilder
      *        prorated onto $importSlots by time overlap. Null if unavailable.
      * @param ?float $currentSocPercent actual battery SoC right now (FoxessClient::getBatterySoc()),
      *        0-100, or null if unknown (falls back to the reserve floor, same as IntelligentScheduleBuilder).
+     * @param ?array $forcedActionsByIndex same length/order as $importSlots — null (the
+     *        default: every slot is a free choice) or, per index, either null or one of
+     *        'ForceCharge'/'ForceDischarge'/'SelfUse' to make that slot's action compulsory
+     *        rather than optimised. This is how Fill-your-boots/Power-down overrides feed
+     *        into the DP itself (Schedulers.php's buildForcedActionsFromOverrides()) — as
+     *        hard constraints the recursion optimises *around*, not something painted over
+     *        the output afterward the way the other two schedulers' overrides work. A
+     *        forced slot's own cost/SoC-transition math is completely unchanged — only the
+     *        set of actions considered for it shrinks to one — so a forced discharge with
+     *        nothing available to discharge still correctly does nothing, same as an
+     *        unconstrained one would.
      * @return array{intervals: array, summary: string, finalSocPercent: float, totalCostPence: float}
      *         intervals: array<int, array{start: DateTimeImmutable, end: DateTimeImmutable, workMode: string, explanation: string}>,
      *         already excluding SelfUse periods (nothing to explicitly push for those, same
@@ -83,7 +94,7 @@ class ModellingScheduleBuilder
      *         to confirm it's actually optimising, but also generically useful (e.g. a
      *         future "projected cost" figure in the UI).
      */
-    public function build(array $importSlots, ?array $exportSlots, array $halfHourlyUsageKwh, ?array $solarSlots, ?float $currentSocPercent): array
+    public function build(array $importSlots, ?array $exportSlots, array $halfHourlyUsageKwh, ?array $solarSlots, ?float $currentSocPercent, ?array $forcedActionsByIndex = null): array
     {
         $n = count($importSlots);
         if ($n !== count($halfHourlyUsageKwh)) {
@@ -110,11 +121,10 @@ class ModellingScheduleBuilder
         // The least a *usable* kWh could cost to replace: the horizon's cheapest import
         // rate, inflated by round-trip efficiency since recharging 1kWh of usable capacity
         // draws 1/efficiency kWh from the grid (see the class doc comment — efficiency is
-        // applied once, on the charge side). Used both as the gate on ForceDischarge
-        // selling beyond what a slot's own usage needs (below) and to value SoC held above
-        // the floor when picking the terminal state (see pickTerminalBin()'s doc comment) —
-        // without the efficiency adjustment, a "sell now, rebuy later at the same price"
-        // round trip would look break-even when it's actually a guaranteed loss.
+        // applied once, on the charge side). Gates ForceDischarge selling beyond what a
+        // slot's own usage needs (see transitionForceDischarge()'s doc comment) — without
+        // the efficiency adjustment, a "sell now, rebuy later at the same price" round trip
+        // would look break-even when it's actually a guaranteed loss.
         $replacementPrice = min($importRates) / $efficiency;
 
         $reserveSocKwh = $capacityKwh * $reserveSoc / 100;
@@ -145,13 +155,19 @@ class ModellingScheduleBuilder
             $exportPrice = $exportRates !== null ? $exportRates[$t] : 0.0;
             $usage = $halfHourlyUsageKwh[$t];
             $solar = $solarKwh[$t];
+            // A forced slot (see this method's own doc comment) restricts the actions tried
+            // to the single compulsory one — everything downstream (transition cost, SoC
+            // update, backpointer) is unchanged, so the recursion still finds the cheapest
+            // way to reach every *other* state around this constraint.
+            $forcedAction = $forcedActionsByIndex[$t] ?? null;
+            $actionsToTry = $forcedAction !== null ? [$forcedAction] : self::ACTIONS;
 
             for ($b = 0; $b < $numBins; $b++) {
                 if ($cost[$t][$b] === INF) {
                     continue; // unreached state
                 }
                 $socKwh = $binKwh($b);
-                foreach (self::ACTIONS as $action) {
+                foreach ($actionsToTry as $action) {
                     [$newSocKwh, $netGridKwh] = $this->transition(
                         $action,
                         $socKwh,

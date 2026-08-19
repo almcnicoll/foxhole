@@ -1325,6 +1325,81 @@ check(
 );
 check($midnightSchedule['2026-03-01']['summary'] === $midnightSchedule['2026-03-02']['summary'], 'the whole-window summary is attached identically to every touched date, since the DP doesn\'t compute a separate per-date breakdown');
 
+// --- ModellingScheduleBuilder: overrides fed in as compulsory DP actions (user-requested) ---
+// Rather than painting an override onto the DP's output afterward (the way the other two
+// schedulers' overrides work), a forced slot restricts the DP to a single action for that
+// slot and lets it optimise every other slot around the resulting SoC trajectory. Slot 0 is
+// the expensive one (50p) — left free, the DP would charge in one of the cheap slots (10p)
+// instead, exactly like the existing "cheap slot preferred" test above. Forcing slot 0 to
+// ForceCharge must make the DP charge there *and* recognise that the forced charge alone
+// already meets the 20% end target, so it must NOT also charge in a cheap slot afterward —
+// that's the "optimise around it" half of the ask, not just "obey it".
+$forcedChargeBattery = ['capacity_kwh' => 10.0, 'max_charge_kw' => 4.0, 'max_discharge_kw' => 4.0, 'min_soc_on_grid' => 0, 'reserve_soc' => 0, 'round_trip_efficiency_pct' => 100.0];
+$forcedChargeModelling = ['soc_bin_kwh' => 0.5, 'min_end_soc_pct' => 20];
+$forcedChargeSlots = buildSlotsFrom([50.0, 10.0, 10.0], new DateTimeImmutable('2026-04-01 00:00:00', $mTz));
+$forcedChargeUsage = [0.0, 0.0, 0.0];
+$forcedChargeResult = (new ModellingScheduleBuilder($mStrategy, $forcedChargeBattery, $forcedChargeModelling))
+    ->build($forcedChargeSlots, null, $forcedChargeUsage, null, 0.0, ['ForceCharge', null, null]);
+check(
+    count($forcedChargeResult['intervals']) === 1 && $forcedChargeResult['intervals'][0]['workMode'] === 'ForceCharge' && $forcedChargeResult['intervals'][0]['start']->format('H:i') === '00:00',
+    'a forced ForceCharge on the expensive slot is obeyed even though the DP would otherwise have preferred a cheap slot: got ' . json_encode(array_column($forcedChargeResult['intervals'], 'workMode')),
+);
+check(
+    abs($forcedChargeResult['totalCostPence'] - 100.0) < 0.5,
+    "charging 2kWh at the forced (expensive, 50p) slot costs 100p, and the DP must not also charge in a cheap slot once the end-SoC target is already met by the forced charge: got {$forcedChargeResult['totalCostPence']}p",
+);
+
+// The opposite direction: a forced SelfUse must block an otherwise clearly profitable
+// discharge — same shape as the "highly favourable export price" test above (which left
+// this slot free and got a ForceDischarge), but with the slot forced to SelfUse instead.
+// This is exactly what a power_down event window means (see ScheduleBuilder::overrideModesFor()'s
+// doc comment): held in reserve, not sold, even when the DP would otherwise want to sell.
+$forcedSelfUseBattery = ['capacity_kwh' => 10.0, 'max_charge_kw' => 4.0, 'max_discharge_kw' => 1000.0, 'min_soc_on_grid' => 0, 'reserve_soc' => 50, 'round_trip_efficiency_pct' => 100.0];
+$forcedSelfUseModelling = ['soc_bin_kwh' => 1.0, 'min_end_soc_pct' => 0];
+$forcedSelfUseImport = buildSlotsFrom([10.0], new DateTimeImmutable('2026-04-01 00:00:00', $mTz));
+$forcedSelfUseExport = buildSlotsFrom([100.0], new DateTimeImmutable('2026-04-01 00:00:00', $mTz));
+$forcedSelfUseResult = (new ModellingScheduleBuilder($mStrategy, $forcedSelfUseBattery, $forcedSelfUseModelling))
+    ->build($forcedSelfUseImport, $forcedSelfUseExport, [0.0], null, 100.0, ['SelfUse']);
+check(
+    count($forcedSelfUseResult['intervals']) === 0,
+    'a forced SelfUse blocks a discharge the DP would otherwise clearly want (100p export vs 10p import): got ' . json_encode(array_column($forcedSelfUseResult['intervals'], 'workMode')),
+);
+check(abs($forcedSelfUseResult['finalSocPercent'] - 100.0) < 1.0, 'the battery stays at its starting 100% — forced self-use with no usage/solar genuinely does nothing: got ' . $forcedSelfUseResult['finalSocPercent']);
+
+// --- Schedulers.php: buildForcedActionsFromOverrides() — translates overrides into per-slot
+// compulsory actions ahead of the DP, so it can optimise around them rather than have them
+// painted on afterward (user-requested) ---
+$overrideTz = new DateTimeZone('Europe/London');
+saveOverride('2026-04-02', 'fill_your_boots', '10:00', '11:00', '09:00', '10:00');
+$bootsSlots = buildSlotsFrom(array_fill(0, 8, 20.0), new DateTimeImmutable('2026-04-02 08:00:00', $overrideTz));
+$bootsForced = buildForcedActionsFromOverrides($bootsSlots, $overrideTz);
+check(
+    $bootsForced === [null, null, 'ForceDischarge', 'ForceDischarge', 'ForceCharge', 'ForceCharge', null, null],
+    'fill_your_boots translates to a ForceDischarge prep window then a ForceCharge event window, leaving slots outside both free: got ' . json_encode($bootsForced),
+);
+
+saveOverride('2026-04-03', 'power_down', '14:00', '14:30', null, null);
+$powerDownSlots = buildSlotsFrom([1.0, 1.0, 1.0], new DateTimeImmutable('2026-04-03 13:30:00', $overrideTz));
+$powerDownForced = buildForcedActionsFromOverrides($powerDownSlots, $overrideTz);
+check($powerDownForced === [null, 'SelfUse', null], 'power_down with no prep window forces only its event slot, to SelfUse: got ' . json_encode($powerDownForced));
+
+// An override's free-form time doesn't have to land on a half-hour boundary — a slot the
+// window only partially overlaps is still forced for its whole half hour (the DP's own
+// granularity can't do better; the exact minute boundary is trimmed afterward by the
+// existing post-hoc ScheduleBuilder::applyOverrides() pass — see buildForcedActionsFromOverrides()'s
+// own doc comment).
+saveOverride('2026-04-04', 'fill_your_boots', '10:15', '10:45', null, null);
+$edgeSlots = buildSlotsFrom([1.0, 1.0], new DateTimeImmutable('2026-04-04 10:00:00', $overrideTz));
+$edgeForced = buildForcedActionsFromOverrides($edgeSlots, $overrideTz);
+check($edgeForced === ['ForceCharge', 'ForceCharge'], "a 10:15-10:45 event forces both the 10:00-10:30 and 10:30-11:00 slots it only partially overlaps: got " . json_encode($edgeForced));
+
+// An override on one date must never leak into an adjacent date's same local time.
+$noLeakSlots = buildSlotsFrom([1.0, 1.0], new DateTimeImmutable('2026-04-05 10:00:00', $overrideTz));
+$noLeakForced = buildForcedActionsFromOverrides($noLeakSlots, $overrideTz);
+check($noLeakForced === [null, null], "2026-04-02's fill_your_boots override doesn't leak into 2026-04-05's slots: got " . json_encode($noLeakForced));
+
+check(overrideWindowInstants('2026-04-06', $overrideTz, '10:00', '10:00', 'ForceCharge') === null, 'an empty/invalid override window (end <= start) is ignored rather than corrupting the forced-actions array');
+
 if ($failures > 0) {
     fwrite(STDERR, "\n$failures/$checks checks failed\n");
     exit(1);

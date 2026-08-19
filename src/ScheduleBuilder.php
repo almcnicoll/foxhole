@@ -155,15 +155,7 @@ class ScheduleBuilder
         $intervals = $this->groupsToIntervals($groups, $explanations);
 
         foreach ($overrides as $override) {
-            $isPowerDown = $override['kind'] === 'power_down';
-            $label = $isPowerDown ? 'Power down' : 'Fill your boots';
-            // Fill-your-boots events force-charge (there's surplus cheap/free energy to use).
-            // Power-down events switch to SelfUse rather than force-discharging: selling the
-            // battery down during a power-down window works against the point of it — it
-            // should be held in reserve for the house's own usage instead, not sold back with
-            // the risk of needing to buy grid power again once the event ends.
-            $eventMode = $isPowerDown ? 'SelfUse' : 'ForceCharge';
-            $prepMode = $isPowerDown ? 'ForceCharge' : 'ForceDischarge';
+            ['label' => $label, 'eventMode' => $eventMode, 'prepMode' => $prepMode] = self::overrideModesFor($override['kind']);
 
             $windows = [];
             if ($override['prep_start'] !== null && $override['prep_end'] !== null) {
@@ -194,6 +186,31 @@ class ScheduleBuilder
         usort($intervals, fn($a, $b) => $a['start'] <=> $b['start']);
 
         return $this->intervalsToGroups($intervals);
+    }
+
+    /**
+     * What an override's prep/event windows actually mean, in one place — public and static
+     * so Schedulers.php's buildForcedActionsFromOverrides() can share this exact mapping
+     * rather than risk drifting from it (see that function's own doc comment for why the
+     * modelling scheduler needs to know these modes *before* it optimises, not just as a
+     * post-hoc overlay the way this class applies them).
+     *
+     * Fill-your-boots events force-charge (there's surplus cheap/free energy to use).
+     * Power-down events switch to SelfUse rather than force-discharging: selling the battery
+     * down during a power-down window works against the point of it — it should be held in
+     * reserve for the house's own usage instead, not sold back with the risk of needing to
+     * buy grid power again once the event ends.
+     *
+     * @return array{label: string, eventMode: string, prepMode: string}
+     */
+    public static function overrideModesFor(string $kind): array
+    {
+        $isPowerDown = $kind === 'power_down';
+        return [
+            'label' => $isPowerDown ? 'Power down' : 'Fill your boots',
+            'eventMode' => $isPowerDown ? 'SelfUse' : 'ForceCharge',
+            'prepMode' => $isPowerDown ? 'ForceCharge' : 'ForceDischarge',
+        ];
     }
 
     /**

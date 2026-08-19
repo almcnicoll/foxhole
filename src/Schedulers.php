@@ -154,6 +154,10 @@ function buildMultiDaySchedule(string $schedulerId, array $strategyConfig, array
  *        window derivation — same bounds ScheduleBuilder::buildPushWindow() uses),
  *        possibly spanning more than one calendar date
  * @param float[] $halfHourlyUsageKwh aligned to $importSlots (see HalfHourlyUsageEstimator)
+ * @param ?array $forcedActionsByIndex aligned to $importSlots — see
+ *        ModellingScheduleBuilder::build()'s own doc comment; buildModellingScheduleForRun()
+ *        is what actually populates this from active overrides via
+ *        buildForcedActionsFromOverrides()
  * @return array<string, array{groups: array, explanations: string[], summary: string}> for_date => schedule
  */
 function buildModellingSchedule(
@@ -166,9 +170,10 @@ function buildModellingSchedule(
     ?array $solarSlots,
     ?float $currentSocPercent,
     DateTimeZone $timezone,
+    ?array $forcedActionsByIndex = null,
 ): array {
     $result = (new ModellingScheduleBuilder($strategyConfig, $batteryConfig, $modellingConfig))
-        ->build($importSlots, $exportSlots, $halfHourlyUsageKwh, $solarSlots, $currentSocPercent);
+        ->build($importSlots, $exportSlots, $halfHourlyUsageKwh, $solarSlots, $currentSocPercent, $forcedActionsByIndex);
 
     // Clip each of the DP's absolute intervals at calendar-date boundaries — one interval
     // can itself span midnight, so keying by its start date alone would silently drop the
@@ -203,6 +208,73 @@ function buildModellingSchedule(
     }
     ksort($byDate);
     return $byDate;
+}
+
+/**
+ * Translates active Fill-your-boots/Power-down overrides (Store::getOverridesForDate) into a
+ * per-slot compulsory action aligned to $importSlots, so ModellingScheduleBuilder::build()
+ * can treat them as hard constraints the DP optimises *around* rather than something painted
+ * onto its output afterward (the way ScheduleBuilder::applyOverrides() still works for the
+ * other two schedulers — see that method and this function's own use in
+ * buildModellingScheduleForRun()). Feeding the override in up front, not after, is what lets
+ * the DP's own SoC trajectory correctly account for the override's own charge/discharge
+ * before deciding what to do with every other slot — a post-hoc overlay can't do that, since
+ * by the time it runs the DP has already committed to a (now-partly-wrong) plan for the rest
+ * of the horizon built without knowing the override was coming.
+ *
+ * Same mode mapping ScheduleBuilder::overrideModesFor() defines, applied here to absolute
+ * instants instead of that method's minute-of-day integers, since this needs to work across
+ * however many calendar dates the rolling window actually touches. A slot is forced whenever
+ * an override window overlaps it *at all*, not only when fully contained — the DP's own
+ * half-hour granularity is coarser than an override's free-form <input type="time">
+ * boundaries, so a slot straddling an override's edge is still treated as compulsory for its
+ * whole half hour. The exact minute-level boundary, and the correct override-specific
+ * explanation text (this function has no reason to invent its own — the DP would just narrate
+ * a forced slot as if it were freely chosen, which is honestly wrong for it), are both still
+ * supplied afterward by the existing post-hoc ScheduleBuilder::applyOverrides() pass
+ * (Runner.php) — the two are complementary, not redundant: this function gets the
+ * *optimisation* right, that pass gets the *precision and narration* right. Later overrides
+ * win on any overlap, the same precedent getOverridesForDate()'s `ORDER BY kind` +
+ * applyOverrides()'s sequential subtractInterval() already established.
+ *
+ * @return array<int, ?string> same length/order as $importSlots — null (free choice) or one
+ *         of 'ForceCharge'/'ForceDischarge'/'SelfUse'
+ */
+function buildForcedActionsFromOverrides(array $importSlots, DateTimeZone $timezone): array
+{
+    $windowsByDate = [];
+    $forced = array_fill(0, count($importSlots), null);
+    foreach ($importSlots as $i => $slot) {
+        $forDate = $slot['from']->setTimezone($timezone)->format('Y-m-d');
+        if (!isset($windowsByDate[$forDate])) {
+            $windows = [];
+            foreach (getOverridesForDate($forDate) as $override) {
+                ['eventMode' => $eventMode, 'prepMode' => $prepMode] = ScheduleBuilder::overrideModesFor($override['kind']);
+                if ($override['prep_start'] !== null && $override['prep_end'] !== null) {
+                    $windows[] = [$forDate, $timezone, $override['prep_start'], $override['prep_end'], $prepMode];
+                }
+                $windows[] = [$forDate, $timezone, $override['event_start'], $override['event_end'], $eventMode];
+            }
+            $windowsByDate[$forDate] = array_values(array_filter(array_map(
+                fn($w) => overrideWindowInstants(...$w),
+                $windows,
+            )));
+        }
+        foreach ($windowsByDate[$forDate] as $window) {
+            if ($slot['from'] < $window['end'] && $slot['to'] > $window['start']) {
+                $forced[$i] = $window['mode'];
+            }
+        }
+    }
+    return $forced;
+}
+
+/** @return ?array{start: DateTimeImmutable, end: DateTimeImmutable, mode: string} null for an invalid/empty window (ignored, same rule ScheduleBuilder::applyOverrides() uses) */
+function overrideWindowInstants(string $forDate, DateTimeZone $timezone, string $startStr, string $endStr, string $mode): ?array
+{
+    $start = new DateTimeImmutable("$forDate $startStr", $timezone);
+    $end = new DateTimeImmutable("$forDate $endStr", $timezone);
+    return $end > $start ? ['start' => $start, 'end' => $end, 'mode' => $mode] : null;
 }
 
 /**
@@ -285,5 +357,7 @@ function buildModellingScheduleForRun(
         $halfHourlyUsageKwh[] = $usageForecastByDate[$forDate][$halfHourIndex] ?? 0.0;
     }
 
-    return buildModellingSchedule($strategyConfig, $batteryConfig, $modellingConfig, $importSlots, $exportSlots, $halfHourlyUsageKwh, $solarSlots, $currentSocPercent, $timezone);
+    $forcedActionsByIndex = buildForcedActionsFromOverrides($importSlots, $timezone);
+
+    return buildModellingSchedule($strategyConfig, $batteryConfig, $modellingConfig, $importSlots, $exportSlots, $halfHourlyUsageKwh, $solarSlots, $currentSocPercent, $timezone, $forcedActionsByIndex);
 }

@@ -854,6 +854,67 @@ as its price/solar shape and horizon length — a fixture has to actually
 create the multi-step trade-off the bug depends on, or it's not testing
 anything.
 
+**Overrides feed into the DP as hard constraints, not a post-hoc overlay
+(user-requested).** Fill-your-boots/Power-down overrides (`overrides`
+table, `override.php`) previously only ever reached a computed schedule
+via `ScheduleBuilder::applyOverrides()` — called from `Runner.php` *after*
+whichever scheduler had already produced its plan, painting the override's
+own forced periods over whatever was there. That's still exactly how
+`ScheduleBuilder`/`IntelligentScheduleBuilder` get theirs; it's a fine fit
+for a greedy heuristic that doesn't globally optimise a SoC trajectory in
+the first place. It's a poor fit for the modelling scheduler specifically:
+an override applied only after the DP has already solved the whole horizon
+means the DP's own SoC-trajectory optimisation for every *other* slot was
+computed in ignorance of a charge/discharge the schedule will actually
+contain — the combined result can be internally inconsistent (e.g. the DP
+might independently have planned a charge for a slot the override is about
+to force into a discharge instead).
+
+Fixed by giving `ModellingScheduleBuilder::build()` an optional
+`$forcedActionsByIndex` parameter (same length as `$importSlots`; null or
+one of the three action names per slot). A forced slot doesn't get special
+transition math — the cost/SoC-update formulas are identical either way —
+it just restricts the action loop to the single compulsory choice for that
+slot, so the Bellman recursion still finds the genuinely cheapest way to
+handle every *other* slot given the SoC trajectory that choice produces.
+That's the literal meaning of "reflect the overrides and optimise around
+them": the override is data the solver sees before it solves, not a patch
+applied to its answer.
+
+`Schedulers.php`'s new `buildForcedActionsFromOverrides()` is what
+populates this from real overrides — called from
+`buildModellingScheduleForRun()`, so every existing call site
+(`Runner.php`'s `runScheduler()`/`reapplyOverrides()`, `schedulers.php`'s
+preview) picks it up with no changes of its own. It shares its mode
+mapping (fill_your_boots: prep=ForceDischarge, event=ForceCharge;
+power_down: prep=ForceCharge, event=SelfUse) with `applyOverrides()` via a
+new `ScheduleBuilder::overrideModesFor()` static helper — extracted
+specifically so the two can't silently drift apart on what an override
+actually means. Working across however many calendar dates the rolling
+window touches (unlike `applyOverrides()`, which only ever deals with one
+date at a time and works in bare minute-of-day integers) means resolving
+each override's H:i strings against real dates into absolute instants,
+then marking a slot forced whenever an override window overlaps it *at
+all* — not only when fully contained. The DP's own half-hour granularity
+is coarser than an override's free-form `<input type="time">` boundaries,
+so a slot straddling an override's edge is conservatively treated as
+compulsory for its whole half hour.
+
+**The post-hoc `applyOverrides()` pass still runs afterward for every
+scheduler, including modelling — deliberately kept, not made redundant by
+the above.** It does two things the DP-level constraint can't: replaces
+the DP's own explanation for a forced slot (which would otherwise narrate
+it as a normal cost-driven choice — "the lowest-cost point... to charge"
+— genuinely misleading for a slot that wasn't actually chosen for cost
+reasons at all) with the honest override-specific wording, and trims the
+final output to the override's exact minute boundaries rather than the
+DP's coarser half-hour ones. The two passes are complementary: the DP-level
+constraint gets the *optimisation* right, the post-hoc pass gets the
+*precision and narration* right. Confirmed live: a saved override run
+through the full pipeline (DP forces the slot, then the post-hoc pass
+relabels it) produces a single clean group with the correct override
+explanation, not a duplicate or conflicting one.
+
 **A real bug found via live verification, not by inspection: SQLite TEXT
 comparison of ISO 8601 datetime strings isn't chronologically correct
 unless every value shares the same UTC offset.** `price_slots.slot_from` is
