@@ -626,26 +626,133 @@ function saveApiLogEntry(string $endpoint, ?string $requestBody, ?int $statusCod
     $stmt->execute([$calledAt->format(DATE_ATOM), $endpoint, $requestBody, $statusCode, $responseBody]);
 }
 
-/** @return array<int, array{id:int, called_at: DateTimeImmutable, endpoint:string, request_body:?string, status_code:?int, response_body:?string}> most recent first */
-function getApiLogEntries(int $limit, int $offset = 0): array
+/** See getAllApiLogEntriesForLevelFilter()'s doc comment. */
+const API_LOG_LEVEL_FILTER_MAX_ROWS = 5000;
+
+/**
+ * GitHub issue #8: $statusCode/$noResponseOnly are api-log.php's status-code filter — a
+ * plain WHERE, since status_code is a real stored column. Its *level* filter
+ * (error/warning/success) is deliberately not a parameter here: level is derived at render
+ * time by apiLogLevel() below (JSON-parsing the response body, downgrading the "Device
+ * offline" case, falling back to status-only once a body is redacted), and pushing that into
+ * SQL would mean maintaining the same classification logic in two places that could drift
+ * apart — see getAllApiLogEntriesForLevelFilter() for how that case is handled instead.
+ *
+ * @return array<int, array{id:int, called_at: DateTimeImmutable, endpoint:string, request_body:?string, status_code:?int, response_body:?string}> most recent first
+ */
+function getApiLogEntries(int $limit, int $offset = 0, ?int $statusCode = null, bool $noResponseOnly = false): array
 {
-    $stmt = db()->prepare('SELECT * FROM api_log ORDER BY id DESC LIMIT ? OFFSET ?');
-    $stmt->bindValue(1, $limit, PDO::PARAM_INT);
-    $stmt->bindValue(2, $offset, PDO::PARAM_INT);
+    [$where, $params] = apiLogStatusFilterSql($statusCode, $noResponseOnly);
+    $stmt = db()->prepare("SELECT * FROM api_log $where ORDER BY id DESC LIMIT :limit OFFSET :offset");
+    foreach ($params as $key => $value) {
+        $stmt->bindValue($key, $value, PDO::PARAM_INT);
+    }
+    $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+    $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
     $stmt->execute();
-    return array_map(fn($row) => [
+    return array_map('mapApiLogRow', $stmt->fetchAll(PDO::FETCH_ASSOC));
+}
+
+function countApiLogEntries(?int $statusCode = null, bool $noResponseOnly = false): int
+{
+    [$where, $params] = apiLogStatusFilterSql($statusCode, $noResponseOnly);
+    $stmt = db()->prepare("SELECT COUNT(*) FROM api_log $where");
+    foreach ($params as $key => $value) {
+        $stmt->bindValue($key, $value, PDO::PARAM_INT);
+    }
+    $stmt->execute();
+    return (int) $stmt->fetchColumn();
+}
+
+/**
+ * All entries (no LIMIT/OFFSET pagination) matching the optional status filter,
+ * most-recent-first, capped at API_LOG_LEVEL_FILTER_MAX_ROWS — used only by api-log.php when
+ * its level filter (error/warning/success) is active, since (see getApiLogEntries()'s own
+ * doc comment) that can't be pushed into SQL without duplicating apiLogLevel()'s logic.
+ * api-log.php filters this in PHP with that same function, then paginates the filtered
+ * result itself. The cap is a sanity backstop for a single-user hobby-scale install's log,
+ * not expected to be hit in practice.
+ */
+function getAllApiLogEntriesForLevelFilter(?int $statusCode, bool $noResponseOnly): array
+{
+    [$where, $params] = apiLogStatusFilterSql($statusCode, $noResponseOnly);
+    $stmt = db()->prepare("SELECT * FROM api_log $where ORDER BY id DESC LIMIT :cap");
+    foreach ($params as $key => $value) {
+        $stmt->bindValue($key, $value, PDO::PARAM_INT);
+    }
+    $stmt->bindValue(':cap', API_LOG_LEVEL_FILTER_MAX_ROWS, PDO::PARAM_INT);
+    $stmt->execute();
+    return array_map('mapApiLogRow', $stmt->fetchAll(PDO::FETCH_ASSOC));
+}
+
+/**
+ * Every FoxESS call either succeeds outright (HTTP 200, errno 0), fails at the network level
+ * (no status code at all), or comes back HTTP 200 with a non-zero `errno` — FoxESS wraps
+ * logical/business errors inside a 200 response rather than a non-2xx status, so colouring
+ * by HTTP status alone would show green for most real failures. "Device offline" (errno
+ * 41935) is downgraded to a warning rather than an error, same as Runner.php's
+ * isOfflineFailure() treats it elsewhere — it's routine for a battery-less inverter
+ * overnight, not a genuine problem.
+ *
+ * Once a body is redacted (see saveApiLogEntry()'s 7-day retention rule), errno is no longer
+ * recoverable — this falls back to the coarser HTTP-status-only judgement for those entries,
+ * which is an accepted trade-off of that rule, not a bug.
+ *
+ * Lives here rather than in api-log.php (which originally defined it, before GitHub issue
+ * #8's filter needed to reuse the exact same classification) so it can be unit-tested
+ * directly and shared with getAllApiLogEntriesForLevelFilter()'s caller without requiring a
+ * whole login-gated page file just to reach one pure function.
+ */
+function apiLogLevel(?int $statusCode, ?string $responseBody): string
+{
+    if ($statusCode === null || $statusCode !== 200) {
+        return 'error';
+    }
+    if ($responseBody === null) {
+        return 'success';
+    }
+    $decoded = json_decode($responseBody, true);
+    $errno = is_array($decoded) ? ($decoded['errno'] ?? 0) : 0;
+    if ($errno === 0) {
+        return 'success';
+    }
+    return str_contains((string) ($decoded['msg'] ?? ''), 'Device offline') ? 'warning' : 'error';
+}
+
+/** @return array{0: string, 1: array<string, int>} [whereClauseSql, boundParams] shared by every api_log query above. */
+function apiLogStatusFilterSql(?int $statusCode, bool $noResponseOnly): array
+{
+    if ($noResponseOnly) {
+        return ['WHERE status_code IS NULL', []];
+    }
+    if ($statusCode !== null) {
+        return ['WHERE status_code = :status', [':status' => $statusCode]];
+    }
+    return ['', []];
+}
+
+function mapApiLogRow(array $row): array
+{
+    return [
         'id' => (int) $row['id'],
         'called_at' => new DateTimeImmutable($row['called_at']),
         'endpoint' => $row['endpoint'],
         'request_body' => $row['request_body'],
         'status_code' => $row['status_code'] !== null ? (int) $row['status_code'] : null,
         'response_body' => $row['response_body'],
-    ], $stmt->fetchAll(PDO::FETCH_ASSOC));
+    ];
 }
 
-function countApiLogEntries(): int
+/** @return int[] distinct HTTP status codes actually present in api_log, ascending — populates api-log.php's status filter dropdown with only options that mean something, not a hardcoded guess list. */
+function getDistinctApiLogStatusCodes(): array
 {
-    return (int) db()->query('SELECT COUNT(*) FROM api_log')->fetchColumn();
+    return array_map('intval', db()->query('SELECT DISTINCT status_code FROM api_log WHERE status_code IS NOT NULL ORDER BY status_code ASC')->fetchAll(PDO::FETCH_COLUMN));
+}
+
+/** Whether any transport-level failure (no HTTP response at all) has ever been logged — api-log.php only offers "No response" as a status filter option when this is true. */
+function hasApiLogNoResponseEntries(): bool
+{
+    return (bool) db()->query('SELECT EXISTS(SELECT 1 FROM api_log WHERE status_code IS NULL)')->fetchColumn();
 }
 
 /**

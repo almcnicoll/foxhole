@@ -1047,16 +1047,39 @@ errors inside HTTP 200.** A naive "colour by status code" would show green for m
 failures, since FoxESS's own API returns `{errno, msg, result}` inside a 200 response for
 business-level errors (bad auth, wrong permissions, etc.) rather than a non-2xx status —
 only a genuine transport failure or an unexpected non-200 HTTP response gets a non-200
-status at all. `api-log.php`'s `apiLogLevel()` therefore parses the stored response body
-for `errno` when the status is 200, downgrading the specific, already-established "Device
+status at all. `Store::apiLogLevel()` therefore parses the stored response body for
+`errno` when the status is 200, downgrading the specific, already-established "Device
 offline" case (`errno` 41935, same string check `Runner.php`'s `isOfflineFailure()` uses)
 to a warning rather than an error, since that's routine for a battery-less inverter
-overnight, not a real problem. This is a display-time heuristic in `api-log.php`, not a
-new column `saveApiLogEntry()` writes — same "derive it at render time rather than
-storing a redundant field" pattern index.php's `$ranClass` warning-detection already
-uses. One accepted consequence: once a body is redacted past the 7-day window, `errno`
-is no longer recoverable and the colour falls back to the coarser status-code-only
-judgement — a known, accepted trade-off of the retention rule, not a bug.
+overnight, not a real problem. This is a display-time heuristic, not a new column
+`saveApiLogEntry()` writes — same "derive it at render time rather than storing a
+redundant field" pattern index.php's `$ranClass` warning-detection already uses. One
+accepted consequence: once a body is redacted past the 7-day window, `errno` is no longer
+recoverable and the colour falls back to the coarser status-code-only judgement — a
+known, accepted trade-off of the retention rule, not a bug.
+
+**Status/level filtering (GitHub issue #8) splits into a real SQL filter and a
+PHP-side one, because only one of the two is a stored column.** `api-log.php` gained two
+independent, combinable dropdowns: status code (a plain `WHERE status_code = ?`, since
+that's a real column — `Store::getApiLogEntries()`/`countApiLogEntries()` grew optional
+`$statusCode`/`$noResponseOnly` parameters, the latter a `none` sentinel in the URL for
+"transport failure, no HTTP response at all") and level (error/warning/success, which
+isn't a column at all — it's `apiLogLevel()`'s own derived judgement). Pushing the level
+filter into SQL would mean re-implementing `apiLogLevel()`'s JSON-parsing/redaction-
+fallback/"Device offline" logic a second time as a SQL expression, with the two
+classifications free to drift apart — so instead, whenever a level filter is active,
+`Store::getAllApiLogEntriesForLevelFilter()` fetches every row matching the status filter
+(no `LIMIT`/`OFFSET`, capped at `API_LOG_LEVEL_FILTER_MAX_ROWS` as a sanity backstop, not
+because a single-user hobby-scale log is expected to approach it) and `api-log.php`
+filters/paginates that result in PHP with the exact same `apiLogLevel()` call the
+unfiltered page already uses. `apiLogLevel()` itself moved from `api-log.php` into
+`Store.php` as part of this — it originally lived on the page purely because nothing else
+needed it, but issue #8's filter needed to call the identical logic from outside a
+login-gated page, and moving it also made it directly unit-testable for the first time.
+The status dropdown's options are `Store::getDistinctApiLogStatusCodes()` — whatever
+codes are actually present in the log, never a hardcoded guess list — plus a
+conditionally-shown "No response" option (`Store::hasApiLogNoResponseEntries()`) that
+only appears once a transport failure has actually happened.
 
 **Rate-limit/quota detection surfaces on the dashboard and history page, not just the API
 log's red badge (GitHub issue #7).** The API log already coloured a rate-limited call red

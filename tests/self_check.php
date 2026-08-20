@@ -629,6 +629,30 @@ check(
 check(count(getApiLogEntries(1)) === 1, 'getApiLogEntries() respects its $limit argument');
 check(count(getApiLogEntries(10, 1)) === 2, 'getApiLogEntries() respects its $offset argument');
 
+// --- Store: api_log status/level filtering (GitHub issue #8) — api-log.php's filter dropdowns.
+// At this point the throwaway DB has 3 rows: two status=200 (one redacted-to-null body, one
+// fresh with errno 0 — both read as 'success'), one status=null (a transport failure, 'error').
+check(getDistinctApiLogStatusCodes() === [200], 'only the real, distinct status codes actually present populate the dropdown — no guessed/hardcoded list: got ' . json_encode(getDistinctApiLogStatusCodes()));
+check(hasApiLogNoResponseEntries(), 'the transport-failure row is detected for the "No response" filter option');
+check(countApiLogEntries(200) === 2, 'countApiLogEntries() with a status filter counts only matching rows');
+check(countApiLogEntries(null, true) === 1, 'countApiLogEntries() with noResponseOnly counts only status_code IS NULL rows');
+check(count(getApiLogEntries(10, 0, 200)) === 2, 'getApiLogEntries() with a status filter returns only matching rows');
+check(count(getApiLogEntries(10, 0, null, true)) === 1, 'getApiLogEntries() with noResponseOnly returns only the transport-failure row');
+check(getApiLogEntries(10, 0, null, true)[0]['endpoint'] === '/op/v1/device/real/query', 'the noResponseOnly-filtered row is the right one');
+
+// A fourth row (a "Device offline" business error, errno 41935) gives full coverage of all
+// three levels — apiLogLevel() downgrades this one to 'warning', not 'error'.
+saveApiLogEntry('/op/v1/device/scheduler/enable', '{}', 200, '{"errno":41935,"msg":"Device offline, Please connect and retry"}', $logNow->modify('+9 days'));
+$levelCounts = ['success' => 0, 'warning' => 0, 'error' => 0];
+foreach (getAllApiLogEntriesForLevelFilter(null, false) as $e) {
+    $levelCounts[apiLogLevel($e['status_code'], $e['response_body'])]++;
+}
+check($levelCounts === ['success' => 2, 'warning' => 1, 'error' => 1], 'getAllApiLogEntriesForLevelFilter() plus apiLogLevel() together classify all 4 rows correctly, the same combination api-log.php uses for its level filter: got ' . json_encode($levelCounts));
+$warningOnly = array_values(array_filter(getAllApiLogEntriesForLevelFilter(null, false), fn($e) => apiLogLevel($e['status_code'], $e['response_body']) === 'warning'));
+check(count($warningOnly) === 1 && str_contains($warningOnly[0]['response_body'], '41935'), 'the level-filtered result is genuinely the "Device offline" row, not just the right count');
+$errorWithStatusFilter = array_values(array_filter(getAllApiLogEntriesForLevelFilter(200, false), fn($e) => apiLogLevel($e['status_code'], $e['response_body']) === 'error'));
+check($errorWithStatusFilter === [], 'status and level filters combine (AND, not OR) — filtering to status=200 excludes the transport-failure row even though it would otherwise be the "error" level match');
+
 // --- Store: wasRecentlyRateLimited() (GitHub issue #7) — surfaces a rate-limit/quota errno
 // from the API log so HistoryFetcher can report it even though its own loops only ever
 // needed success/no-data/error to decide whether to keep going, not why ---

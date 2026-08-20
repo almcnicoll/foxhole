@@ -416,6 +416,20 @@ progress.soc-green::-moz-progress-bar {
     font-weight: normal;
 }
 
+/* api-log.php's status/level filter bar (GitHub issue #8) — same horizontal
+   label+select layout as .history-date-form, just a standalone complete rule
+   rather than relying on flex properties from a shared ancestor. */
+.api-log-filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+    margin: 0.5rem 0 1rem;
+}
+.api-log-filters label {
+    font-weight: normal;
+}
+
 /* DataTables ships a light-only skin — override its chrome (search box, page-length
    select, pagination buttons, sort icons) to follow this app's own theme instead of
    clashing with it in dark mode. The table body itself (th/td) already inherits this

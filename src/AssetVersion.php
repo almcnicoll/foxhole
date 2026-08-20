@@ -18,4 +18,4 @@
  * their version is already part of the CDN URL path, and appending our own query string
  * to a CDN request would only defeat that CDN's own shared cache for no benefit.
  */
-const ASSET_VERSION = '4';
+const ASSET_VERSION = '5';
