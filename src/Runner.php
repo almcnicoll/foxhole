@@ -363,7 +363,11 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
         foreach ($devicesToPush as $sn) {
             $clients[$sn] = new FoxessClient($apiKey, $sn, $config['foxess']['base_url']);
         }
-        $pushResult = pushToDevices($clients, $pushGroups, $logger);
+        $devicePushGroups = $pushGroups;
+        if (getSetting('foxess_bst_workaround_enabled', '0') === '1' && isBstDate($pushWindow['windowStart'], $timezone)) {
+            $devicePushGroups = $scheduleBuilder->applyBstWorkaround($pushGroups, $pushWindow['explanations'])['groups'];
+        }
+        $pushResult = pushToDevices($clients, $devicePushGroups, $logger);
         $stillPending = $pushResult['failedSns'];
         setSetting('pending_device_sns', implode("\n", $stillPending));
 
@@ -566,7 +570,11 @@ function reapplyOverrides(): array
     foreach ($deviceSns as $sn) {
         $clients[$sn] = new FoxessClient($apiKey, $sn, $config['foxess']['base_url']);
     }
-    $pushResult = pushToDevices($clients, $pushWindow['groups'], $logger);
+    $devicePushGroups = $pushWindow['groups'];
+    if (getSetting('foxess_bst_workaround_enabled', '0') === '1' && isBstDate($pushWindow['windowStart'], $timezone)) {
+        $devicePushGroups = $scheduleBuilder->applyBstWorkaround($pushWindow['groups'], $pushWindow['explanations'])['groups'];
+    }
+    $pushResult = pushToDevices($clients, $devicePushGroups, $logger);
     if ($pushResult['failures']) {
         $message = sprintf('Saved, but the push failed for %d/%d inverter(s): %s', count($pushResult['failures']), count($deviceSns), implode('; ', $pushResult['failures']));
         $logger->error($message);
@@ -608,6 +616,18 @@ function pushToDevices(array $clients, array $groups, Logger $logger): array
         $callCount += $client->callCount();
     }
     return ['callCount' => $callCount, 'failures' => $failures, 'failedSns' => $failedSns, 'failureMessages' => $failureMessages];
+}
+
+/**
+ * Whether $instant falls within British Summer Time — the single flag applied to a
+ * whole push window by the FoxESS BST-quirk workaround (settings.php's "Fox quirks"
+ * section; see ScheduleBuilder::applyBstWorkaround()). Checked against the push
+ * window's start (essentially "now"), not per-slot — see that method's doc comment
+ * for the resulting edge case on the two clock-change days themselves.
+ */
+function isBstDate(DateTimeImmutable $instant, DateTimeZone $timezone): bool
+{
+    return $instant->setTimezone($timezone)->format('I') === '1';
 }
 
 /** errno 41935 ("Device offline") is routine for a battery-less inverter after dark — see CLAUDE.md. */

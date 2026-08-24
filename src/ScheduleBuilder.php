@@ -279,6 +279,63 @@ class ScheduleBuilder
         return $this->absoluteIntervalsToGroups($absoluteIntervals) + ['windowStart' => $windowStart, 'windowEnd' => $windowEnd];
     }
 
+    /**
+     * Workaround for a documented FoxESS-side bug where scheduler events during British
+     * Summer Time execute an hour later than the local time actually sent — FoxESS's
+     * backend appears to apply the schedule using GMT/UTC regardless of what the wall
+     * clock says (independently reproduced and matching multiple community reports; see
+     * CLAUDE.md's BST investigation). Shifts every group an hour earlier so FoxESS's late
+     * execution lands back on the real, intended local time. Only ever called on the copy
+     * of groups actually POSTed to FoxESS, right before pushToDevices() — the "true"
+     * schedule stored per date, and diffed via last_pushed_groups_json, is untouched (see
+     * Runner.php). Toggled from settings.php's "Fox quirks" section, off by default.
+     *
+     * Applied uniformly to the whole push window rather than per-slot by actual local
+     * offset — only wrong on the two clock-change days themselves, a known, accepted edge
+     * case in this app already (see CLAUDE.md's "for_date"/SQLite-offset-comparison notes).
+     * A per-instant version is possible (buildPushWindow() has real DateTimeImmutable
+     * instants before they collapse into hour/minute-of-day groups) but not worth the
+     * extra complexity for a handful of half-hour slots, twice a year, compensating for a
+     * bug whose exact mechanism FoxESS hasn't confirmed.
+     *
+     * @param array $groups periodsToGroups()/buildPushWindow()-shaped groups
+     * @param string[] $explanations same length/order as $groups
+     * @return array{groups: array, explanations: string[]}
+     */
+    public function applyBstWorkaround(array $groups, array $explanations): array
+    {
+        $intervals = $this->groupsToIntervals($groups, $explanations);
+        $shifted = [];
+        foreach ($intervals as $iv) {
+            array_push($shifted, ...$this->shiftIntervalEarlier($iv, 60));
+        }
+        usort($shifted, fn($a, $b) => $a['start'] <=> $b['start']);
+        return $this->intervalsToGroups($shifted);
+    }
+
+    /**
+     * Shifts one interval $minutes earlier, splitting into two pieces if it crosses local
+     * midnight once shifted (the schedule is dateless/recurring, so "before midnight" just
+     * means "at the end of the day" here, not a different calendar date).
+     *
+     * @return array<int, array{start: int, end: int, workMode: string, explanation: string}>
+     */
+    private function shiftIntervalEarlier(array $interval, int $minutes): array
+    {
+        $start = $interval['start'] - $minutes;
+        $end = $interval['end'] - $minutes;
+        if ($start >= 0) {
+            return [['start' => $start, 'end' => $end] + $interval];
+        }
+        if ($end <= 0) {
+            return [['start' => $start + 1440, 'end' => $end + 1440] + $interval];
+        }
+        return [
+            ['start' => $start + 1440, 'end' => 1440] + $interval,
+            ['start' => 0, 'end' => $end] + $interval,
+        ];
+    }
+
     /** @return array<int, array{start: int, end: int, workMode: string, explanation: string}> */
     private function groupsToIntervals(array $groups, array $explanations): array
     {

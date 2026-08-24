@@ -969,6 +969,40 @@ $stale = $pushBuilder->buildPushWindow($todayOnly, new DateTimeImmutable('2026-0
 check($stale['groups'] === [] && $stale['explanations'] === [], 'a known-data-end already before "now" collapses the push window to empty rather than an invalid negative-width window');
 check($stale['windowEnd'] == $stale['windowStart'], 'a collapsed window still reports windowStart/windowEnd (equal to each other) for the caller\'s status message');
 
+// --- ScheduleBuilder: applyBstWorkaround shifts pushed groups an hour earlier, splitting at midnight ---
+$bstNormal = [['enable' => 1, 'startHour' => 6, 'startMinute' => 0, 'endHour' => 10, 'endMinute' => 0, 'workMode' => 'ForceCharge', 'minSocOnGrid' => 15, 'fdSoc' => 100, 'fdPwr' => 3000]];
+$bstNormalResult = (new ScheduleBuilder($strategy, $battery))->applyBstWorkaround($bstNormal, ['x']);
+check(
+    $bstNormalResult['groups'][0]['startHour'] === 5 && $bstNormalResult['groups'][0]['endHour'] === 9,
+    'applyBstWorkaround shifts a normal (non-wrapping) group an hour earlier',
+);
+
+$bstWholeWrap = [['enable' => 1, 'startHour' => 0, 'startMinute' => 0, 'endHour' => 0, 'endMinute' => 30, 'workMode' => 'ForceDischarge', 'minSocOnGrid' => 15, 'fdSoc' => 15, 'fdPwr' => 3000]];
+$bstWholeWrapResult = (new ScheduleBuilder($strategy, $battery))->applyBstWorkaround($bstWholeWrap, ['x']);
+check(
+    count($bstWholeWrapResult['groups']) === 1
+        && $bstWholeWrapResult['groups'][0]['startHour'] === 23 && $bstWholeWrapResult['groups'][0]['startMinute'] === 0
+        && $bstWholeWrapResult['groups'][0]['endHour'] === 23 && $bstWholeWrapResult['groups'][0]['endMinute'] === 30,
+    'applyBstWorkaround wraps a group entirely before midnight to the end of the day: got ' . json_encode($bstWholeWrapResult['groups']),
+);
+
+$bstSplitWrap = [['enable' => 1, 'startHour' => 0, 'startMinute' => 30, 'endHour' => 2, 'endMinute' => 0, 'workMode' => 'ForceCharge', 'minSocOnGrid' => 15, 'fdSoc' => 100, 'fdPwr' => 3000]];
+$bstSplitResult = (new ScheduleBuilder($strategy, $battery))->applyBstWorkaround($bstSplitWrap, ['x']);
+check(count($bstSplitResult['groups']) === 2, 'applyBstWorkaround splits a group that straddles midnight once shifted into two');
+check(
+    $bstSplitResult['groups'][0]['startHour'] === 0 && $bstSplitResult['groups'][0]['startMinute'] === 0
+        && $bstSplitResult['groups'][0]['endHour'] === 1 && $bstSplitResult['groups'][0]['endMinute'] === 0,
+    'the post-midnight half (sorted first, starting 00:00) runs to 01:00: got ' . json_encode($bstSplitResult['groups'][0]),
+);
+check(
+    $bstSplitResult['groups'][1]['startHour'] === 23 && $bstSplitResult['groups'][1]['startMinute'] === 30
+        && $bstSplitResult['groups'][1]['endHour'] === 0 && $bstSplitResult['groups'][1]['endMinute'] === 0,
+    'the pre-midnight half (sorted second, starting 23:30) runs to end-of-day: got ' . json_encode($bstSplitResult['groups'][1]),
+);
+
+check(isBstDate(new DateTimeImmutable('2026-07-15 12:00:00', $pushTz), $pushTz) === true, 'isBstDate is true in mid-July');
+check(isBstDate(new DateTimeImmutable('2026-01-15 12:00:00', $pushTz), $pushTz) === false, 'isBstDate is false in mid-January');
+
 // --- Schedulers.php: pluggable scheduler registry (GitHub issue #2) ---
 check(resolveSchedulerId() === 'forecast_weighted_price_model', 'resolveSchedulerId() defaults to the forecast-weighted scheduler with nothing stored');
 check(resolveSchedulerId('classic') === 'classic', 'an explicit override (run.php --classic) wins regardless of any stored setting');

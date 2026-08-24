@@ -85,6 +85,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $errors[] = 'Battery round trip efficiency pct cannot be more than 100.';
     }
 
+    $bstWorkaroundEnabled = isset($_POST['foxess_bst_workaround_enabled']);
+
     $modellingValues = [];
     foreach ($modellingFields as $field) {
         $modellingValues[$field] = trim((string) ($_POST["modelling_{$field}"] ?? ''));
@@ -123,6 +125,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         foreach ($batteryFields as $field) {
             setSetting("battery_{$field}", (string) (float) $batteryValues[$field]);
         }
+        setSetting('foxess_bst_workaround_enabled', $bstWorkaroundEnabled ? '1' : '0');
         foreach ($modellingFields as $field) {
             setSetting("modelling_{$field}", (string) (float) $modellingValues[$field]);
         }
@@ -158,6 +161,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     foreach ($batteryFields as $field) {
         $batteryValues[$field] = (string) $batteryDefaults[$field];
     }
+    // Default off — only worth enabling if you've actually observed the late-execution bug. See CLAUDE.md.
+    $bstWorkaroundEnabled = getSetting('foxess_bst_workaround_enabled', '0') === '1';
     $modellingDefaults = getModellingConfig();
     $modellingValues = [];
     foreach ($modellingFields as $field) {
@@ -193,6 +198,21 @@ renderHeader('Settings');
         <input type="text" id="api_key" name="api_key" value="<?= htmlspecialchars($apiKey) ?>" required>
         <label for="device_sns">Device serial numbers (one per line — the same schedule is pushed to each)</label>
         <textarea id="device_sns" name="device_sns" rows="3" required><?= htmlspecialchars($deviceSnsRaw) ?></textarea>
+    </fieldset>
+
+    <fieldset>
+        <legend>Fox quirks</legend>
+        <label for="foxess_bst_workaround_enabled">
+            <input type="checkbox" id="foxess_bst_workaround_enabled" name="foxess_bst_workaround_enabled"
+                <?= $bstWorkaroundEnabled ? 'checked' : '' ?>>
+            Correct for FoxESS's British Summer Time bug
+        </label>
+        <p class="muted">FoxESS's scheduler has a documented bug (see community forum reports) where force
+            charge/discharge events during BST run an hour later than the local time actually sent — a 18:00 stop
+            ends up applying at 19:00. When enabled, any push made while BST is in effect has every group's
+            start/end shifted an hour earlier before sending, so the late execution lands back on the time you
+            actually intended. Only affects what's sent to FoxESS — the dashboard and Schedulers page still show
+            your real, intended times. Leave off unless you've actually observed the late-running behaviour.</p>
     </fieldset>
 
     <fieldset>
