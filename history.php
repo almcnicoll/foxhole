@@ -5,6 +5,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/src/Auth.php';
 require_once __DIR__ . '/src/Layout.php';
 require_once __DIR__ . '/src/Store.php';
+require_once __DIR__ . '/src/HalfHourlyUsageEstimator.php';
 
 requireLogin();
 
@@ -66,8 +67,8 @@ function buildBuckets(string $view, DateTimeImmutable $start, DateTimeImmutable 
  * shape already uses.
  *
  * @param array<int, array{from: DateTimeImmutable, to: DateTimeImmutable}> $buckets
- * @param array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, generation_kwh: ?float, forecast_kwh: ?float}> $rows
- * @return array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, label: string, generation_kwh: ?float, forecast_kwh: ?float}>
+ * @param array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, generation_kwh: ?float, forecast_kwh: ?float, usage_kwh: ?float}> $rows
+ * @return array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, label: string, generation_kwh: ?float, forecast_kwh: ?float, usage_kwh: ?float}>
  */
 function aggregateBuckets(array $buckets, array $rows, string $view): array
 {
@@ -75,6 +76,7 @@ function aggregateBuckets(array $buckets, array $rows, string $view): array
     foreach ($buckets as $bucket) {
         $genSum = null;
         $foreSum = null;
+        $usageSum = null;
         foreach ($rows as $row) {
             if ($row['from'] < $bucket['from'] || $row['from'] >= $bucket['to']) {
                 continue;
@@ -85,20 +87,81 @@ function aggregateBuckets(array $buckets, array $rows, string $view): array
             if ($row['forecast_kwh'] !== null) {
                 $foreSum = ($foreSum ?? 0.0) + $row['forecast_kwh'];
             }
+            if ($row['usage_kwh'] !== null) {
+                $usageSum = ($usageSum ?? 0.0) + $row['usage_kwh'];
+            }
         }
         $label = match ($view) {
             'day' => $bucket['from']->format('H:i') . '–' . $bucket['to']->format('H:i'),
             'year' => $bucket['from']->format('M Y'),
             default => $bucket['from']->format('D j M'),
         };
-        $result[] = ['from' => $bucket['from'], 'to' => $bucket['to'], 'label' => $label, 'generation_kwh' => $genSum, 'forecast_kwh' => $foreSum];
+        $result[] = ['from' => $bucket['from'], 'to' => $bucket['to'], 'label' => $label, 'generation_kwh' => $genSum, 'forecast_kwh' => $foreSum, 'usage_kwh' => $usageSum];
     }
     return $result;
+}
+
+/**
+ * Projected usage per bucket, from HalfHourlyUsageEstimator — the same per-half-hour
+ * estimate the forecast-weighted/modelling schedulers and the dashboard chart already use
+ * (GitHub issue #9), not a second usage model invented just for this page. Unlike
+ * generation/forecast above, this isn't a sum of stored rows — the estimator produces one
+ * calendar date's 48 values at a time, so this walks every half hour the buckets span,
+ * calling it once per date and folding each half hour into whichever bucket contains it.
+ * Buckets and half-hours are both already in chronological order, so a single advancing
+ * pointer (rather than rescanning every bucket per half hour) keeps this to one pass over
+ * each — the naive nested-loop version is fine for a day/week/month view but noticeably
+ * more work for a year view's ~17,500 half hours.
+ *
+ * @param array<int, array{from: DateTimeImmutable, to: DateTimeImmutable}> $buckets
+ * @return array<int, ?float> aligned to $buckets — always non-null in practice, since the
+ *         estimator has a flat fallback rather than ever refusing to answer, but kept
+ *         nullable for symmetry with the actual-data sums above
+ */
+function aggregateProjectedUsage(array $buckets, array $historicUsageRows, DateTimeZone $timezone, float $summerKwhMonth, float $winterKwhMonth): array
+{
+    if (!$buckets) {
+        return [];
+    }
+    $dayCursor = $buckets[0]['from']->setTimezone($timezone)->setTime(0, 0);
+    $spanEnd = $buckets[count($buckets) - 1]['to']->setTimezone($timezone);
+
+    $sums = array_fill(0, count($buckets), null);
+    $bucketIndex = 0;
+    while ($dayCursor < $spanEnd) {
+        $halfHourlyKwh = HalfHourlyUsageEstimator::estimateHalfHourly($dayCursor, $timezone, $historicUsageRows, $summerKwhMonth, $winterKwhMonth);
+        foreach ($halfHourlyKwh as $half => $kwh) {
+            $slotStart = $dayCursor->modify('+' . ($half * 30) . ' minutes');
+            while ($bucketIndex < count($buckets) && $slotStart >= $buckets[$bucketIndex]['to']) {
+                $bucketIndex++;
+            }
+            if ($bucketIndex >= count($buckets)) {
+                break 2;
+            }
+            if ($slotStart >= $buckets[$bucketIndex]['from']) {
+                $sums[$bucketIndex] = ($sums[$bucketIndex] ?? 0.0) + $kwh;
+            }
+        }
+        $dayCursor = $dayCursor->modify('+1 day');
+    }
+    return $sums;
 }
 
 [$periodStart, $periodEnd] = resolvePeriod($view, $anchor);
 $rows = getHistoricGeneration($periodStart, $periodEnd);
 $buckets = aggregateBuckets(buildBuckets($view, $periodStart, $periodEnd), $rows, $view);
+
+// Projected usage (GitHub issue #9's dashboard feature, mirrored here) needs history well
+// beyond just this page's own period — same "10 years back, harmless if most of it's
+// empty" bound the dashboard chart and Schedulers.php already use for the same estimator.
+$historicUsageRows = getHistoricGeneration((new DateTimeImmutable('-10 years', $timezone))->setTime(0, 0), $periodEnd);
+$usageSummerKwhMonth = (float) getSetting('usage_summer_kwh_month', '300');
+$usageWinterKwhMonth = (float) getSetting('usage_winter_kwh_month', '700');
+$projectedUsageByBucket = aggregateProjectedUsage($buckets, $historicUsageRows, $timezone, $usageSummerKwhMonth, $usageWinterKwhMonth);
+foreach ($buckets as $i => &$bucket) {
+    $bucket['projected_usage_kwh'] = $projectedUsageByBucket[$i];
+}
+unset($bucket);
 
 $stepModifier = match ($view) {
     'day' => '1 day',
@@ -157,6 +220,16 @@ $usageExhausted = $usageLimit !== null && $usageLimit->format('Y-m-d') <= HISTOR
  * same ballpark — a forecast is trying to predict actual generation, so two separate scales
  * made a good forecast and a bad one look visually identical (both would fill their own
  * axis to the same height) and made comparing the two series by eye actively misleading.
+ * Usage/projected usage (GitHub issue #9) share this same axis too, for the same reason —
+ * all four series are kWh over the same period.
+ *
+ * Colour standard (see CLAUDE.md's "Chart colour standard"): yellow for anything solar
+ * (generation and forecast both — they're the same underlying quantity, actual vs
+ * predicted), blue for anything usage (actual and projected, matching the dashboard
+ * exactly), solid for actual/observed, dashed for predicted. A line chart can express
+ * solid-vs-dashed directly; a bar can't, so the predicted series' bars use reduced
+ * fill-opacity instead — same colour family, still visually distinct from their solid
+ * actual-value counterpart without contradicting "same colour" for the pair.
  */
 function renderHistoryChart(array $buckets, string $view): void
 {
@@ -174,14 +247,18 @@ function renderHistoryChart(array $buckets, string $view): void
     $count = count($buckets);
     $baselineY = $marginTop + $plotHeight;
 
-    // One shared scale for both series (GitHub issue #6) — generation and forecast are the
-    // same unit and generally the same ballpark, so a single axis makes the two directly,
-    // honestly comparable by eye, which is the whole point of plotting them together.
+    // One shared scale for every series (GitHub issues #6 and #9) — all four are the same
+    // unit and generally the same ballpark, so a single axis makes them directly, honestly
+    // comparable by eye, which is the whole point of plotting them together.
     $genValues = array_values(array_filter(array_column($buckets, 'generation_kwh'), fn($v) => $v !== null));
     $foreValues = array_values(array_filter(array_column($buckets, 'forecast_kwh'), fn($v) => $v !== null));
+    $usageValues = array_values(array_filter(array_column($buckets, 'usage_kwh'), fn($v) => $v !== null));
+    $projectedUsageValues = array_values(array_filter(array_column($buckets, 'projected_usage_kwh'), fn($v) => $v !== null));
     $hasGeneration = (bool) $genValues;
     $hasForecast = (bool) $foreValues;
-    $maxValue = max(array_merge($genValues, $foreValues, [0.0]));
+    $hasUsage = (bool) $usageValues;
+    $hasProjectedUsage = (bool) $projectedUsageValues;
+    $maxValue = max(array_merge($genValues, $foreValues, $usageValues, $projectedUsageValues, [0.0]));
     $maxValue = $maxValue > 0 ? $maxValue * 1.1 : 1.0; // 10% headroom so the tallest point/bar isn't glued to the top edge
 
     $x = fn(int $i) => $marginLeft + ($count > 1 ? ($i / ($count - 1)) * $plotWidth : $plotWidth / 2);
@@ -216,72 +293,85 @@ function renderHistoryChart(array $buckets, string $view): void
         '<circle class="chart-hit" cx="%.1f" cy="%.1f" r="8" fill="transparent" data-tooltip="%s"><title>%s</title></circle><circle class="chart-dot" cx="%.1f" cy="%.1f" r="2" fill="%s" />',
         $px, $py, htmlspecialchars($title), htmlspecialchars($title), $px, $py, $color,
     );
-    $bar = fn(float $left, float $top, float $w, float $h, string $color, string $title) => sprintf(
-        '<rect class="chart-hit chart-bar" x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="%s" data-tooltip="%s"><title>%s</title></rect>',
-        $left, $top, $w, max(0.0, $h), $color, htmlspecialchars($title), htmlspecialchars($title),
+    // $predicted only affects bars (reduced fill-opacity — see this function's doc comment
+    // for why bars need a different actual-vs-predicted cue than the line plot's dashing).
+    $bar = fn(float $left, float $top, float $w, float $h, string $color, string $title, bool $predicted) => sprintf(
+        '<rect class="chart-hit chart-bar" x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="%s"%s data-tooltip="%s"><title>%s</title></rect>',
+        $left, $top, $w, max(0.0, $h), $color, $predicted ? ' fill-opacity="0.55"' : '', htmlspecialchars($title), htmlspecialchars($title),
     );
+
+    // Colour standard (CLAUDE.md): yellow for solar (generation actual, forecast
+    // predicted), blue for usage (usage actual, projected usage predicted) — see this
+    // function's doc comment. One definition here drives the line plot, the bar plot, and
+    // the legend, so the three can't quietly drift apart on colour/verb/predicted-ness.
+    $series = [
+        'generation' => ['field' => 'generation_kwh', 'color' => 'var(--color-solar)', 'predicted' => false, 'verb' => 'Generated', 'legend' => 'Generation', 'has' => $hasGeneration],
+        'forecast' => ['field' => 'forecast_kwh', 'color' => 'var(--color-solar)', 'predicted' => true, 'verb' => 'Forecast', 'legend' => 'Forecast', 'has' => $hasForecast],
+        'usage' => ['field' => 'usage_kwh', 'color' => 'var(--color-usage)', 'predicted' => false, 'verb' => 'Usage', 'legend' => 'Usage', 'has' => $hasUsage],
+        'projected' => ['field' => 'projected_usage_kwh', 'color' => 'var(--color-usage)', 'predicted' => true, 'verb' => 'Projected usage', 'legend' => 'Projected usage', 'has' => $hasProjectedUsage],
+    ];
+    $activeSeries = array_values(array_filter($series, fn($s) => $s['has']));
 
     $body = '';
     if ($view === 'day') {
         // Line plot, matching the dashboard's price/solar chart exactly — a day's hourly
         // buckets read naturally as a continuous curve.
-        $genPoints = [];
-        $forePoints = [];
+        $lines = '';
         $markers = '';
-        foreach ($buckets as $i => $b) {
-            $px = $x($i);
-            if ($b['generation_kwh'] !== null) {
-                $py = $y($b['generation_kwh']);
-                $genPoints[] = sprintf('%.1f,%.1f', $px, $py);
-                $markers .= $marker($px, $py, 'var(--color-generation)', sprintf('Generated: %s kWh (%s)', number_format($b['generation_kwh'], 2), $b['label']));
+        foreach ($activeSeries as $s) {
+            $points = [];
+            foreach ($buckets as $i => $b) {
+                $val = $b[$s['field']];
+                if ($val === null) {
+                    continue;
+                }
+                $px = $x($i);
+                $py = $y($val);
+                $points[] = sprintf('%.1f,%.1f', $px, $py);
+                $markers .= $marker($px, $py, $s['color'], sprintf('%s: %s kWh (%s)', $s['verb'], number_format($val, 2), $b['label']));
             }
-            if ($b['forecast_kwh'] !== null) {
-                $py = $y($b['forecast_kwh']);
-                $forePoints[] = sprintf('%.1f,%.1f', $px, $py);
-                $markers .= $marker($px, $py, 'var(--color-solar)', sprintf('Forecast: %s kWh (%s)', number_format($b['forecast_kwh'], 2), $b['label']));
+            if ($points) {
+                $lines .= sprintf(
+                    '<polyline points="%s" fill="none" stroke="%s" stroke-width="2"%s />',
+                    implode(' ', $points),
+                    $s['color'],
+                    $s['predicted'] ? ' stroke-dasharray="5,4"' : '',
+                );
             }
         }
-        if ($genPoints) {
-            $body .= sprintf('<polyline points="%s" fill="none" stroke="var(--color-generation)" stroke-width="2" />', implode(' ', $genPoints));
-        }
-        if ($forePoints) {
-            $body .= sprintf('<polyline points="%s" fill="none" stroke="var(--color-solar)" stroke-width="2" stroke-dasharray="5,4" />', implode(' ', $forePoints));
-        }
-        $body .= '<g>' . $markers . '</g>';
+        $body = $lines . '<g>' . $markers . '</g>';
     } else {
-        // Bar plot for week/month/year — two bars per bucket, side by side, both measured
-        // against the same shared axis, so their relative heights are directly comparable.
+        // Bar plot for week/month/year — one bar per active series per bucket, side by
+        // side, all measured against the same shared axis so relative heights are directly
+        // comparable. However many series actually have data this period share the group
+        // width evenly, rather than always reserving space for four.
         $groupWidth = $bucketWidth * 0.7;
-        $barWidth = $groupWidth / 2 - 1;
+        $n = count($activeSeries);
+        $barWidth = $n > 0 ? $groupWidth / $n - 1 : $groupWidth;
         foreach ($buckets as $i => $b) {
             $groupLeft = $bucketLeft($i) + ($bucketWidth - $groupWidth) / 2;
-            if ($b['generation_kwh'] !== null) {
-                $top = $y($b['generation_kwh']);
-                $title = sprintf('Generated: %s kWh (%s)', number_format($b['generation_kwh'], 2), $b['label']);
-                $body .= $bar($groupLeft, $top, $barWidth, $baselineY - $top, 'var(--color-generation)', $title);
-            }
-            if ($b['forecast_kwh'] !== null) {
-                $top = $y($b['forecast_kwh']);
-                $title = sprintf('Forecast: %s kWh (%s)', number_format($b['forecast_kwh'], 2), $b['label']);
-                $body .= $bar($groupLeft + $barWidth + 2, $top, $barWidth, $baselineY - $top, 'var(--color-solar)', $title);
+            foreach ($activeSeries as $j => $s) {
+                $val = $b[$s['field']];
+                if ($val === null) {
+                    continue;
+                }
+                $top = $y($val);
+                $title = sprintf('%s: %s kWh (%s)', $s['verb'], number_format($val, 2), $b['label']);
+                $body .= $bar($groupLeft + $j * ($barWidth + 2), $top, $barWidth, $baselineY - $top, $s['color'], $title, $s['predicted']);
             }
         }
     }
     ?>
 <svg class="price-chart" viewBox="0 0 <?= $width ?> <?= $height ?>" role="img"
-    aria-label="Actual generation and solar forecast, on the same axis, over the selected period">
+    aria-label="Actual and forecast solar generation, and actual and projected usage, on the same axis, over the selected period">
     <?= $grid ?>
     <?= $body ?>
     <g font-size="10" fill="var(--color-muted)">
-        <?php if ($hasGeneration): ?>
-        <line x1="<?= $marginLeft ?>" y1="12" x2="<?= $marginLeft + 16 ?>" y2="12" stroke="var(--color-generation)"
-            stroke-width="2" /><text x="<?= $marginLeft + 20 ?>" y="15">Generation</text>
-        <?php endif; ?>
-        <?php if ($hasForecast): ?>
-        <line x1="<?= $marginLeft + 110 ?>" y1="12" x2="<?= $marginLeft + 126 ?>" y2="12" stroke="var(--color-solar)"
-            stroke-width="2" <?= $view === 'day' ? ' stroke-dasharray="5,4"' : '' ?> /><text
-            x="<?= $marginLeft + 130 ?>" y="15">Forecast</text>
-        <?php endif; ?>
+        <?php foreach ($activeSeries as $idx => $s): $legendX = $marginLeft + $idx * 110; ?>
+        <line x1="<?= $legendX ?>" y1="12" x2="<?= $legendX + 16 ?>" y2="12" stroke="<?= $s['color'] ?>" stroke-width="2"
+            <?= $s['predicted'] && $view === 'day' ? ' stroke-dasharray="5,4"' : '' ?>
+            <?= $s['predicted'] && $view !== 'day' ? ' stroke-opacity="0.55"' : '' ?> /><text x="<?= $legendX + 20 ?>" y="15"><?= htmlspecialchars($s['legend']) ?></text>
+        <?php endforeach; ?>
     </g>
 </svg>
 <script>

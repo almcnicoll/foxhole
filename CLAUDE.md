@@ -248,6 +248,32 @@ self-use row tints, success/warning/error alerts, SoC red/amber/green) stay
 their own hues regardless of theme — they carry meaning, so they're not
 tinted purple along with everything else.
 
+**Chart colour standard**, applied consistently across the dashboard
+(`index.php`'s `renderPriceChart()`) and history (`history.php`'s
+`renderHistoryChart()`) charts — follow it for any future chart rather than
+picking colours ad hoc:
+
+- **Yellow** (`--color-solar`) — anything solar. Generation (actual) and
+  forecast (predicted) are the same underlying quantity, so they share this
+  one hue rather than each getting their own.
+- **Blue** (`--color-usage`) — anything household usage. Actual usage and
+  projected usage share this hue too, matching the dashboard exactly.
+- **Red** (`--color-error`) — import price.
+- **Green** (`--color-success`) — export price.
+- **Solid vs dashed/faded is the actual-vs-predicted axis, orthogonal to
+  colour.** A solid line, or a full-opacity bar, is an observed value; a
+  dashed line is a predicted one. Bars can't be dashed, so a predicted
+  series' bars use reduced fill-opacity (`0.55`) instead — same colour
+  family as their actual counterpart, still visually distinct without a
+  second hue.
+
+This is why generation and forecast share `--color-solar` on the history
+chart — it used to give generation its own `--color-generation`, retired
+once this standard was adopted (see git history for the old value) — and
+why usage/projected usage there reuse the exact same `--color-usage` the
+dashboard introduced for the same pair (GitHub issue #9), rather than a new
+colour.
+
 - **`login.php`** — single password field, checked via
   `Store::verifySystemPassword()`. No password has been set until someone
   visits `settings.php` and sets one — until then the literal password is
