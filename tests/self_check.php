@@ -361,32 +361,72 @@ $overlay2 = (new ScheduleBuilder($strategy, $battery))->applyOverrides([], [], $
 check(count($overlay2['groups']) === 1 && $overlay2['groups'][0]['workMode'] === 'ForceCharge', 'fill_your_boots with no prep window adds a single ForceCharge event group');
 check($overlay2['groups'][0]['fdSoc'] === 100 && $overlay2['groups'][0]['fdPwr'] === 3000, 'override group power/SoC fields are set from battery config, same as a normal group');
 
-// --- FoxessClient: pushSchedule() clears existing slots before pushing the real ones ---
-// Confirmed live: stale slots from a previous push have blocked new ones even though the
-// push call nominally replaces the whole schedule — see FoxessClient::pushSchedule()'s own
-// doc comment. post() is protected (not private) specifically so this can subclass and
-// intercept it, rather than the public pushSchedule() itself, to actually verify the
-// two-call sequence without touching the network.
+// --- FoxessClient: pushSchedule() clears existing slots, pushes the real ones, then
+// re-asserts the scheduler master switch if it's off (GitHub-reported: a manual WorkMode
+// switch via the FoxESS app leaves schedule groups in place but stops the device from
+// following them — see getSchedulerFlag()'s doc comment). post() is protected (not
+// private) specifically so this can subclass and intercept it, rather than the public
+// pushSchedule() itself, to actually verify the call sequence without touching the network.
+$pushedGroups = [['enable' => 1, 'startHour' => 10, 'startMinute' => 0, 'endHour' => 11, 'endMinute' => 0, 'workMode' => 'ForceCharge', 'minSocOnGrid' => 15, 'fdSoc' => 100, 'fdPwr' => 3000]];
+
 $recordingClient = new class('key', 'SN-REC', 'https://example.invalid') extends FoxessClient {
-    public array $calls = []; // each entry: that call's 'groups' body value
+    public array $calls = []; // each entry: [path, body]
     protected function post(string $path, array $body, bool $isRetry = false): array
     {
-        $this->calls[] = $body['groups'];
+        $this->calls[] = [$path, $body];
+        if ($path === '/op/v1/device/scheduler/get/flag') {
+            return ['errno' => 0, 'result' => ['support' => true, 'enable' => false]]; // master switch currently off
+        }
         return ['errno' => 0];
     }
 };
-$pushedGroups = [['enable' => 1, 'startHour' => 10, 'startMinute' => 0, 'endHour' => 11, 'endMinute' => 0, 'workMode' => 'ForceCharge', 'minSocOnGrid' => 15, 'fdSoc' => 100, 'fdPwr' => 3000]];
 $recordingClient->pushSchedule($pushedGroups);
-check(count($recordingClient->calls) === 2, 'pushSchedule() makes exactly two calls: a clear, then the real push');
-check($recordingClient->calls[0] === [], 'the first call clears the schedule with an empty groups array');
-check($recordingClient->calls[1] === $pushedGroups, 'the second call sends the real computed groups');
+check(count($recordingClient->calls) === 4, 'pushSchedule() makes four calls when the master switch is off: clear, real push, flag read, flag write. Got ' . count($recordingClient->calls));
+check($recordingClient->calls[0] === ['/op/v1/device/scheduler/enable', ['deviceSN' => 'SN-REC', 'groups' => []]], 'the first call clears the schedule with an empty groups array');
+check($recordingClient->calls[1] === ['/op/v1/device/scheduler/enable', ['deviceSN' => 'SN-REC', 'groups' => $pushedGroups]], 'the second call sends the real computed groups');
+check($recordingClient->calls[2][0] === '/op/v1/device/scheduler/get/flag', 'the third call reads the current master-switch state');
+check($recordingClient->calls[3] === ['/op/v1/device/scheduler/set/flag', ['deviceSN' => 'SN-REC', 'enable' => true]], 'the fourth call re-enables the master switch, since it was off');
+
+$alreadyOnClient = new class('key', 'SN-ON', 'https://example.invalid') extends FoxessClient {
+    public array $calls = [];
+    protected function post(string $path, array $body, bool $isRetry = false): array
+    {
+        $this->calls[] = $path;
+        if ($path === '/op/v1/device/scheduler/get/flag') {
+            return ['errno' => 0, 'result' => ['support' => true, 'enable' => true]];
+        }
+        return ['errno' => 0];
+    }
+};
+$alreadyOnClient->pushSchedule($pushedGroups);
+check(
+    count($alreadyOnClient->calls) === 3 && $alreadyOnClient->calls[2] === '/op/v1/device/scheduler/get/flag',
+    'when the master switch is already on, pushSchedule() reads it but skips the extra write call: got ' . implode(',', $alreadyOnClient->calls),
+);
+
+$unsupportedFlagClient = new class('key', 'SN-UNSUP', 'https://example.invalid') extends FoxessClient {
+    public array $calls = [];
+    protected function post(string $path, array $body, bool $isRetry = false): array
+    {
+        $this->calls[] = $path;
+        if ($path === '/op/v1/device/scheduler/get/flag') {
+            return ['errno' => 0, 'result' => ['support' => false, 'enable' => false]];
+        }
+        return ['errno' => 0];
+    }
+};
+$unsupportedFlagClient->pushSchedule($pushedGroups);
+check(
+    count($unsupportedFlagClient->calls) === 3 && $unsupportedFlagClient->calls[2] === '/op/v1/device/scheduler/get/flag',
+    'a device that does not support the master-switch flag (support=false) is read but never written to: got ' . implode(',', $unsupportedFlagClient->calls),
+);
 
 $abortingClearClient = new class('key', 'SN-ABORT', 'https://example.invalid') extends FoxessClient {
     public array $calls = [];
     protected function post(string $path, array $body, bool $isRetry = false): array
     {
-        $this->calls[] = $body['groups'];
-        if ($body['groups'] === []) {
+        $this->calls[] = $body['groups'] ?? null;
+        if (($body['groups'] ?? null) === []) {
             throw new FoxessPushException('simulated clear failure');
         }
         return ['errno' => 0];
@@ -397,6 +437,27 @@ try {
     check(false, 'pushSchedule() should propagate a failure from the clear call');
 } catch (FoxessPushException $e) {
     check(count($abortingClearClient->calls) === 1, 'a failed clear call aborts before attempting the real push — not best-effort');
+}
+
+$abortingFlagClient = new class('key', 'SN-FLAGFAIL', 'https://example.invalid') extends FoxessClient {
+    public array $calls = [];
+    protected function post(string $path, array $body, bool $isRetry = false): array
+    {
+        $this->calls[] = $path;
+        if ($path === '/op/v1/device/scheduler/get/flag') {
+            return ['errno' => 0, 'result' => ['support' => true, 'enable' => false]];
+        }
+        if ($path === '/op/v1/device/scheduler/set/flag') {
+            throw new FoxessPushException('simulated set/flag failure');
+        }
+        return ['errno' => 0];
+    }
+};
+try {
+    $abortingFlagClient->pushSchedule($pushedGroups);
+    check(false, 'pushSchedule() should propagate a failure from the master-switch write, not swallow it');
+} catch (FoxessPushException $e) {
+    check(true, 'a failed master-switch write surfaces as a push failure — silently leaving it off would defeat the whole point of this feature');
 }
 
 // --- Runner: pushToDevices() attempts every device and reports per-device failures ---

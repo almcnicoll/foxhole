@@ -46,9 +46,63 @@ class FoxessClient
             'deviceSN' => $this->deviceSn,
             'groups' => [],
         ]);
-        return $this->post('/op/v1/device/scheduler/enable', [
+        $result = $this->post('/op/v1/device/scheduler/enable', [
             'deviceSN' => $this->deviceSn,
             'groups' => $groups,
+        ]);
+
+        // Re-assert Mode Scheduler as the active mode if this device supports the flag
+        // and it isn't already on — see getSchedulerFlag()'s doc comment for why: a
+        // manually-picked WorkMode (e.g. via the FoxESS app) leaves the schedule's own
+        // groups untouched but stops the device from actually following them, and
+        // pushing new groups alone doesn't turn it back on. Checked-then-set rather than
+        // an unconditional write: a no-op skip on unsupported models, and one fewer call
+        // against FoxESS's daily quota (see CLAUDE.md's rate-limit notes) on the common
+        // case where it's already on. Not best-effort — if this write fails, the push as
+        // a whole should be reported as failed, the same as if pushSchedule() had quietly
+        // left the master switch off: the schedule just sent would never actually run.
+        if ($this->getSchedulerFlag() === false) {
+            $this->setSchedulerFlag(true);
+        }
+
+        return $result;
+    }
+
+    /**
+     * Reads the scheduler "master switch" — community-documented as `SegmentedTimedModeEnable`
+     * — which is distinct from the schedule's own time-segment groups (pushSchedule()/
+     * getSchedule()). When it's off, the inverter runs whatever WorkMode was picked directly
+     * (e.g. via the FoxESS app's own work-mode dropdown) and ignores whatever's stored in its
+     * schedule, even though the schedule itself is untouched. Confirmed live against this
+     * project's own account: `support: true, enable: false` on a device that still had
+     * schedule groups from a recent push — the schedule was simply not being followed.
+     *
+     * Path and field names aren't in FoxESS's own OpenAPI docs in enough detail to confirm
+     * independently — taken from a maintained third-party client (`gostonefire/foxess`,
+     * Rust), whose source was read directly, and corroborated by community forum reports of
+     * the same underlying setting name. Same v1 namespace this app already trusts for
+     * scheduler/enable and scheduler/get, not the v0 endpoints known to corrupt state (see
+     * CLAUDE.md's "FoxESS scheduler endpoint" note) — treat as reasonably solid, not as
+     * fully confirmed as the request-signing/scheduler-push logic elsewhere in this file.
+     *
+     * @return ?bool null if this device model doesn't support the flag at all
+     *         (`support: false`) — nothing this app can or should do about that case.
+     */
+    public function getSchedulerFlag(): ?bool
+    {
+        $response = $this->post('/op/v1/device/scheduler/get/flag', ['deviceSN' => $this->deviceSn]);
+        if (($response['result']['support'] ?? false) !== true) {
+            return null;
+        }
+        return (bool) ($response['result']['enable'] ?? false);
+    }
+
+    /** Writes the scheduler master switch — see getSchedulerFlag(). */
+    public function setSchedulerFlag(bool $enable): array
+    {
+        return $this->post('/op/v1/device/scheduler/set/flag', [
+            'deviceSN' => $this->deviceSn,
+            'enable' => $enable,
         ]);
     }
 
