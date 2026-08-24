@@ -5,6 +5,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/src/Auth.php';
 require_once __DIR__ . '/src/Layout.php';
 require_once __DIR__ . '/src/FoxessClient.php';
+require_once __DIR__ . '/src/HalfHourlyUsageEstimator.php';
 
 requireLogin();
 
@@ -331,6 +332,66 @@ function renderPriceChart(array $slots, array $solarForecast, array $absoluteInt
         }
     }
 
+    // GitHub issue #9: household usage (actual, so far as it's been logged) and projected
+    // usage on the same kW axis as solar forecast above — same gate ($kwMax > 0) as solar,
+    // since without an installed-capacity figure there's no kW scale to plot either against.
+    // Actual is a solid line, projected a dashed one, both the same colour (issue #9's own
+    // spec) so a half hour with both simply shows the dashed line traced by the solid one,
+    // rather than needing a legend to tell "predicted" from "real" apart.
+    //
+    // Projected usage reuses HalfHourlyUsageEstimator — the same per-half-hour estimate the
+    // forecast-weighted/modelling schedulers already use internally (see Schedulers.php) —
+    // rather than inventing a second usage model just for display. Historic rows are fetched
+    // with the same "10 years back, harmless if most of that's empty" bound Schedulers.php
+    // already uses for the same call, so this needs no new query shape.
+    $usagePoints = [];
+    $usageMarkers = '';
+    $projectedUsagePoints = [];
+    $projectedUsageMarkers = '';
+    if ($kwMax > 0) {
+        $historicUsageRows = getHistoricGeneration((new DateTimeImmutable('-10 years', $timezone))->setTime(0, 0), $chartEnd);
+
+        foreach ($historicUsageRows as $row) {
+            if ($row['usage_kwh'] === null) {
+                continue;
+            }
+            $localFrom = $row['from']->setTimezone($timezone);
+            if ($localFrom < $chartStart || $localFrom >= $chartEnd) {
+                continue;
+            }
+            $durationHours = ($row['to']->getTimestamp() - $row['from']->getTimestamp()) / 3600;
+            if ($durationHours <= 0) {
+                continue;
+            }
+            $mid = (new DateTimeImmutable('@' . intdiv($row['from']->getTimestamp() + $row['to']->getTimestamp(), 2)))->setTimezone($timezone);
+            $kw = min($row['usage_kwh'] / $durationHours, $kwMax);
+            $px = $x($mid);
+            $py = $yKw($kw);
+            $usagePoints[] = sprintf('%.1f,%.1f', $px, $py);
+            $usageMarkers .= $marker($px, $py, 'var(--color-usage)', sprintf('Usage: %skW at %s', number_format($kw, 2), $mid->format('D H:i')));
+        }
+
+        $usageSummerKwhMonth = (float) getSetting('usage_summer_kwh_month', '300');
+        $usageWinterKwhMonth = (float) getSetting('usage_winter_kwh_month', '700');
+        $chartDay = $chartStart;
+        while ($chartDay < $chartEnd) {
+            $forecastHalfHourlyKwh = HalfHourlyUsageEstimator::estimateHalfHourly($chartDay, $timezone, $historicUsageRows, $usageSummerKwhMonth, $usageWinterKwhMonth);
+            for ($half = 0; $half < 48; $half++) {
+                $slotStart = $chartDay->modify('+' . ($half * 30) . ' minutes');
+                if ($slotStart < $chartStart || $slotStart >= $chartEnd) {
+                    continue;
+                }
+                $mid = $slotStart->modify('+15 minutes');
+                $kw = min($forecastHalfHourlyKwh[$half] * 2, $kwMax); // kWh per half hour -> average kW
+                $px = $x($mid);
+                $py = $yKw($kw);
+                $projectedUsagePoints[] = sprintf('%.1f,%.1f', $px, $py);
+                $projectedUsageMarkers .= $marker($px, $py, 'var(--color-usage)', sprintf('Projected usage: %skW at %s', number_format($kw, 2), $mid->format('D H:i')));
+            }
+            $chartDay = $chartDay->modify('+1 day');
+        }
+    }
+
     // "Now" only makes sense while it actually falls within the charted span — always true
     // for the "today" portion, but not once now has moved past the last known slot (e.g.
     // only a partial day is known and it's later than that).
@@ -351,17 +412,21 @@ function renderPriceChart(array $slots, array $solarForecast, array $absoluteInt
         <polyline points="<?= implode(' ', $importPoints) ?>" fill="none" stroke="var(--color-error)" stroke-width="2" />
         <?php if ($exportPoints): ?><polyline points="<?= implode(' ', $exportPoints) ?>" fill="none" stroke="var(--color-success)" stroke-width="2" /><?php endif; ?>
         <?php if ($solarPoints): ?><polyline points="<?= implode(' ', $solarPoints) ?>" fill="none" stroke="var(--color-solar)" stroke-width="2" /><?php endif; ?>
+        <?php if ($usagePoints): ?><polyline points="<?= implode(' ', $usagePoints) ?>" fill="none" stroke="var(--color-usage)" stroke-width="2" /><?php endif; ?>
+        <?php if ($projectedUsagePoints): ?><polyline points="<?= implode(' ', $projectedUsagePoints) ?>" fill="none" stroke="var(--color-usage)" stroke-width="2" stroke-dasharray="5,4" /><?php endif; ?>
     </g>
     <?= $grid ?>
     <?php /* Markers sit outside the clipped group, deliberately — the first/last point of
     every series lands exactly on the clip boundary, and clip-path silently eats half their
     hit-circle there (confirmed live: elementFromPoint missed it), breaking hover for
     exactly those points. */ ?>
-    <g><?= $importMarkers . $exportMarkers . $solarMarkers ?></g>
+    <g><?= $importMarkers . $exportMarkers . $solarMarkers . $usageMarkers . $projectedUsageMarkers ?></g>
     <g font-size="10" fill="var(--color-muted)">
         <line x1="<?= $marginLeft ?>" y1="12" x2="<?= $marginLeft + 16 ?>" y2="12" stroke="var(--color-error)" stroke-width="2" /><text x="<?= $marginLeft + 20 ?>" y="15">Import price</text>
         <line x1="<?= $marginLeft + 110 ?>" y1="12" x2="<?= $marginLeft + 126 ?>" y2="12" stroke="var(--color-success)" stroke-width="2" /><text x="<?= $marginLeft + 130 ?>" y="15">Export price</text>
         <?php if ($kwMax > 0): ?><line x1="<?= $marginLeft + 220 ?>" y1="12" x2="<?= $marginLeft + 236 ?>" y2="12" stroke="var(--color-solar)" stroke-width="2" /><text x="<?= $marginLeft + 240 ?>" y="15">Solar forecast</text><?php endif; ?>
+        <?php if ($usagePoints): ?><line x1="<?= $marginLeft + 330 ?>" y1="12" x2="<?= $marginLeft + 346 ?>" y2="12" stroke="var(--color-usage)" stroke-width="2" /><text x="<?= $marginLeft + 350 ?>" y="15">Usage</text><?php endif; ?>
+        <?php if ($projectedUsagePoints): ?><line x1="<?= $marginLeft + 400 ?>" y1="12" x2="<?= $marginLeft + 416 ?>" y2="12" stroke="var(--color-usage)" stroke-width="2" stroke-dasharray="4,3" /><text x="<?= $marginLeft + 420 ?>" y="15">Projected usage</text><?php endif; ?>
     </g>
 </svg>
 <script>
@@ -477,27 +542,50 @@ $ranClass = !$ranOk ? 'alert-error' : ((str_contains($ranMsg, 'unchanged') || st
 <?php else: ?>
 <p class="muted">
     Rates last fetched <?= htmlspecialchars(getLatestPriceFetchedAt()->setTimezone($timezone)->format('D j M, H:i')) ?>.
+    Every run recomputes and pushes the schedule to your inverter(s) regardless of whether it changed from last time
+    (see the banner above for the outcome of the most recent one triggered from here).
     <?php foreach ($scheduleByDate as $forDate => $daySchedule): ?>
         <?php if ($daySchedule['pushed_at']): ?>
-    Schedule for <?= htmlspecialchars($forDate) ?> pushed
-    <?= htmlspecialchars($daySchedule['pushed_at']->setTimezone($timezone)->format('D j M, H:i')) ?>.
+    <?= htmlspecialchars($forDate) ?> last computed
+    <?= htmlspecialchars($daySchedule['pushed_at']->setTimezone($timezone)->format('D j M, H:i')) ?>
+    (<?= count($daySchedule['groups']) ?> forced period<?= count($daySchedule['groups']) === 1 ? '' : 's' ?>).
+        <?php elseif (getScheduleSummary($forDate)): ?>
+    <?= htmlspecialchars($forDate) ?> last computed with self-use only — no forced charge/discharge needed.
         <?php else: ?>
-    No schedule pushed yet for <?= htmlspecialchars($forDate) ?>.
+    No schedule computed yet for <?= htmlspecialchars($forDate) ?>.
         <?php endif; ?>
     <?php endforeach; ?>
 </p>
 
-<?php if (array_filter(array_column($scheduleByDate, 'explanations'))): ?>
+<?php
+// A day that computed to zero forced periods (self-use throughout — a legitimate, common
+// outcome, not a sign nothing ran) still gets its own entry here now, not just its own
+// summary sentence silently dropped — see GitHub issue #10: the old gate here (only dates
+// with explanations) combined with schedule_groups storing nothing for a zero-group day
+// (see getScheduleForDate()) was the actual root cause of "no schedule pushed" reading as
+// if nothing had happened, even on a run that correctly decided there was nothing to force.
+$hasAnyPlanInfo = false;
+foreach ($scheduleByDate as $forDate => $daySchedule) {
+    if ($daySchedule['explanations'] || getScheduleSummary($forDate)) {
+        $hasAnyPlanInfo = true;
+        break;
+    }
+}
+?>
+<?php if ($hasAnyPlanInfo): ?>
 <h3>Energy plan</h3>
-<?php foreach ($scheduleByDate as $forDate => $daySchedule): if ($daySchedule['explanations']): ?>
+<?php foreach ($scheduleByDate as $forDate => $daySchedule): $daySummary = getScheduleSummary($forDate); if ($daySchedule['explanations'] || $daySummary): ?>
 <h4><?= htmlspecialchars((new DateTimeImmutable($forDate, $timezone))->format('D j M')) ?></h4>
-<?php $daySummary = getScheduleSummary($forDate); ?>
 <?php if ($daySummary): ?><p class="muted"><?= htmlspecialchars($daySummary) ?></p><?php endif; ?>
+<?php if ($daySchedule['explanations']): ?>
 <ul>
     <?php foreach ($daySchedule['explanations'] as $explanation): ?>
     <li><?= htmlspecialchars((string) $explanation) ?></li>
     <?php endforeach; ?>
 </ul>
+<?php else: ?>
+<p class="muted">No forced charge/discharge periods — self-use throughout.</p>
+<?php endif; ?>
 <?php endif; endforeach; ?>
 <?php endif; ?>
 
