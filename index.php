@@ -532,6 +532,23 @@ $ranClass = !$ranOk ? 'alert-error' : ((str_contains($ranMsg, 'unchanged') || st
 <p class="alert <?= $ranClass ?>"><?= htmlspecialchars($ranMsg) ?></p>
 <?php endif; ?>
 
+<?php
+// Durable, not just the one-off run banner above — most runs are unattended cron, not a
+// manual "Run now" click, so a warning from one of those needs to still be visible next
+// time someone actually looks at the dashboard. Overwritten wholesale on every real run
+// (see Runner.php's pushToDevices()/scheduler_flag_warnings_json), so this clears itself
+// automatically once a run's master-switch re-enable succeeds again.
+$schedulerFlagWarnings = json_decode(getSetting('scheduler_flag_warnings_json', '') ?: '{}', true) ?: [];
+?>
+<?php if ($schedulerFlagWarnings): ?>
+<p class="alert alert-warning">
+    Scheduler mode may not be active on <?= htmlspecialchars(implode(', ', array_keys($schedulerFlagWarnings))) ?>
+    — the schedule itself was still pushed successfully, but re-enabling "Mode Scheduler" on the device failed, so
+    it may still be running whatever mode was last set manually (e.g. via the FoxESS app) instead. Check the FoxESS
+    app, or the <a href="api-log.php">API log</a> for the underlying error.
+</p>
+<?php endif; ?>
+
 <?php if (!$slots): ?>
 <p class="muted">No rates fetched yet — run.php hasn't completed a successful fetch.</p>
 <form method="post" action="run-now.php">

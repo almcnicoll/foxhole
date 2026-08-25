@@ -375,10 +375,21 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
         // derivation, so only the push-tracking setting is left to update here.
         setSetting('last_pushed_groups_json', json_encode($pushGroups));
 
+        // Persisted (not just logged) so a warning from an unattended cron run is still
+        // visible on the dashboard whenever it's next checked, not only in the API log —
+        // see FoxessClient::pushSchedule()'s doc comment for why this is best-effort rather
+        // than a push failure. Overwritten wholesale every real run, same pattern as
+        // last_pushed_groups_json/pending_device_sns above: this run's result is the
+        // complete current truth, so a clean run naturally clears any earlier warning.
+        setSetting('scheduler_flag_warnings_json', json_encode($pushResult['flagWarnings']));
+
         // GitHub issue #7: appended to whichever message below ends up returned, so a rate
         // limit hit during the generation-history fetch stays visible even when the push
         // itself (below) goes on to succeed cleanly — see $historyRateLimited's own comment.
         $historyNote = $historyRateLimited ? ' (Also: FoxESS rate-limited the generation history fetch earlier this run — see the API log.)' : '';
+        $flagWarningNote = $pushResult['flagWarnings']
+            ? ' Scheduler mode may not be active on: ' . implode(', ', array_keys($pushResult['flagWarnings'])) . ' — the schedule was still pushed, but check the FoxESS app (see the dashboard warning).'
+            : '';
 
         if ($stillPending) {
             // "Device offline" is expected/routine for a battery-less inverter after dark —
@@ -403,7 +414,7 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
             if (array_filter($stillPending, fn($sn) => isRateLimitedFailure($pushResult['failureMessages'][$sn]))) {
                 $message .= ' FoxESS is rate-limiting or has hit its API quota for this account — this should resolve on its own once the limit resets.';
             }
-            $message .= $historyNote;
+            $message .= $historyNote . $flagWarningNote;
             if ($hardFailureSns) {
                 $logger->error($message . ' Failure detail: ' . implode('; ', $pushResult['failures']));
                 alertOnFailure($config, 'FoxESS scheduler: push incomplete', $message);
@@ -420,7 +431,7 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
             count($pushGroups),
             $pushResult['callCount'],
             implode(' ', array_column($scheduleByDate, 'summary')),
-        ) . $historyNote;
+        ) . $historyNote . $flagWarningNote;
         $logger->info($message);
         return ['ok' => true, 'dryRun' => false, 'message' => $message, 'schedule' => $scheduleByDate];
     } catch (OctopusFetchException|ScheduleBuildException|FoxessPushException $e) {
@@ -582,9 +593,13 @@ function reapplyOverrides(): array
     }
 
     setSetting('last_pushed_groups_json', json_encode($pushWindow['groups']));
+    setSetting('scheduler_flag_warnings_json', json_encode($pushResult['flagWarnings']));
     $windowDescription = $pushWindow['windowStart']->format('D j M H:i') . ' to ' . $pushWindow['windowEnd']->format('D j M H:i');
-    $logger->info("Override applied and pushed ($windowDescription).");
-    return ['ok' => true, 'message' => "Saved and pushed the active schedule ($windowDescription)."];
+    $flagWarningNote = $pushResult['flagWarnings']
+        ? ' Scheduler mode may not be active on: ' . implode(', ', array_keys($pushResult['flagWarnings'])) . ' — see the dashboard warning.'
+        : '';
+    $logger->info("Override applied and pushed ($windowDescription)." . $flagWarningNote);
+    return ['ok' => true, 'message' => "Saved and pushed the active schedule ($windowDescription)." . $flagWarningNote];
 }
 
 /**
@@ -595,7 +610,7 @@ function reapplyOverrides(): array
  * treats an offline device (isOfflineFailure()) differently from a real one.
  *
  * @param array<string, FoxessClient> $clients device serial number => client
- * @return array{callCount: int, failures: string[], failedSns: string[], failureMessages: array<string, string>}
+ * @return array{callCount: int, failures: string[], failedSns: string[], failureMessages: array<string, string>, flagWarnings: array<string, string>}
  */
 function pushToDevices(array $clients, array $groups, Logger $logger): array
 {
@@ -603,10 +618,20 @@ function pushToDevices(array $clients, array $groups, Logger $logger): array
     $failures = [];
     $failedSns = [];
     $failureMessages = [];
+    // Separate from $failures/$failedSns above — FoxessClient::pushSchedule() treats the
+    // scheduler master-switch re-enable as best-effort (see its own doc comment), so its
+    // failure doesn't fail the push, but still needs surfacing somewhere more visible than
+    // just the API log. Runner.php's callers persist this for the dashboard (see
+    // scheduler_flag_warnings_json).
+    $flagWarnings = [];
     foreach ($clients as $sn => $client) {
         try {
-            $client->pushSchedule($groups);
+            $result = $client->pushSchedule($groups);
             $logger->info("Pushed schedule to $sn.");
+            if (!empty($result['_schedulerFlagWarning'])) {
+                $logger->warn("Scheduler mode re-enable failed for $sn: " . $result['_schedulerFlagWarning']);
+                $flagWarnings[$sn] = $result['_schedulerFlagWarning'];
+            }
         } catch (FoxessPushException $e) {
             $logger->error("Push to $sn failed: " . $e->getMessage());
             $failures[] = "$sn: " . $e->getMessage();
@@ -615,7 +640,7 @@ function pushToDevices(array $clients, array $groups, Logger $logger): array
         }
         $callCount += $client->callCount();
     }
-    return ['callCount' => $callCount, 'failures' => $failures, 'failedSns' => $failedSns, 'failureMessages' => $failureMessages];
+    return ['callCount' => $callCount, 'failures' => $failures, 'failedSns' => $failedSns, 'failureMessages' => $failureMessages, 'flagWarnings' => $flagWarnings];
 }
 
 /**

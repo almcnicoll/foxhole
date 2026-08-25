@@ -58,11 +58,25 @@ class FoxessClient
         // pushing new groups alone doesn't turn it back on. Checked-then-set rather than
         // an unconditional write: a no-op skip on unsupported models, and one fewer call
         // against FoxESS's daily quota (see CLAUDE.md's rate-limit notes) on the common
-        // case where it's already on. Not best-effort — if this write fails, the push as
-        // a whole should be reported as failed, the same as if pushSchedule() had quietly
-        // left the master switch off: the schedule just sent would never actually run.
-        if ($this->getSchedulerFlag() === false) {
-            $this->setSchedulerFlag(true);
+        // case where it's already on.
+        //
+        // Best-effort, deliberately — the opposite of the clear-then-push calls above.
+        // Confirmed live: this call can fail (a wrong request shape returned errno 40257
+        // in production before the `enable` int/bool fix above) independently of whether
+        // the schedule itself pushed successfully, and the schedule having actually
+        // reached the device is the more important of the two outcomes to report — the
+        // whole push shouldn't read as failed, and get retried from scratch next run, just
+        // because this one follow-up call didn't land. The failure is still surfaced, not
+        // swallowed: attached to the return value so pushToDevices() (Runner.php) can log
+        // it and put a warning on the dashboard rather than it only ever showing up in the
+        // API log.
+        $result['_schedulerFlagWarning'] = null;
+        try {
+            if ($this->getSchedulerFlag() === false) {
+                $this->setSchedulerFlag(true);
+            }
+        } catch (FoxessPushException $e) {
+            $result['_schedulerFlagWarning'] = $e->getMessage();
         }
 
         return $result;
@@ -97,12 +111,20 @@ class FoxessClient
         return (bool) ($response['result']['enable'] ?? false);
     }
 
-    /** Writes the scheduler master switch — see getSchedulerFlag(). */
+    /**
+     * Writes the scheduler master switch — see getSchedulerFlag(). `enable` is sent as an
+     * integer (0/1), not a JSON boolean: confirmed live, a JSON `true`/`false` here gets
+     * rejected with errno 40257 ("Parameters do not meet expectations"), even though
+     * get/flag's *response* happily returns `enable` as a JSON boolean. Consistent with
+     * every other enable-style field already used elsewhere in this file (schedule groups'
+     * own `enable` is always an int 1, never a bool) — FoxESS's request parsing apparently
+     * isn't as lenient about the two as its response encoding is.
+     */
     public function setSchedulerFlag(bool $enable): array
     {
         return $this->post('/op/v1/device/scheduler/set/flag', [
             'deviceSN' => $this->deviceSn,
-            'enable' => $enable,
+            'enable' => $enable ? 1 : 0,
         ]);
     }
 

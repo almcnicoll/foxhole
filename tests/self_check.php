@@ -385,7 +385,10 @@ check(count($recordingClient->calls) === 4, 'pushSchedule() makes four calls whe
 check($recordingClient->calls[0] === ['/op/v1/device/scheduler/enable', ['deviceSN' => 'SN-REC', 'groups' => []]], 'the first call clears the schedule with an empty groups array');
 check($recordingClient->calls[1] === ['/op/v1/device/scheduler/enable', ['deviceSN' => 'SN-REC', 'groups' => $pushedGroups]], 'the second call sends the real computed groups');
 check($recordingClient->calls[2][0] === '/op/v1/device/scheduler/get/flag', 'the third call reads the current master-switch state');
-check($recordingClient->calls[3] === ['/op/v1/device/scheduler/set/flag', ['deviceSN' => 'SN-REC', 'enable' => true]], 'the fourth call re-enables the master switch, since it was off');
+check(
+    $recordingClient->calls[3] === ['/op/v1/device/scheduler/set/flag', ['deviceSN' => 'SN-REC', 'enable' => 1]],
+    'the fourth call re-enables the master switch (enable as an int 1, not a JSON bool — see setSchedulerFlag()\'s doc comment) since it was off',
+);
 
 $alreadyOnClient = new class('key', 'SN-ON', 'https://example.invalid') extends FoxessClient {
     public array $calls = [];
@@ -439,7 +442,12 @@ try {
     check(count($abortingClearClient->calls) === 1, 'a failed clear call aborts before attempting the real push — not best-effort');
 }
 
-$abortingFlagClient = new class('key', 'SN-FLAGFAIL', 'https://example.invalid') extends FoxessClient {
+// Best-effort, deliberately the opposite of the clear-call test above — confirmed live
+// (errno 40257 in production before the enable int/bool fix) that this call can fail
+// independently of the schedule itself pushing successfully, and the schedule reaching
+// the device matters more than this follow-up landing. The failure still isn't silently
+// dropped: it comes back on the result so pushToDevices()/Runner.php can surface it.
+$flagFailureClient = new class('key', 'SN-FLAGFAIL', 'https://example.invalid') extends FoxessClient {
     public array $calls = [];
     protected function post(string $path, array $body, bool $isRetry = false): array
     {
@@ -453,12 +461,20 @@ $abortingFlagClient = new class('key', 'SN-FLAGFAIL', 'https://example.invalid')
         return ['errno' => 0];
     }
 };
-try {
-    $abortingFlagClient->pushSchedule($pushedGroups);
-    check(false, 'pushSchedule() should propagate a failure from the master-switch write, not swallow it');
-} catch (FoxessPushException $e) {
-    check(true, 'a failed master-switch write surfaces as a push failure — silently leaving it off would defeat the whole point of this feature');
-}
+$flagFailureResult = $flagFailureClient->pushSchedule($pushedGroups);
+check(count($flagFailureClient->calls) === 4, 'a failed master-switch write does not stop pushSchedule() from completing, or retrying it further');
+check($flagFailureResult['_schedulerFlagWarning'] === 'simulated set/flag failure', 'the failure is attached to the result rather than silently dropped: got ' . json_encode($flagFailureResult['_schedulerFlagWarning'] ?? null));
+
+$flagSuccessClient = new class('key', 'SN-FLAGOK', 'https://example.invalid') extends FoxessClient {
+    protected function post(string $path, array $body, bool $isRetry = false): array
+    {
+        if ($path === '/op/v1/device/scheduler/get/flag') {
+            return ['errno' => 0, 'result' => ['support' => true, 'enable' => true]];
+        }
+        return ['errno' => 0];
+    }
+};
+check($flagSuccessClient->pushSchedule($pushedGroups)['_schedulerFlagWarning'] === null, 'a clean push (no flag write needed) carries no warning');
 
 // --- Runner: pushToDevices() attempts every device and reports per-device failures ---
 // Stubs override pushSchedule() directly (public, not final) rather than hitting the
@@ -492,6 +508,20 @@ check($pushResult['failureMessages'] === ['SN-FAIL' => 'simulated failure'], 'fa
 $allOkResult = pushToDevices(['SN-OK' => $okDevice], [], $pushLogger);
 check($allOkResult['failures'] === [], 'no failures reported when every device succeeds');
 check($allOkResult['failedSns'] === [], 'failedSns is empty when every device succeeds');
+check($allOkResult['flagWarnings'] === [], 'no flag warnings when pushSchedule() returns none');
+
+// A device whose master-switch re-enable failed (but whose schedule push itself
+// succeeded) must not be treated as a failed/pending push — see FoxessClient::
+// pushSchedule()'s best-effort doc comment — but its warning must still surface.
+$flagWarningDevice = new class('key', 'SN-FLAGWARN', 'https://example.invalid') extends FoxessClient {
+    public function pushSchedule(array $groups): array
+    {
+        return ['errno' => 0, '_schedulerFlagWarning' => 'simulated set/flag failure'];
+    }
+};
+$flagWarningResult = pushToDevices(['SN-FLAGWARN' => $flagWarningDevice], [], $pushLogger);
+check($flagWarningResult['failures'] === [] && $flagWarningResult['failedSns'] === [], 'a flag-warning device is not counted as a push failure');
+check($flagWarningResult['flagWarnings'] === ['SN-FLAGWARN' => 'simulated set/flag failure'], 'the flag warning is surfaced, keyed by serial number, for Runner.php to persist for the dashboard');
 
 // --- Runner: isOfflineFailure() distinguishes a routine offline inverter from a real failure ---
 check(isOfflineFailure('FoxESS /op/v1/device/scheduler/enable error 41935: Device offline, Please connect and retry'), 'a FoxESS "Device offline" error is recognised as routine (battery-less inverter after dark, see CLAUDE.md)');
