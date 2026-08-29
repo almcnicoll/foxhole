@@ -101,14 +101,26 @@ renderHeader('Override');
       ?>
         <fieldset>
           <legend><?= htmlspecialchars($label) ?> <button type="button" class="btn-clear" onclick="<?= htmlspecialchars($clearJs) ?>">Clear</button></legend>
-          <label for="<?= $prefix ?>event_start">Event start</label>
-          <input type="time" id="<?= $prefix ?>event_start" name="<?= $prefix ?>event_start" value="<?= htmlspecialchars($existing['event_start'] ?? '') ?>">
-          <label for="<?= $prefix ?>event_end">Event end</label>
-          <input type="time" id="<?= $prefix ?>event_end" name="<?= $prefix ?>event_end" value="<?= htmlspecialchars($existing['event_end'] ?? '') ?>">
-          <label for="<?= $prefix ?>prep_start">Prepare from (optional — force <?= $prepAction ?>)</label>
-          <input type="time" id="<?= $prefix ?>prep_start" name="<?= $prefix ?>prep_start" value="<?= htmlspecialchars($existing['prep_start'] ?? '') ?>">
-          <label for="<?= $prefix ?>prep_end">Prepare until</label>
-          <input type="time" id="<?= $prefix ?>prep_end" name="<?= $prefix ?>prep_end" value="<?= htmlspecialchars($existing['prep_end'] ?? '') ?>">
+          <div class="time-range">
+            <div class="time-field">
+              <label for="<?= $prefix ?>event_start">Event start</label>
+              <input type="time" id="<?= $prefix ?>event_start" name="<?= $prefix ?>event_start" value="<?= htmlspecialchars($existing['event_start'] ?? '') ?>">
+            </div>
+            <div class="time-field">
+              <label for="<?= $prefix ?>event_end">Event end</label>
+              <input type="time" id="<?= $prefix ?>event_end" name="<?= $prefix ?>event_end" value="<?= htmlspecialchars($existing['event_end'] ?? '') ?>">
+            </div>
+          </div>
+          <div class="time-range">
+            <div class="time-field">
+              <label for="<?= $prefix ?>prep_start">Prepare from (optional — force <?= $prepAction ?>)</label>
+              <input type="time" id="<?= $prefix ?>prep_start" name="<?= $prefix ?>prep_start" value="<?= htmlspecialchars($existing['prep_start'] ?? '') ?>">
+            </div>
+            <div class="time-field">
+              <label for="<?= $prefix ?>prep_end">Prepare until</label>
+              <input type="time" id="<?= $prefix ?>prep_end" name="<?= $prefix ?>prep_end" value="<?= htmlspecialchars($existing['prep_end'] ?? '') ?>">
+            </div>
+          </div>
         </fieldset>
       <?php endforeach; ?>
     </fieldset>

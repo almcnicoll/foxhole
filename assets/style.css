@@ -289,6 +289,29 @@ fieldset {
     padding: 0.8rem;
 }
 
+/* override.php: an event/prepare pair of time inputs side by side rather than stacked —
+   they read as a "from"/"to" pair, and neither needs to be wide, so there's no reason to
+   waste a whole row each on both mobile and desktop. */
+.time-range {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.8rem;
+}
+.time-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    /* Caps how wide a field gets so a long label (e.g. "Prepare from (optional — force
+       discharge)") wraps onto multiple lines instead of forcing the field wide enough to
+       fit unbroken — without this, that one long label alone pushed its pair past a phone
+       viewport's width and defeated the whole point of .time-range's side-by-side layout. */
+    min-width: 0;
+    max-width: 9.5rem;
+}
+.time-field input[type="time"] {
+    width: auto;
+}
+
 .btn-clear {
     margin-left: 0.5rem;
     padding: 0.1rem 0.5rem;
