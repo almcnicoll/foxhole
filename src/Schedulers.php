@@ -278,17 +278,56 @@ function overrideWindowInstants(string $forDate, DateTimeZone $timezone, string 
 }
 
 /**
+ * The modelling scheduler's own optimisation horizon end — as far ahead as the data
+ * actually allows, per the user's explicit ask, rather than a fixed 24h: the DP can only
+ * make a good decision about *whether* to hold charge through an expensive period if that
+ * period is actually inside the horizon it can see. A DP that always stopped looking 24h
+ * out would cheerfully sell everything right at that boundary even when the very next
+ * slot outside it is the most expensive of the day — exactly the bug this was written to
+ * fix (confirmed live: a horizon ending at 17:00 sold down to the configured floor in the
+ * slot right before it, immediately ahead of a 40p+ spike it had no visibility into).
+ *
+ * Bounded by whichever of price or solar-forecast data runs out first — predicted usage is
+ * never the limiting factor, since HalfHourlyUsageEstimator always has an answer (real
+ * history, or its own flat fallback — see that class's doc comment) regardless of how far
+ * ahead it's asked for. Solar only constrains this when forecast data actually exists;
+ * with it disabled/unavailable ($solarSlots null or empty), only the price horizon applies
+ * — solar being optional everywhere else in this scheduler (it degrades to no-solar
+ * behaviour rather than refusing to run) would make it strange for its mere absence to
+ * also refuse to plan ahead on price alone.
+ *
+ * This is deliberately a separate, usually-longer horizon than what actually reaches
+ * FoxESS: the schedule format has no date field, only recurring hour/minute-of-day, so
+ * ScheduleBuilder::buildPushWindow() (called downstream on this function's output,
+ * regardless of which scheduler produced it) still independently caps the actual push at
+ * 24h — a hard constraint of that format, not a business choice this function makes. The
+ * DP seeing further than what gets pushed is the whole point: its choices *within* the
+ * pushable window come out correctly informed by what it knows is coming right after.
+ *
+ * @param ?array $solarSlots SolarForecastClient-shaped periods (['from','to','watt_hours']), or null/empty if unavailable
+ * @return ?DateTimeImmutable null if there's no known price data to plan from at all
+ */
+function modellingWindowEnd(?DateTimeImmutable $priceHorizon, ?array $solarSlots): ?DateTimeImmutable
+{
+    if ($priceHorizon === null) {
+        return null;
+    }
+    if (!$solarSlots) {
+        return $priceHorizon;
+    }
+    $solarHorizon = max(array_column($solarSlots, 'to'));
+    return min($priceHorizon, $solarHorizon);
+}
+
+/**
  * Gathers the modelling scheduler's own rolling-window inputs and calls
  * buildModellingSchedule() — shared by Runner.php's runScheduler()/reapplyOverrides() and
- * schedulers.php's preview, so the window-bounds math (which must stay consistent with
- * ScheduleBuilder::buildPushWindow()'s own derivation, or the modelling scheduler would be
- * optimising over a different horizon than what actually ends up pushed) isn't duplicated
- * at each call site.
+ * schedulers.php's preview, so the window-bounds math isn't duplicated at each call site.
  *
  * @param array $knownSlots getPriceSlotsFrom()-shaped rows — every currently-known slot
  *        from local midnight today onward; this slices out just the rolling window itself
- *        (start of the current hour through 24h ahead or the end of known pricing,
- *        whichever is sooner)
+ *        (start of the current hour through as far as price/solar data allows — see
+ *        modellingWindowEnd())
  * @return array<string, array{groups: array, explanations: string[], summary: string}> for_date => schedule
  */
 function buildModellingScheduleForRun(
@@ -303,10 +342,9 @@ function buildModellingScheduleForRun(
 ): array {
     $localNow = $now->setTimezone($timezone);
     $windowStart = $localNow->setTime((int) $localNow->format('G'), 0, 0);
-    $windowEnd = $windowStart->modify('+24 hours');
-    $knownDataEnd = getLatestPriceHorizon();
-    if ($knownDataEnd !== null && $knownDataEnd < $windowEnd) {
-        $windowEnd = $knownDataEnd;
+    $windowEnd = modellingWindowEnd(getLatestPriceHorizon(), $solarSlots);
+    if ($windowEnd === null) {
+        throw new ScheduleBuildException('No known price slots to plan the modelling scheduler\'s window from');
     }
 
     $importSlots = [];

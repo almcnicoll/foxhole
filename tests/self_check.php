@@ -1648,6 +1648,30 @@ check(
 );
 check($midnightSchedule['2026-03-01']['summary'] === $midnightSchedule['2026-03-02']['summary'], 'the whole-window summary is attached identically to every touched date, since the DP doesn\'t compute a separate per-date breakdown');
 
+// --- Schedulers.php: modellingWindowEnd() plans as far ahead as data allows (user-requested,
+// replacing the old fixed +24h cap — see CLAUDE.md's "Horizon later widened" note) ---
+$priceHorizon48h = new DateTimeImmutable('2026-05-03 00:00:00', $mTz); // 48h out from an assumed "now" of 2026-05-01 00:00
+check(modellingWindowEnd(null, null) === null, 'no known price data at all means no window to plan');
+check(modellingWindowEnd($priceHorizon48h, null) == $priceHorizon48h, 'with no solar data, the window extends all the way to the price horizon — not capped at 24h');
+check(modellingWindowEnd($priceHorizon48h, []) == $priceHorizon48h, 'an empty solar array is treated the same as no solar data (not a zero-length window)');
+
+$solarHorizon30h = new DateTimeImmutable('2026-05-02 06:00:00', $mTz); // sooner than the 48h price horizon
+$shortSolar = [
+    ['from' => new DateTimeImmutable('2026-05-01 06:00:00', $mTz), 'to' => new DateTimeImmutable('2026-05-01 20:00:00', $mTz), 'watt_hours' => 5000],
+    ['from' => new DateTimeImmutable('2026-05-02 00:00:00', $mTz), 'to' => $solarHorizon30h, 'watt_hours' => 0],
+];
+check(
+    modellingWindowEnd($priceHorizon48h, $shortSolar) == $solarHorizon30h,
+    'when solar forecast data runs out sooner than price data, the shorter of the two wins: got ' . modellingWindowEnd($priceHorizon48h, $shortSolar)->format('Y-m-d H:i'),
+);
+
+$solarHorizon60h = new DateTimeImmutable('2026-05-03 12:00:00', $mTz); // later than the 48h price horizon
+$longSolar = [['from' => new DateTimeImmutable('2026-05-01 06:00:00', $mTz), 'to' => $solarHorizon60h, 'watt_hours' => 5000]];
+check(
+    modellingWindowEnd($priceHorizon48h, $longSolar) == $priceHorizon48h,
+    'when solar forecast data extends further than price data, price stays the binding constraint (nothing to schedule against beyond it anyway)',
+);
+
 // --- ModellingScheduleBuilder: overrides fed in as compulsory DP actions (user-requested) ---
 // Rather than painting an override onto the DP's output afterward (the way the other two
 // schedulers' overrides work), a forced slot restricts the DP to a single action for that

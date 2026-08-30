@@ -10,9 +10,11 @@ require_once __DIR__ . '/Exceptions.php';
  * sequence — exact and deterministic for a given discretisation, no tuning or random
  * search, and cheap to compute (tens of thousands of evaluations for a typical horizon).
  *
- * Unlike the other two schedulers, this one's horizon is a *rolling window from now*
- * (typically the rest of today plus overnight, up to 48 slots), not a single calendar day
- * — it may genuinely cross a midnight boundary. That's why build() returns absolute
+ * Unlike the other two schedulers, this one's horizon is a *rolling window from now* —
+ * not a single calendar day, and not a fixed length either: it extends as far as price and
+ * solar forecast data both allow (see Schedulers.php's modellingWindowEnd()), often well
+ * past 24h/48 slots, specifically so the DP isn't blind to a price spike that falls just
+ * outside a shorter, fixed horizon. It may genuinely cross a midnight boundary. That's why build() returns absolute
  * DateTimeImmutable intervals rather than calendar-day-relative hour/minute groups; the
  * caller (Schedulers.php's buildModellingSchedule()) splits those into per-date storage,
  * the same reasoning ScheduleBuilder::buildPushWindow() already documents for its own

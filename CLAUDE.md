@@ -686,6 +686,40 @@ site" pattern `Runner.php` already used for gathering live SoC/solar only
 when the forecast-weighted scheduler is selected, just extended to also
 cover this one.
 
+**Horizon later widened from a fixed 24h to "as far as the data allows"
+(user-requested).** The rolling window described above — `[start of current
+hour, min(+24h, latest known price horizon)]` — was the original issue #5
+spec, and it created a real bug: a horizon that always stops 24h out has no
+visibility into anything past that boundary, so the DP would cheerfully sell
+the battery down to its configured floor in the last slot before the cutoff
+even when the very next (invisible) slot was the most expensive of the day.
+Confirmed live: a horizon ending at 17:00 sold down to the floor in the
+16:00-17:00 slot, immediately ahead of a 40p+ spike it had no way to know
+about. `Schedulers.php`'s new `modellingWindowEnd(?DateTimeImmutable
+$priceHorizon, ?array $solarSlots)` — a small pure function, deliberately
+extracted out of `buildModellingScheduleForRun()` so it's unit-testable
+without touching the database — replaces the `+24h` cap with "as far as
+price *and* solar forecast data both extend," per the user's explicit
+requirement of planning as far ahead as (a) Octopus prices, (b) solar
+forecast, and (c) predicted usage allow. (c) never actually limits anything:
+`HalfHourlyUsageEstimator` always has an answer — real history, or its own
+flat fallback — regardless of how far ahead it's asked, so only (a) and (b)
+appear in the function. Solar only constrains the horizon when forecast data
+actually exists; with it disabled or unavailable, only the price horizon
+applies, consistent with solar being optional everywhere else in this
+scheduler (no solar data means it degrades to no-solar behaviour, not a
+refusal to plan ahead on price alone).
+
+This is deliberately a *different, usually longer* horizon than what
+actually reaches FoxESS: `ScheduleBuilder::buildPushWindow()` (called
+downstream on this function's output, same as every other scheduler's) still
+independently caps the real push at 24h — a hard constraint of FoxESS's
+dateless hour/minute-of-day schedule format, not a business choice, and
+untouched by this change. The DP seeing further than what gets pushed is the
+whole point: its choices *within* the pushable window come out correctly
+informed by costs it now knows are coming right after it, rather than
+optimising in ignorance of them.
+
 *New data: half-hourly household usage history, from FoxESS's `loads`
 variable.* Nothing in this app tracked household consumption before this —
 `historic_generation` only had `generation_kwh`/`forecast_kwh`. Researched
