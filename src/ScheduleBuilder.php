@@ -224,7 +224,10 @@ class ScheduleBuilder
      * instant's local hour/minute-of-day is unambiguous.
      *
      * Already-elapsed hours of today are naturally excluded (the window starts at the
-     * current hour, not midnight), and a day whose pricing hasn't been published yet is
+     * current hour, not midnight) — except a group actually in progress right now, which
+     * keeps its true, possibly-earlier start rather than being clipped to the top of the
+     * current hour (see the in-progress check inline below for why that clipping was a
+     * real bug, not just cosmetic). A day whose pricing hasn't been published yet is
      * naturally never pushed past its own known horizon — neither needs special-casing
      * "today vs tomorrow" the way the old splice did, since everything here works in real
      * instants throughout. Recomputing every known day fresh each run (rather than
@@ -266,8 +269,19 @@ class ScheduleBuilder
                 if ($absEnd <= $windowStart || $absStart >= $windowEnd) {
                     continue; // entirely outside the push window — e.g. already-elapsed hours of today
                 }
+                // A group actually in progress right now keeps its true start rather than
+                // being clipped to the top of the current hour — confirmed live as a real
+                // bug, not just a cosmetic one: the BST workaround (applyBstWorkaround(),
+                // applied after this function) shifts everything sent to FoxESS an hour
+                // earlier to compensate for FoxESS's own late-execution bug, so clipping an
+                // in-progress group's start here throws away exactly the portion that shift
+                // needs in order to land FoxESS's (delayed) execution back on the group's
+                // real, already-elapsed start — that portion of the group then never
+                // actually applies on the device at all, workaround or not. A group that
+                // hasn't started yet, or already fully ended, is unaffected either way.
+                $inProgress = $absStart < $now && $absEnd > $now;
                 $absoluteIntervals[] = [
-                    'start' => max($absStart, $windowStart),
+                    'start' => $inProgress ? $absStart : max($absStart, $windowStart),
                     'end' => min($absEnd, $windowEnd),
                     'workMode' => $iv['workMode'],
                     'explanation' => $iv['explanation'],

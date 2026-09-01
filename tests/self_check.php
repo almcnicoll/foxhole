@@ -1040,11 +1040,37 @@ check(
     'with nothing capping the window, both known days combine into one 24h push, in true chronological order (today\'s evening before tomorrow\'s early morning, not sorted by raw hour-of-day): got ' . implode(',', $pushModes),
 );
 
+// "Now" (21:00) falls inside today's 20:00-00:00 group — genuinely in progress, not merely
+// "after the top of the hour" — so its true 20:00 start must survive, not get clipped to
+// 21:00. This used to assert the opposite (clipped to 21:00) before a GitHub-reported bug
+// was fixed: applyBstWorkaround() (applied after this function, on the copy actually sent
+// to FoxESS) shifts everything an hour earlier to compensate for FoxESS's own delayed
+// execution, and clipping an in-progress group's start here threw away exactly the portion
+// that shift needed — the 20:00-21:00 stretch would then never actually apply on the
+// device at all, workaround or not, confirmed live.
 $push2 = $pushBuilder->buildPushWindow($scheduleByDate, new DateTimeImmutable('2026-01-05 21:00:00', $pushTz), $pushTz, null);
 $tail = $push2['groups'][0];
 check(
-    $tail['startHour'] === 21 && $tail['endHour'] === 0,
-    'the window starts at the current hour (21:00), trimming away the already-elapsed 20:00-21:00 portion of today\'s plan: got startHour=' . $tail['startHour'],
+    $tail['startHour'] === 20 && $tail['endHour'] === 0,
+    'a group actually in progress at "now" (20:00-00:00, now=21:00) keeps its true 20:00 start rather than being clipped to the top of the current hour: got startHour=' . $tail['startHour'],
+);
+
+// A group that's genuinely, fully in the past by "now" — as opposed to merely started
+// before the current hour — must still be excluded entirely; the in-progress fix above
+// must not resurrect a group that's actually finished.
+$elapsedSchedule = ['2026-01-05' => ['groups' => [['enable' => 1, 'startHour' => 10, 'startMinute' => 0, 'endHour' => 11, 'endMinute' => 0, 'workMode' => 'ForceCharge', 'minSocOnGrid' => 15, 'fdSoc' => 100, 'fdPwr' => 3000]], 'explanations' => ['Charging 10:00-11:00.']]];
+$elapsedPush = $pushBuilder->buildPushWindow($elapsedSchedule, new DateTimeImmutable('2026-01-05 13:05:00', $pushTz), $pushTz, null);
+check($elapsedPush['groups'] === [], 'a group that fully ended before "now" is excluded, not resurrected by the in-progress fix: got ' . json_encode($elapsedPush['groups']));
+
+// The exact scenario reported live: a 12:00-14:59 override, pushed while already partway
+// through it (13:05) — must keep the true 12:00 start, not 13:00.
+$inProgressSchedule = ['2026-01-05' => ['groups' => [['enable' => 1, 'startHour' => 12, 'startMinute' => 0, 'endHour' => 14, 'endMinute' => 59, 'workMode' => 'ForceDischarge', 'minSocOnGrid' => 15, 'fdSoc' => 15, 'fdPwr' => 3000]], 'explanations' => ['Selling 12:00-14:59.']]];
+$inProgressPush = $pushBuilder->buildPushWindow($inProgressSchedule, new DateTimeImmutable('2026-01-05 13:05:00', $pushTz), $pushTz, null);
+check(
+    count($inProgressPush['groups']) === 1
+        && $inProgressPush['groups'][0]['startHour'] === 12 && $inProgressPush['groups'][0]['startMinute'] === 0
+        && $inProgressPush['groups'][0]['endHour'] === 14 && $inProgressPush['groups'][0]['endMinute'] === 59,
+    'a saved 12:00-14:59 override pushed at 13:05 keeps its full 12:00-14:59 span: got ' . json_encode($inProgressPush['groups']),
 );
 
 // Only today known (tomorrow not in $scheduleByDate at all, e.g. not published yet) and
