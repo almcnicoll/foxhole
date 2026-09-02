@@ -382,11 +382,16 @@ $recordingClient = new class('key', 'SN-REC', 'https://example.invalid') extends
 };
 $recordingClient->pushSchedule($pushedGroups);
 check(count($recordingClient->calls) === 4, 'pushSchedule() makes four calls when the master switch is off: clear, real push, flag read, flag write. Got ' . count($recordingClient->calls));
-// v1, not v2 — see pushSchedule()'s own doc comment: v2 hard-rejects any push over 8
-// groups (confirmed live, errno 40257), so the write path reverted back to v1 the same
-// day it was migrated. Only scheduler/get moved to v2 and stayed there.
-check($recordingClient->calls[0] === ['/op/v1/device/scheduler/enable', ['deviceSN' => 'SN-REC', 'groups' => []]], 'the first call clears the schedule with an empty groups array');
-check($recordingClient->calls[1] === ['/op/v1/device/scheduler/enable', ['deviceSN' => 'SN-REC', 'groups' => $pushedGroups]], 'the second call sends the real computed groups, in this app\'s own flat shape (no v2 extraParam reshape)');
+// v2 for both — pushSchedule() itself trusts the caller (Runner.php) to have already
+// capped $groups to max_scheduler_groups before it ever gets here; see
+// capToSoonestGroups()'s own tests for that half of the safeguard.
+check($recordingClient->calls[0] === ['/op/v2/device/scheduler/enable', ['deviceSN' => 'SN-REC', 'groups' => []]], 'the first call clears the schedule with an empty groups array');
+check(
+    $recordingClient->calls[1] === ['/op/v2/device/scheduler/enable', ['deviceSN' => 'SN-REC', 'groups' => [
+        ['enable' => 1, 'startHour' => 10, 'startMinute' => 0, 'endHour' => 11, 'endMinute' => 0, 'workMode' => 'ForceCharge', 'extraParam' => ['minSocOnGrid' => 15, 'fdSoc' => 100, 'fdPwr' => 3000]],
+    ]]],
+    'the second call sends the real computed groups, reshaped with the control fields nested under extraParam: got ' . json_encode($recordingClient->calls[1]),
+);
 check($recordingClient->calls[2][0] === '/op/v1/device/scheduler/get/flag', 'the third call reads the current master-switch state');
 check(
     $recordingClient->calls[3] === ['/op/v1/device/scheduler/set/flag', ['deviceSN' => 'SN-REC', 'enable' => 1]],
@@ -1088,6 +1093,31 @@ check(count($capped['groups']) === 1 && $capped['groups'][0]['startHour'] === 20
 $stale = $pushBuilder->buildPushWindow($todayOnly, new DateTimeImmutable('2026-01-05 14:00:00', $pushTz), $pushTz, new DateTimeImmutable('2026-01-05 10:00:00', $pushTz));
 check($stale['groups'] === [] && $stale['explanations'] === [], 'a known-data-end already before "now" collapses the push window to empty rather than an invalid negative-width window');
 check($stale['windowEnd'] == $stale['windowStart'], 'a collapsed window still reports windowStart/windowEnd (equal to each other) for the caller\'s status message');
+
+// --- ScheduleBuilder: capToSoonestGroups() caps the actual FoxESS push to
+// config.php's foxess.max_scheduler_groups (user-requested safeguard for moving
+// scheduler/enable to v2 — see CLAUDE.md's "FoxESS scheduler endpoint" note: v2
+// hard-rejects a call with more than 8 groups). Keeping the soonest N and dropping the
+// rest is safe specifically because the cron job re-runs every few hours and will push
+// whatever didn't fit well before it's actually needed. ---
+$manyGroups = array_map(
+    fn($i) => ['enable' => 1, 'startHour' => $i, 'startMinute' => 0, 'endHour' => $i + 1, 'endMinute' => 0, 'workMode' => 'ForceCharge', 'minSocOnGrid' => 15, 'fdSoc' => 100, 'fdPwr' => 3000],
+    range(1, 11),
+);
+$manyExplanations = array_map(fn($i) => "Group $i.", range(1, 11));
+$cappedToEight = (new ScheduleBuilder($strategy, $battery))->capToSoonestGroups($manyGroups, $manyExplanations, 8);
+check(count($cappedToEight['groups']) === 8, 'capToSoonestGroups(..., 8) keeps exactly 8 of 11 groups: got ' . count($cappedToEight['groups']));
+check(
+    $cappedToEight['groups'][0]['startHour'] === 1 && $cappedToEight['groups'][7]['startHour'] === 8,
+    'the soonest 8 (by array order, which buildPushWindow() already guarantees is true chronological order) are kept, not an arbitrary 8: got start hours ' . implode(',', array_column($cappedToEight['groups'], 'startHour')),
+);
+check($cappedToEight['explanations'] === array_slice($manyExplanations, 0, 8), 'explanations are capped in lockstep with groups, so the two arrays never end up mismatched in length');
+
+$underLimit = (new ScheduleBuilder($strategy, $battery))->capToSoonestGroups(array_slice($manyGroups, 0, 5), array_slice($manyExplanations, 0, 5), 8);
+check(count($underLimit['groups']) === 5, 'fewer groups than the cap is a no-op, not padded or truncated further');
+
+$configuredLimit = (new ScheduleBuilder($strategy, $battery))->capToSoonestGroups($manyGroups, $manyExplanations, 3);
+check(count($configuredLimit['groups']) === 3, 'the cap value itself is a plain parameter (config.php\'s foxess.max_scheduler_groups), not hardcoded to 8 inside this method — verified live because FoxESS could change this limit in a future API version');
 
 // --- ScheduleBuilder: applyBstWorkaround shifts pushed groups an hour earlier, splitting at midnight ---
 $bstNormal = [['enable' => 1, 'startHour' => 6, 'startMinute' => 0, 'endHour' => 10, 'endMinute' => 0, 'workMode' => 'ForceCharge', 'minSocOnGrid' => 15, 'fdSoc' => 100, 'fdPwr' => 3000]];

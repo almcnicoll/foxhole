@@ -363,9 +363,16 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
         foreach ($devicesToPush as $sn) {
             $clients[$sn] = new FoxessClient($apiKey, $sn, $config['foxess']['base_url']);
         }
-        $devicePushGroups = $pushGroups;
+        // Capped to the soonest N before anything else — see capToSoonestGroups()'s own
+        // doc comment for why dropping the rest is safe (a later cron run covers them
+        // well before they're actually needed) and why this must happen before, not
+        // after, applyBstWorkaround() (which would undo the chronological ordering this
+        // relies on).
+        $maxSchedulerGroups = (int) ($config['foxess']['max_scheduler_groups'] ?? 8);
+        $capped = $scheduleBuilder->capToSoonestGroups($pushGroups, $pushWindow['explanations'], $maxSchedulerGroups);
+        $devicePushGroups = $capped['groups'];
         if (getSetting('foxess_bst_workaround_enabled', '0') === '1' && isBstDate($pushWindow['windowStart'], $timezone)) {
-            $devicePushGroups = $scheduleBuilder->applyBstWorkaround($pushGroups, $pushWindow['explanations'])['groups'];
+            $devicePushGroups = $scheduleBuilder->applyBstWorkaround($devicePushGroups, $capped['explanations'])['groups'];
         }
         $pushResult = pushToDevices($clients, $devicePushGroups, $logger);
         $stillPending = $pushResult['failedSns'];
@@ -581,9 +588,13 @@ function reapplyOverrides(): array
     foreach ($deviceSns as $sn) {
         $clients[$sn] = new FoxessClient($apiKey, $sn, $config['foxess']['base_url']);
     }
-    $devicePushGroups = $pushWindow['groups'];
+    // See runScheduler()'s identical step for why this must happen before, not after,
+    // applyBstWorkaround().
+    $maxSchedulerGroups = (int) ($config['foxess']['max_scheduler_groups'] ?? 8);
+    $capped = $scheduleBuilder->capToSoonestGroups($pushWindow['groups'], $pushWindow['explanations'], $maxSchedulerGroups);
+    $devicePushGroups = $capped['groups'];
     if (getSetting('foxess_bst_workaround_enabled', '0') === '1' && isBstDate($pushWindow['windowStart'], $timezone)) {
-        $devicePushGroups = $scheduleBuilder->applyBstWorkaround($pushWindow['groups'], $pushWindow['explanations'])['groups'];
+        $devicePushGroups = $scheduleBuilder->applyBstWorkaround($devicePushGroups, $capped['explanations'])['groups'];
     }
     $pushResult = pushToDevices($clients, $devicePushGroups, $logger);
     if ($pushResult['failures']) {

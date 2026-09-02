@@ -1033,31 +1033,59 @@ it's what the no-op-push diff compares, and wording drift shouldn't trigger
 a re-push when the actual schedule hasn't changed. `index.php` renders both
 under "Energy plan", one `<h4>` sub-section per known date.
 
-**FoxESS scheduler endpoint: v0 never, v2 for reads, v1 for writes.** Cross-checked the
+**FoxESS scheduler endpoint: v0 never, v1 only for the master switch, v2 for
+everything else — with a hard-earned safeguard on the write side.** Cross-checked the
 live FoxESS OpenAPI docs (unreliable to scrape — confirmed twice, garbles version labels
 even when directly asked), the `foxesscommunity.com` forums, and existing implementations
 (`TonyM1958/FoxESS-Cloud`, `nickw444/ha-foxess-cloud`, `gostonefire/foxess`). v0 is
 confirmed by multiple community reports to corrupt backend scheduler state on some
 inverters (recovery requires waiting ~3h then re-writing a plain SelfUse schedule) — never
-used for the scheduler. `scheduler/get/flag`/`scheduler/set/flag` (the master switch) and
-`scheduler/enable` (the actual push) are v1; `scheduler/get` (read-back) is v2.
+used for the scheduler. `scheduler/get`/`scheduler/enable` (read-back and the actual push)
+are v2; `scheduler/get/flag`/`scheduler/set/flag` (the master switch) stay v1, since even
+the current v3-era community reference code keeps that specific pair there.
 
-That split — not "just use whichever version is newest" — is itself a live-confirmed
-finding, not a guess: `doc/foxess-scheduler-api-migration-plan.md` has the full
-investigation, but the short version is that `scheduler/enable` was migrated to v2
-(2026-09-01), then reverted to v1 the very next day after a real override push failed
-with `errno 40257`. Bisection proved **v2 hard-rejects any push of more than 8 groups
-per call**, while the identical payload succeeds on v1 unchanged — and this app's
-modelling scheduler (and overrides) routinely produce more than 8. A read-only v3
-`scheduler/get` call reported `maxGroupCount: 24` for the very same device — actively
-wrong for what v2 actually enforces on write, which is the whole reason this needed a
-live test rather than trusting a version's own metadata. `scheduler/get` stayed on v2
-throughout, since the group-count issue is specific to the write endpoint and v2's read
-turned out to already include the `properties` capability-discovery block a historical
-source suggested was v3-only. **If you're tempted to move `scheduler/enable` off v1
-again — including to v3 — re-run that same bisection against the real account first;
-don't assume a newer version lifts the cap just because its own reported metadata claims
-a higher number.**
+v1 was tried first for the whole enable/get pair, and rejected on purpose, not left behind
+by accident: multiple FoxESS community forum reports describe v1 pushes the cloud API
+accepts (`errno 0`) that the inverter itself never actually applies — a silent,
+undetectable-from-the-API-response failure mode this app can't tolerate for something
+controlling real money and a real battery. `doc/foxess-scheduler-api-migration-plan.md`
+has the full investigation, but the short version: `scheduler/enable` moved to v2
+(2026-09-01), got reverted to v1 the very next day after a real override push failed with
+`errno 40257`, then moved back to v2 for good (2026-09-02) once the actual cause was
+understood and safeguarded against, per the two paragraphs below.
+
+**v2's `scheduler/enable` hard-rejects any single call with more than 8 groups** —
+confirmed by bisecting a real failing payload against the live account (8 succeeds, 9
+fails, repeatably), not documented anywhere by FoxESS. A read-only v3 `scheduler/get`
+call reported `maxGroupCount: 24` for the very same device — **actively wrong** for what
+v2 actually enforces on write, which is exactly why this needed a live bisection rather
+than trusting a version's own metadata. `scheduler/get` never had this problem — its v2
+response already includes the `properties` capability-discovery block a historical
+source suggested was v3-only, a pleasant surprise rather than something this app relies
+on yet.
+
+The safeguard, not just a raised limit: `config.php`'s `foxess.max_scheduler_groups`
+(default 8 — a plain, hand-set number precisely because FoxESS's own real enforced value
+isn't documented and could differ on a future API version; see config.example.php's own
+comment) caps every push to the **soonest** N groups
+(`ScheduleBuilder::capToSoonestGroups()`), dropping the rest rather than erroring.
+Dropping the rest is safe *because of how this app already runs*: the cron job repeats
+every few hours, so whatever doesn't fit in one run's cap gets pushed by the next run,
+well before any of it is actually needed — nothing is silently lost, just deferred.
+`capToSoonestGroups()` must run before `applyBstWorkaround()`, not after:
+`buildPushWindow()`'s groups already come out sorted in true chronological order (today's
+evening before tomorrow's early morning, when the window crosses midnight), which is
+exactly the "soonest first" this relies on, and `applyBstWorkaround()`'s own internal
+re-sort (by bare minute-of-day, which has no concept of which calendar day a group
+belongs to) would silently undo that ordering if run first. This is also why the fix from
+GitHub's "push the full slot for any group currently in progress" change matters here
+too: the currently-active group, if any, is always chronologically first, so it always
+survives the cap regardless of how many groups follow it.
+
+**If you're tempted to raise the limit, or move `scheduler/enable` to v3** — re-run the
+same live bisection against the real account first; don't assume a newer version lifts
+the cap just because its own reported metadata claims a higher number. That's the exact
+mistake `maxGroupCount: 24` would have led to here.
 
 **Request signing** (`FoxessClient::post()`) matches the spec exactly:
 `md5(path . "\r\n" . token . "\r\n" . timestamp_ms)`, headers

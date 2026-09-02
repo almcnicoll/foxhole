@@ -294,6 +294,37 @@ class ScheduleBuilder
     }
 
     /**
+     * Caps the groups actually sent to FoxESS to the soonest $maxGroups — see
+     * config.php's `foxess.max_scheduler_groups` (default 8, user-confirmed live: FoxESS's
+     * v2 scheduler/enable hard-rejects a call with more than that, errno 40257). Safe to
+     * simply drop whatever doesn't fit, keeping the earliest ones, because of how this app
+     * already runs: the cron job repeats every few hours, so a later run pushes whatever
+     * this run couldn't fit well before any of it is actually needed — nothing beyond the
+     * cap is being abandoned, just deferred to the next run that has room for it.
+     *
+     * Only ever called on the copy of groups actually POSTed to FoxESS, before
+     * applyBstWorkaround() — the "true" schedule stored per date, and diffed via
+     * last_pushed_groups_json, is untouched (same reasoning as applyBstWorkaround()'s own
+     * doc comment). Must run *before* applyBstWorkaround(), not after: buildPushWindow()'s
+     * $groups already come out sorted in true chronological order (today's evening before
+     * tomorrow's early morning, when the window crosses midnight — see that method's own
+     * tests), which is exactly the "soonest first" this method relies on;
+     * applyBstWorkaround() re-sorts its own output by bare minute-of-day, which would
+     * silently undo that ordering if this ran afterward instead.
+     *
+     * @param array $groups buildPushWindow()-shaped groups, already sorted soonest-first
+     * @param string[] $explanations same length/order as $groups
+     * @return array{groups: array, explanations: string[]}
+     */
+    public function capToSoonestGroups(array $groups, array $explanations, int $maxGroups): array
+    {
+        return [
+            'groups' => array_slice($groups, 0, $maxGroups),
+            'explanations' => array_slice($explanations, 0, $maxGroups),
+        ];
+    }
+
+    /**
      * Workaround for a documented FoxESS-side bug where scheduler events during British
      * Summer Time execute an hour later than the local time actually sent — FoxESS's
      * backend appears to apply the schedule using GMT/UTC regardless of what the wall

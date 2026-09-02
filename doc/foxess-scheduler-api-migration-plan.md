@@ -1,13 +1,15 @@
 # FoxESS scheduler API migration plan: v1 → v2 → v3
 
-Status: **Stage 1 implemented, then partially reverted the same day** —
-`scheduler/get` is on v2; `scheduler/enable` went to v2 and back to v1 after a
-live-confirmed regression (see "Stage 1 regression" below). Stages 2 and 3 are still
-follow-on options, done only if separately requested — but Stage 3 in particular must
-budget time to re-test the group-count issue below against v3 before trusting it, not
-assume v3 fixes it.
+Status: **Stage 1 done, for good, as of 2026-09-02** — `scheduler/get` and
+`scheduler/enable` are both on v2. Getting there took a same-day revert to v1 and back
+(see "Stage 1 regression" below) — the interim revert was a stopgap, not the final
+design; v1 was rejected on purpose in the end, not just abandoned once v2 was fixed, per
+CLAUDE.md's "FoxESS scheduler endpoint" note (community reports of v1 pushes the cloud
+API silently accepts but the inverter never applies). Stages 2 and 3 are still follow-on
+options, done only if separately requested — but Stage 3 in particular must re-test the
+group-count issue below against v3 before trusting it, not assume v3 lifts the cap.
 
-## Stage 1 regression, found live (2026-09-02)
+## Stage 1 regression, found live (2026-09-02) — and its permanent fix
 
 The day after Stage 1 shipped, a routine push (2 groups) worked fine; adding an override
 and repushing (11 groups, `reapplyOverrides()`) failed on both inverters:
@@ -37,18 +39,35 @@ something" code) — v1 has no such limit, or at least a higher one. This app's 
 scheduler routinely produces more than 8 groups on its own (a plain run earlier in this
 project logged 13), and overrides make it more likely, not less.
 
-Fix shipped: `pushSchedule()` reverted to v1 for both the clear and real-push calls;
-`getSchedule()` stayed on v2 (no observed downside, and it's where the `properties` win
-lives). `toV2Groups()` was removed as dead code rather than left unused. Verified live:
-the exact 11-group payload that failed on v2 succeeds on v1 unchanged, and a real
-override push through the app's own `reapplyOverrides()` now completes successfully.
+**First fix (same day, temporary): reverted `scheduler/enable` to v1.** Restored
+correct behaviour immediately, but wasn't the final answer — v1 has its own known
+problem (see above: silent cloud-accepts/inverter-ignores failures reported by the
+community), which is exactly why this app wanted off v1 in the first place.
+
+**Second fix (also same day, permanent): back to v2, with a cap-and-defer safeguard.**
+`config.php`'s new `foxess.max_scheduler_groups` (default 8) caps every push to the
+**soonest** N groups (`ScheduleBuilder::capToSoonestGroups()`), silently dropping
+whatever doesn't fit rather than erroring. This is safe specifically because of how this
+app already runs: the cron job repeats every few hours, so anything that doesn't fit in
+one run's cap is pushed by the *next* run, well before it's actually needed — nothing is
+lost, only deferred. `buildPushWindow()` already guarantees the two properties this
+relies on: nothing wholly in the past is ever included, and its output is sorted in true
+chronological order (including correctly handling a group already in progress right now
+— see the separate "push the full slot for any group currently in progress" fix) — so
+capping is a plain `array_slice()`, no extra sorting or past-filtering logic needed.
+Must run *before* `applyBstWorkaround()`, not after: that method's own internal re-sort
+(by bare minute-of-day) has no notion of which calendar day a group belongs to and would
+silently scramble the "soonest first" ordering this cap depends on if applied first.
+
+Verified live end-to-end: the exact 11-group payload that originally failed, capped to
+8 and pushed via v2, succeeds (`errno 0`); a real override push through the app's own
+`reapplyOverrides()` completes successfully against v2.
 
 **Before ever attempting Stage 3** (moving `scheduler/enable` to v3), this group-count
 behaviour must be re-tested empirically against v3 specifically — do not assume v3's own
 `maxGroupCount` figure is trustworthy for the same reason v2's wasn't. If v3 turns out to
-have the same or a similar cap, either stage becomes blocked on this app first learning
-to collapse/reduce a schedule to fit within it, which is real, separate design work, not
-a version-swap detail.
+have a different real limit, only `max_scheduler_groups`'s configured value need change,
+not the capping mechanism itself.
 
 ## Why
 
@@ -204,16 +223,18 @@ POST /op/v3/device/scheduler/enable
 
 ## Stage 1 — move `scheduler/get` and `scheduler/enable` to v2
 
-**Outcome: `scheduler/get` stayed on v2. `scheduler/enable` shipped to v2, then reverted
-to v1 the same day — see "Stage 1 regression" above.** Left below as originally written,
-for the record of what was actually tried; treat "move `scheduler/enable` to v2" as
-**done and undone**, not as a remaining task.
+**Outcome: done, and staying done.** Both endpoints ended up on v2 — `scheduler/get`
+cleanly on the first attempt, `scheduler/enable` after a same-day revert-to-v1-then-back
+loop while the 8-group limit got diagnosed and safeguarded against (see "Stage 1
+regression" above for the full story, including why v1 was never going to be the
+permanent home for the write side regardless of the group-count issue).
 
 Lowest-risk stage *on paper*: v2's shape is a well-understood reshape (nest three fields
 we already send into `extraParam`), not a behavioural change, and doesn't touch the
 master-switch fix or BST workaround logic at all. What the plan didn't anticipate, and
 what pure shape-comparison against reference source couldn't have caught, was a hard
-group-count limit enforced only on the write side — see the regression note.
+group-count limit enforced only on the write side — see the regression note for the
+`max_scheduler_groups`/`capToSoonestGroups()` safeguard that now handles it.
 
 ### Code changes
 
@@ -228,9 +249,18 @@ group-count limit enforced only on the write side — see the regression note.
     there.
   - `getSchedulerFlag()` / `setSchedulerFlag()`: **unchanged**, stay on v1 (see "Why"
     above).
-- **Everything else** (`ScheduleBuilder`, `Store`, `Runner.php`, `index.php`,
-  `schedulers.php`, `override.php`) — no changes. They only ever see the existing flat
-  group shape; the reshape happens inside `FoxessClient` on the way out.
+- **`config.example.php`**: new `foxess.max_scheduler_groups` (default `8`) — the
+  group-count safeguard's one tunable, added once the regression above was diagnosed.
+- **`src/ScheduleBuilder.php`**: new `capToSoonestGroups(array $groups, array
+  $explanations, int $maxGroups): array` — caps to the soonest N, relying on
+  `buildPushWindow()`'s existing chronological-order and no-wholly-past-groups
+  guarantees rather than re-deriving them.
+- **`src/Runner.php`**: both push sites (`runScheduler()`, `reapplyOverrides()`) call
+  `capToSoonestGroups()` on the copy of groups bound for FoxESS, *before*
+  `applyBstWorkaround()` — order matters, see the regression note.
+- **Everything else** (`Store`, `index.php`, `schedulers.php`, `override.php`) — no
+  changes. They only ever see the existing flat, uncapped group shape; both the v2
+  reshape and the group cap happen only on the copy actually sent to FoxESS.
 
 ### Tests
 
@@ -401,9 +431,9 @@ not the end of the task.
 | Stage | Endpoint(s) moved | Version | Status | New fields used | DB/settings changes | Risk |
 |---|---|---|---|---|---|---|
 | 1 | `scheduler/get` | v1 → v2 | **Done** | none | none | Low — pure reshape, confirmed |
-| 1 | `scheduler/enable` | v1 → v2 → v1 | **Done, then reverted** — v2 hard-caps at 8 groups, v1 doesn't | none | none | Real regression found live; now back to known-good v1 |
-| 2 | `scheduler/get` | v2 → v3 | Not started | `properties` (read-only) — though v2 may already have this, see regression note | new `foxess_device_capabilities_json` setting | Low — read-only |
-| 3 | `scheduler/enable` | v1 → v3 | Not started, and **blocked pending a re-test of the group-count limit against v3 specifically** | none used, but shape changes (`enable` removed, per-device field filtering) | none new | High — write path, young API version, unresolved group-count question |
+| 1 | `scheduler/enable` | v1 → v2 → v1 → v2 | **Done, permanently** — v2 with a group-count safeguard, after v1 was confirmed to have its own silent-failure problem | none | new `foxess.max_scheduler_groups` config value (default 8) | Real regression found and fixed live; safeguarded, not just patched over |
+| 2 | `scheduler/get` | v2 → v3 | Not started | `properties` (read-only) — v2 may already have this, see regression note | new `foxess_device_capabilities_json` setting | Low — read-only |
+| 3 | `scheduler/enable` | v2 → v3 | Not started, and **blocked pending a re-test of the group-count limit against v3 specifically** — only `max_scheduler_groups`'s value should need to change if v3's real limit differs, not the mechanism | none used, but shape changes (`enable` removed, per-device field filtering) | none new | High — write path, young API version, unresolved group-count question |
 
 Unaffected throughout: `scheduler/get\|set/flag` (v1), `device/real/query` (v1),
 `device/report/query` (v0).

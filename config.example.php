@@ -13,6 +13,15 @@ return [
         // api_key / device_sn are no longer set here — enter them via settings.php,
         // stored in data/scheduler.sqlite. base_url is the only non-secret bit left.
         'base_url' => 'https://www.foxesscloud.com',
+        // FoxESS's v2 scheduler/enable endpoint hard-rejects any push of more than 8
+        // groups (errno 40257) — confirmed live by bisecting a real failing payload, not
+        // documented anywhere by FoxESS. Not a business setting, a technical safety limit
+        // on this specific API version — see CLAUDE.md's "FoxESS scheduler endpoint" note
+        // and doc/foxess-scheduler-api-migration-plan.md before changing it. Safe to raise
+        // (or lower) here, without a deploy of new logic, if a future API version's real
+        // enforced limit turns out to differ from 8 — Runner.php reads this value fresh
+        // each run, it isn't cached anywhere.
+        'max_scheduler_groups' => 8,
     ],
     // Battery specs (capacity, max charge/discharge power, SoC floors) are no longer
     // configured here — set them via settings.php's "Battery" section instead, same
