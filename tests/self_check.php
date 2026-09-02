@@ -382,8 +382,13 @@ $recordingClient = new class('key', 'SN-REC', 'https://example.invalid') extends
 };
 $recordingClient->pushSchedule($pushedGroups);
 check(count($recordingClient->calls) === 4, 'pushSchedule() makes four calls when the master switch is off: clear, real push, flag read, flag write. Got ' . count($recordingClient->calls));
-check($recordingClient->calls[0] === ['/op/v1/device/scheduler/enable', ['deviceSN' => 'SN-REC', 'groups' => []]], 'the first call clears the schedule with an empty groups array');
-check($recordingClient->calls[1] === ['/op/v1/device/scheduler/enable', ['deviceSN' => 'SN-REC', 'groups' => $pushedGroups]], 'the second call sends the real computed groups');
+check($recordingClient->calls[0] === ['/op/v2/device/scheduler/enable', ['deviceSN' => 'SN-REC', 'groups' => []]], 'the first call clears the schedule (v2) with an empty groups array');
+check(
+    $recordingClient->calls[1] === ['/op/v2/device/scheduler/enable', ['deviceSN' => 'SN-REC', 'groups' => [
+        ['enable' => 1, 'startHour' => 10, 'startMinute' => 0, 'endHour' => 11, 'endMinute' => 0, 'workMode' => 'ForceCharge', 'extraParam' => ['minSocOnGrid' => 15, 'fdSoc' => 100, 'fdPwr' => 3000]],
+    ]]],
+    'the second call sends the real computed groups (v2), reshaped with the control fields nested under extraParam: got ' . json_encode($recordingClient->calls[1]),
+);
 check($recordingClient->calls[2][0] === '/op/v1/device/scheduler/get/flag', 'the third call reads the current master-switch state');
 check(
     $recordingClient->calls[3] === ['/op/v1/device/scheduler/set/flag', ['deviceSN' => 'SN-REC', 'enable' => 1]],

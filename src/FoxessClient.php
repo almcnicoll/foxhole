@@ -3,10 +3,13 @@
 require_once __DIR__ . '/Exceptions.php';
 require_once __DIR__ . '/Store.php';
 
-// Signs and sends requests to the FoxESS OpenAPI. Uses the v1 scheduler
-// endpoints, not v0 — community reports (foxesscommunity.com) describe v0
-// scheduler writes corrupting backend state on some inverters. See CLAUDE.md
-// for the research trail behind this choice.
+// Signs and sends requests to the FoxESS OpenAPI. Never v0 for the scheduler — community
+// reports (foxesscommunity.com) describe v0 scheduler writes corrupting backend state on
+// some inverters. scheduler/get and scheduler/enable are v2 (migrated from v1 — see
+// doc/foxess-scheduler-api-migration-plan.md, stage 1); scheduler/get/flag and
+// scheduler/set/flag deliberately stay on v1, since even the current v3-era community
+// reference code keeps the master-switch flag there. See CLAUDE.md for the fuller
+// research trail behind these choices.
 //
 // Requires Store.php (a dependency this class didn't have before) purely so post() can
 // log every call via Store::saveApiLogEntry() — see CLAUDE.md's "API call log". This is
@@ -28,7 +31,11 @@ class FoxessClient
     }
 
     /**
-     * Push a computed schedule. $groups is the array built by ScheduleBuilder.
+     * Push a computed schedule. $groups is the array built by ScheduleBuilder — this
+     * app's own internal shape (flat `enable`/`startHour`/.../`fdPwr` fields) never
+     * changes regardless of which scheduler API version is actually in use; toV2Groups()
+     * below is the one place that translates it to whatever the wire currently expects,
+     * so nothing upstream of this class needs to know or care about that.
      *
      * Clears any existing schedule first — a separate push with an empty `groups` array —
      * before sending the real one. Confirmed live (and via community reports): stale slots
@@ -42,13 +49,13 @@ class FoxessClient
      */
     public function pushSchedule(array $groups): array
     {
-        $this->post('/op/v1/device/scheduler/enable', [
+        $this->post('/op/v2/device/scheduler/enable', [
             'deviceSN' => $this->deviceSn,
             'groups' => [],
         ]);
-        $result = $this->post('/op/v1/device/scheduler/enable', [
+        $result = $this->post('/op/v2/device/scheduler/enable', [
             'deviceSN' => $this->deviceSn,
-            'groups' => $groups,
+            'groups' => $this->toV2Groups($groups),
         ]);
 
         // Re-assert Mode Scheduler as the active mode if this device supports the flag
@@ -94,10 +101,14 @@ class FoxessClient
      * Path and field names aren't in FoxESS's own OpenAPI docs in enough detail to confirm
      * independently — taken from a maintained third-party client (`gostonefire/foxess`,
      * Rust), whose source was read directly, and corroborated by community forum reports of
-     * the same underlying setting name. Same v1 namespace this app already trusts for
-     * scheduler/enable and scheduler/get, not the v0 endpoints known to corrupt state (see
-     * CLAUDE.md's "FoxESS scheduler endpoint" note) — treat as reasonably solid, not as
-     * fully confirmed as the request-signing/scheduler-push logic elsewhere in this file.
+     * the same underlying setting name. Deliberately kept on v1 even though scheduler/get
+     * and scheduler/enable have since moved to v2 (see
+     * doc/foxess-scheduler-api-migration-plan.md) — every version of the community
+     * reference code checked, right up to its current v3-era release, keeps the
+     * master-switch flag on v1, so there's no v2/v3 equivalent to move to. Not the v0
+     * endpoints known to corrupt state (see CLAUDE.md's "FoxESS scheduler endpoint" note)
+     * — treat as reasonably solid, not as fully confirmed as the request-signing/
+     * scheduler-push logic elsewhere in this file.
      *
      * @return ?bool null if this device model doesn't support the flag at all
      *         (`support: false`) — nothing this app can or should do about that case.
@@ -131,7 +142,35 @@ class FoxessClient
     /** Read back the currently applied schedule — useful to verify a push landed. */
     public function getSchedule(): array
     {
-        return $this->post('/op/v1/device/scheduler/get', ['deviceSN' => $this->deviceSn]);
+        return $this->post('/op/v2/device/scheduler/get', ['deviceSN' => $this->deviceSn]);
+    }
+
+    /**
+     * Translates this app's internal flat group shape (ScheduleBuilder's output —
+     * `enable`, `startHour`/`startMinute`/`endHour`/`endMinute`, `workMode`,
+     * `minSocOnGrid`, `fdSoc`, `fdPwr`, all top-level) into the v2 wire shape, which
+     * nests the three control fields under `extraParam`. `enable`/the time fields/
+     * `workMode` stay top-level in v2 — only the reshape changed, not which fields exist.
+     * Confirmed against `TonyM1958/FoxESS-Cloud`'s source at the commit where it moved to
+     * v2 (`2b6e7fad`, 2025-11-30) — see doc/foxess-scheduler-api-migration-plan.md.
+     *
+     * @param array $groups periodsToGroups()/buildPushWindow()-shaped groups
+     */
+    private function toV2Groups(array $groups): array
+    {
+        return array_map(fn(array $g) => [
+            'enable' => $g['enable'],
+            'startHour' => $g['startHour'],
+            'startMinute' => $g['startMinute'],
+            'endHour' => $g['endHour'],
+            'endMinute' => $g['endMinute'],
+            'workMode' => $g['workMode'],
+            'extraParam' => [
+                'minSocOnGrid' => $g['minSocOnGrid'],
+                'fdSoc' => $g['fdSoc'],
+                'fdPwr' => $g['fdPwr'],
+            ],
+        ], $groups);
     }
 
     /** Low-risk read-only call, useful for testing the signature logic in isolation. */
