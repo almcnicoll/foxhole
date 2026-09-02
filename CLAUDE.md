@@ -1033,17 +1033,31 @@ it's what the no-op-push diff compares, and wording drift shouldn't trigger
 a re-push when the actual schedule hasn't changed. `index.php` renders both
 under "Energy plan", one `<h4>` sub-section per known date.
 
-**FoxESS scheduler endpoint: v1, not v0 or v3.** Cross-checked the live
-FoxESS OpenAPI docs, the `foxesscommunity.com` forums, and existing
-implementations (`TonyM1958/FoxESS-Cloud`, `nickw444/ha-foxess-cloud`). v0 is
-confirmed by multiple community reports to corrupt backend scheduler state on
-some inverters (recovery requires waiting ~3h then re-writing a plain SelfUse
-schedule). v1 (`/op/v1/device/scheduler/enable` / `/op/v1/device/scheduler/get`)
-is what the community has since standardized on. A "v2/v3 batch" variant
-showed up in one low-confidence source but couldn't be corroborated
-independently — not used. **If you're revisiting this, re-check the live
-docs at foxesscloud.com/public/i18n/en/OpenApiDocument.html** — FoxESS has
-changed this endpoint before and could again.
+**FoxESS scheduler endpoint: v0 never, v2 for reads, v1 for writes.** Cross-checked the
+live FoxESS OpenAPI docs (unreliable to scrape — confirmed twice, garbles version labels
+even when directly asked), the `foxesscommunity.com` forums, and existing implementations
+(`TonyM1958/FoxESS-Cloud`, `nickw444/ha-foxess-cloud`, `gostonefire/foxess`). v0 is
+confirmed by multiple community reports to corrupt backend scheduler state on some
+inverters (recovery requires waiting ~3h then re-writing a plain SelfUse schedule) — never
+used for the scheduler. `scheduler/get/flag`/`scheduler/set/flag` (the master switch) and
+`scheduler/enable` (the actual push) are v1; `scheduler/get` (read-back) is v2.
+
+That split — not "just use whichever version is newest" — is itself a live-confirmed
+finding, not a guess: `doc/foxess-scheduler-api-migration-plan.md` has the full
+investigation, but the short version is that `scheduler/enable` was migrated to v2
+(2026-09-01), then reverted to v1 the very next day after a real override push failed
+with `errno 40257`. Bisection proved **v2 hard-rejects any push of more than 8 groups
+per call**, while the identical payload succeeds on v1 unchanged — and this app's
+modelling scheduler (and overrides) routinely produce more than 8. A read-only v3
+`scheduler/get` call reported `maxGroupCount: 24` for the very same device — actively
+wrong for what v2 actually enforces on write, which is the whole reason this needed a
+live test rather than trusting a version's own metadata. `scheduler/get` stayed on v2
+throughout, since the group-count issue is specific to the write endpoint and v2's read
+turned out to already include the `properties` capability-discovery block a historical
+source suggested was v3-only. **If you're tempted to move `scheduler/enable` off v1
+again — including to v3 — re-run that same bisection against the real account first;
+don't assume a newer version lifts the cap just because its own reported metadata claims
+a higher number.**
 
 **Request signing** (`FoxessClient::post()`) matches the spec exactly:
 `md5(path . "\r\n" . token . "\r\n" . timestamp_ms)`, headers

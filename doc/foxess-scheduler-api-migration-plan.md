@@ -1,8 +1,54 @@
 # FoxESS scheduler API migration plan: v1 → v2 → v3
 
-Status: **planning only** — nothing in this document has been implemented. Stage 1 is
-proposed as the next actionable piece of work; Stages 2 and 3 are follow-on options,
-each done only if separately requested, per the shape of this plan.
+Status: **Stage 1 implemented, then partially reverted the same day** —
+`scheduler/get` is on v2; `scheduler/enable` went to v2 and back to v1 after a
+live-confirmed regression (see "Stage 1 regression" below). Stages 2 and 3 are still
+follow-on options, done only if separately requested — but Stage 3 in particular must
+budget time to re-test the group-count issue below against v3 before trusting it, not
+assume v3 fixes it.
+
+## Stage 1 regression, found live (2026-09-02)
+
+The day after Stage 1 shipped, a routine push (2 groups) worked fine; adding an override
+and repushing (11 groups, `reapplyOverrides()`) failed on both inverters:
+`errno 40257: Parameters do not meet expectations. Please reenter`.
+
+Diagnosis (all via direct, read-only-where-possible live calls against the real
+account, same discipline as every other FoxESS finding in this project):
+1. The failing request body was already correctly shaped (`extraParam` nesting present)
+   — so this was never a case of the override path missing the v2 translation. Confirmed
+   the same `pushSchedule()`/`toV2Groups()` code Stage 1 added handles both the routine
+   and override push paths identically, because they share the exact same function.
+2. `properties`/capability discovery, previously assumed v3-only, turned out to already
+   be present in v2's `scheduler/get` response for this account — a genuine surprise
+   versus the historical library source the plan was based on, but not the cause here.
+3. Re-ordering the groups into ascending clock-face time made no difference — ruled out
+   an ordering requirement.
+4. Bisecting the group list by count did: **8 groups succeeded, 9 failed**, repeatably.
+5. The same 9-group payload (reshaped back to v1's flat fields) succeeded against
+   `/op/v1/device/scheduler/enable` without complaint.
+6. A read-only v3 `scheduler/get` call reported `maxGroupCount: 24` for the same
+   device — actively misleading, since v2's real enforced limit for a write is 8.
+   **Don't trust a version's reported metadata for a different version's behaviour.**
+
+Root cause: **v2's `scheduler/enable` hard-rejects any push of more than 8 groups**,
+with no field-level indication of why (`errno 40257` is FoxESS's generic "didn't like
+something" code) — v1 has no such limit, or at least a higher one. This app's modelling
+scheduler routinely produces more than 8 groups on its own (a plain run earlier in this
+project logged 13), and overrides make it more likely, not less.
+
+Fix shipped: `pushSchedule()` reverted to v1 for both the clear and real-push calls;
+`getSchedule()` stayed on v2 (no observed downside, and it's where the `properties` win
+lives). `toV2Groups()` was removed as dead code rather than left unused. Verified live:
+the exact 11-group payload that failed on v2 succeeds on v1 unchanged, and a real
+override push through the app's own `reapplyOverrides()` now completes successfully.
+
+**Before ever attempting Stage 3** (moving `scheduler/enable` to v3), this group-count
+behaviour must be re-tested empirically against v3 specifically — do not assume v3's own
+`maxGroupCount` figure is trustworthy for the same reason v2's wasn't. If v3 turns out to
+have the same or a similar cap, either stage becomes blocked on this app first learning
+to collapse/reduce a schedule to fit within it, which is real, separate design work, not
+a version-swap detail.
 
 ## Why
 
@@ -158,9 +204,16 @@ POST /op/v3/device/scheduler/enable
 
 ## Stage 1 — move `scheduler/get` and `scheduler/enable` to v2
 
-Lowest-risk stage: v2's shape is a well-understood reshape (nest three fields we already
-send into `extraParam`), not a behavioural change, and doesn't touch the master-switch
-fix or BST workaround logic at all.
+**Outcome: `scheduler/get` stayed on v2. `scheduler/enable` shipped to v2, then reverted
+to v1 the same day — see "Stage 1 regression" above.** Left below as originally written,
+for the record of what was actually tried; treat "move `scheduler/enable` to v2" as
+**done and undone**, not as a remaining task.
+
+Lowest-risk stage *on paper*: v2's shape is a well-understood reshape (nest three fields
+we already send into `extraParam`), not a behavioural change, and doesn't touch the
+master-switch fix or BST workaround logic at all. What the plan didn't anticipate, and
+what pure shape-comparison against reference source couldn't have caught, was a hard
+group-count limit enforced only on the write side — see the regression note.
 
 ### Code changes
 
@@ -345,11 +398,12 @@ not the end of the task.
 
 ## Summary table
 
-| Stage | Endpoint(s) moved | Version | New fields used | DB/settings changes | Risk |
-|---|---|---|---|---|---|
-| 1 | `scheduler/get`, `scheduler/enable` | v1 → v2 | none | none | Low — pure reshape |
-| 2 | `scheduler/get` | v2 → v3 | `properties` (read-only) | new `foxess_device_capabilities_json` setting | Low — read-only |
-| 3 | `scheduler/enable` | v2 → v3 | none used, but shape changes (`enable` removed, per-device field filtering) | none new | High — write path, young API version |
+| Stage | Endpoint(s) moved | Version | Status | New fields used | DB/settings changes | Risk |
+|---|---|---|---|---|---|---|
+| 1 | `scheduler/get` | v1 → v2 | **Done** | none | none | Low — pure reshape, confirmed |
+| 1 | `scheduler/enable` | v1 → v2 → v1 | **Done, then reverted** — v2 hard-caps at 8 groups, v1 doesn't | none | none | Real regression found live; now back to known-good v1 |
+| 2 | `scheduler/get` | v2 → v3 | Not started | `properties` (read-only) — though v2 may already have this, see regression note | new `foxess_device_capabilities_json` setting | Low — read-only |
+| 3 | `scheduler/enable` | v1 → v3 | Not started, and **blocked pending a re-test of the group-count limit against v3 specifically** | none used, but shape changes (`enable` removed, per-device field filtering) | none new | High — write path, young API version, unresolved group-count question |
 
 Unaffected throughout: `scheduler/get\|set/flag` (v1), `device/real/query` (v1),
 `device/report/query` (v0).
