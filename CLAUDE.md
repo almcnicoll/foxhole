@@ -990,6 +990,46 @@ schedule and pushes it, whether or not any override remains, exactly like
 `override.php` already called `reapplyOverrides()` unconditionally after
 every save/delete; the bug was entirely on this function's side.
 
+**A group ending at literal 0:00 collides with the next group starting at
+0:00 — FoxESS's v2 `scheduler/enable` doesn't treat that as "end of day"
+the way this app's own code does.** Reproduced live 2026-09-04: a genuine,
+non-overlapping `ForceCharge 23:30-00:00` immediately followed by
+`ForceDischarge 00:00-00:30` was rejected wholesale with `errno 42023,
+"Time overlap, please reselect time"` — a real push, not a synthetic edge
+case, since alternating cheap-charge/expensive-discharge half-hour slots
+around a calendar-day boundary is an entirely normal shape for the
+modelling scheduler's arbitrage behaviour to produce. Both
+`absoluteIntervalsToGroups()` (used by `buildPushWindow()` and the
+modelling scheduler's per-date split) and `intervalsToGroups()` (used by
+`build()` and, via `groupsToIntervals()`/`applyBstWorkaround()`, the BST
+shift) previously encoded a midnight-ending interval as `endHour: 0,
+endMinute: 0` — believed, per this file's own now-corrected old comment, to
+be exactly FoxESS's "end of day" convention. It isn't, at least not for
+whatever overlap check v2's `scheduler/enable` runs: `endHour: 0,
+endMinute: 0` is apparently indistinguishable from a group *starting* at
+0:00, so two adjacent groups meeting exactly at midnight look like they
+overlap even though neither has moved.
+
+Fixed with a single narrow helper, `ScheduleBuilder::avoidMidnightEnd()`,
+called from both conversion functions: whenever a computed end is exactly
+`(0, 0)`, emit `(23, 59)` instead — a deliberate one-minute nudge, not a
+blanket "always end one minute early" change to every group boundary in the
+schedule (every other adjacent-group boundary in this app already pushes
+successfully as-is, so widening the fix beyond the one ambiguous case would
+be changing behaviour that isn't broken). Cross-checked against
+`TonyM1958/FoxESS-Cloud`'s `set_period()`, which independently arrives at
+the same literal 23:59 encoding for its own "remain mode"/full-day case
+(via a blanket "subtract one minute from every exclusive end," a more
+general — and, on this evidence, also more defensive — approach than this
+app takes) — useful corroboration that 23:59 is *a* working encoding, not
+proof of what FoxESS's server-side logic actually does with 0:00. Regression
+tests reproduce the exact reported payload shape (`tests/self_check.php`)
+and were re-verified against the affected buildPushWindow/BST-workaround/
+modelling-scheduler-split call sites, all of which independently produce
+midnight-ending groups and needed their own expected-output updates once
+this changed the encoding project-wide, not just at the one call site that
+happened to trigger the live failure.
+
 **A real bug found via live verification, not by inspection: SQLite TEXT
 comparison of ISO 8601 datetime strings isn't chronologically correct
 unless every value shares the same UTC offset.** `price_slots.slot_from` is

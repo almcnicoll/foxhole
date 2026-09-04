@@ -418,12 +418,13 @@ class ScheduleBuilder
                 'ForceDischarge' => [$reserveSoc, $dischargeKw],
                 default => [$minSocOnGrid, 0.0],
             };
+            [$endHour, $endMinute] = self::avoidMidnightEnd(intdiv($end, 60), $end % 60);
             $groups[] = [
                 'enable' => 1,
                 'startHour' => intdiv($iv['start'], 60),
                 'startMinute' => $iv['start'] % 60,
-                'endHour' => intdiv($end, 60),
-                'endMinute' => $end % 60,
+                'endHour' => $endHour,
+                'endMinute' => $endMinute,
                 'workMode' => $iv['workMode'],
                 'minSocOnGrid' => $minSocOnGrid,
                 'fdSoc' => $fdSoc,
@@ -435,14 +436,36 @@ class ScheduleBuilder
     }
 
     /**
+     * FoxESS's v2 scheduler/enable rejects a push containing a group that ends at literal
+     * 0:00 immediately followed by another group starting there — errno 42023, "Time
+     * overlap, please reselect time" — confirmed live 2026-09-04 on a genuine
+     * ForceCharge/ForceDischarge boundary that happened to land exactly on local midnight
+     * (23:30-00:00 followed by 00:00-00:30). Both groups were correct and non-overlapping
+     * in real terms; whatever FoxESS's own overlap check does with the pair, it doesn't
+     * treat "endHour 0, endMinute 0" as unambiguously meaning "end of day" the way this
+     * app's own group<->interval conversions do elsewhere (see groupsToIntervals()'s
+     * opposite-direction convention) — it's indistinguishable from "start of day" to
+     * whatever comparison they run. Nudging the end back one minute, to 23:59, sidesteps
+     * the ambiguity entirely: every other adjacent-group boundary in this app already
+     * pushes successfully as-is, so this is deliberately narrow — only the literal
+     * midnight case is special-cased, not a blanket "always end one minute early" shift.
+     * (TonyM1958/FoxESS-Cloud's own set_period() independently arrives at the same
+     * literal 23:59 encoding for its "remain mode"/full-day case, for what that's worth as
+     * external corroboration — not proof of FoxESS's actual server-side logic.)
+     *
+     * @return array{0: int, 1: int} [endHour, endMinute]
+     */
+    private static function avoidMidnightEnd(int $endHour, int $endMinute): array
+    {
+        return $endHour === 0 && $endMinute === 0 ? [23, 59] : [$endHour, $endMinute];
+    }
+
+    /**
      * Like intervalsToGroups(), but for real DateTimeImmutable instants rather than
      * minutes since a conceptual single day's midnight — used by buildPushWindow(), whose
      * window doesn't necessarily start at midnight, so "minutes since window start" would
      * map to the wrong hour/minute-of-day (FoxESS's fields are literal local clock time,
-     * not elapsed time from some reference point). A real midnight instant already formats
-     * as hour 0 / minute 0 via DateTimeImmutable::format(), which happens to be exactly
-     * FoxESS's own "end of day" convention — no 24*60-\>0 wraparound special-case needed
-     * here, unlike intervalsToGroups() above.
+     * not elapsed time from some reference point).
      *
      * Public (not private) so Schedulers.php's buildModellingSchedule() can reuse it too —
      * the modelling scheduler's own rolling horizon can cross midnight, so it already
@@ -468,12 +491,13 @@ class ScheduleBuilder
                 'ForceDischarge' => [$reserveSoc, $dischargeKw],
                 default => [$minSocOnGrid, 0.0],
             };
+            [$endHour, $endMinute] = self::avoidMidnightEnd((int) $iv['end']->format('G'), (int) $iv['end']->format('i'));
             $groups[] = [
                 'enable' => 1,
                 'startHour' => (int) $iv['start']->format('G'),
                 'startMinute' => (int) $iv['start']->format('i'),
-                'endHour' => (int) $iv['end']->format('G'),
-                'endMinute' => (int) $iv['end']->format('i'),
+                'endHour' => $endHour,
+                'endMinute' => $endMinute,
                 'workMode' => $iv['workMode'],
                 'minSocOnGrid' => $minSocOnGrid,
                 'fdSoc' => $fdSoc,

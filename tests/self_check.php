@@ -1044,7 +1044,7 @@ $pushBuilder = new ScheduleBuilder($strategy, $battery);
 $push = $pushBuilder->buildPushWindow($scheduleByDate, new DateTimeImmutable('2026-01-05 18:00:00', $pushTz), $pushTz, null);
 $pushModes = array_map(fn($g) => $g['workMode'] . ' ' . $g['startHour'] . '-' . $g['endHour'], $push['groups']);
 check(
-    $pushModes === ['ForceDischarge 20-0', 'ForceCharge 2-5'],
+    $pushModes === ['ForceDischarge 20-23', 'ForceCharge 2-5'],
     'with nothing capping the window, both known days combine into one 24h push, in true chronological order (today\'s evening before tomorrow\'s early morning, not sorted by raw hour-of-day): got ' . implode(',', $pushModes),
 );
 
@@ -1059,7 +1059,7 @@ check(
 $push2 = $pushBuilder->buildPushWindow($scheduleByDate, new DateTimeImmutable('2026-01-05 21:00:00', $pushTz), $pushTz, null);
 $tail = $push2['groups'][0];
 check(
-    $tail['startHour'] === 20 && $tail['endHour'] === 0,
+    $tail['startHour'] === 20 && $tail['endHour'] === 23,
     'a group actually in progress at "now" (20:00-00:00, now=21:00) keeps its true 20:00 start rather than being clipped to the top of the current hour: got startHour=' . $tail['startHour'],
 );
 
@@ -1087,7 +1087,7 @@ check(
 $todayOnly = ['2026-01-05' => ['groups' => $todayGroups, 'explanations' => $todayExplanations]];
 $knownEndsAtMidnight = new DateTimeImmutable('2026-01-06 00:00:00', $pushTz);
 $capped = $pushBuilder->buildPushWindow($todayOnly, new DateTimeImmutable('2026-01-05 14:00:00', $pushTz), $pushTz, $knownEndsAtMidnight);
-check(count($capped['groups']) === 1 && $capped['groups'][0]['startHour'] === 20 && $capped['groups'][0]['endHour'] === 0, 'a day with no known pricing past it is included up to its own end, unclipped, when that end is sooner than 24h out');
+check(count($capped['groups']) === 1 && $capped['groups'][0]['startHour'] === 20 && $capped['groups'][0]['endHour'] === 23, 'a day with no known pricing past it is included up to its own end, unclipped, when that end is sooner than 24h out');
 
 // Pricing data that's already fully in the past relative to "now" collapses the window to nothing.
 $stale = $pushBuilder->buildPushWindow($todayOnly, new DateTimeImmutable('2026-01-05 14:00:00', $pushTz), $pushTz, new DateTimeImmutable('2026-01-05 10:00:00', $pushTz));
@@ -1119,6 +1119,24 @@ check(count($underLimit['groups']) === 5, 'fewer groups than the cap is a no-op,
 $configuredLimit = (new ScheduleBuilder($strategy, $battery))->capToSoonestGroups($manyGroups, $manyExplanations, 3);
 check(count($configuredLimit['groups']) === 3, 'the cap value itself is a plain parameter (config.php\'s foxess.max_scheduler_groups), not hardcoded to 8 inside this method — verified live because FoxESS could change this limit in a future API version');
 
+// --- ScheduleBuilder: absoluteIntervalsToGroups()/intervalsToGroups() never emit a
+// literal 0:00 end (errno 42023 "Time overlap", reproduced live 2026-09-04: FoxESS's v2
+// scheduler/enable rejected a genuine, non-overlapping ForceCharge 23:30-00:00 followed by
+// ForceDischarge 00:00-00:30) ---
+$midnightBoundaryIntervals = [
+    ['start' => new DateTimeImmutable('2026-09-04 23:30:00', $pushTz), 'end' => new DateTimeImmutable('2026-09-05 00:00:00', $pushTz), 'workMode' => 'ForceCharge', 'explanation' => 'x'],
+    ['start' => new DateTimeImmutable('2026-09-05 00:00:00', $pushTz), 'end' => new DateTimeImmutable('2026-09-05 00:30:00', $pushTz), 'workMode' => 'ForceDischarge', 'explanation' => 'x'],
+];
+$midnightBoundaryGroups = (new ScheduleBuilder($strategy, $battery))->absoluteIntervalsToGroups($midnightBoundaryIntervals)['groups'];
+check(
+    $midnightBoundaryGroups[0]['endHour'] === 23 && $midnightBoundaryGroups[0]['endMinute'] === 59,
+    'absoluteIntervalsToGroups() ends a midnight-ending group at 23:59, never literal 0:00, so it can\'t collide with the next group\'s 0:00 start: got ' . json_encode($midnightBoundaryGroups[0]),
+);
+check(
+    $midnightBoundaryGroups[1]['startHour'] === 0 && $midnightBoundaryGroups[1]['startMinute'] === 0,
+    'the following group still starts at the real 00:00: got ' . json_encode($midnightBoundaryGroups[1]),
+);
+
 // --- ScheduleBuilder: applyBstWorkaround shifts pushed groups an hour earlier, splitting at midnight ---
 $bstNormal = [['enable' => 1, 'startHour' => 6, 'startMinute' => 0, 'endHour' => 10, 'endMinute' => 0, 'workMode' => 'ForceCharge', 'minSocOnGrid' => 15, 'fdSoc' => 100, 'fdPwr' => 3000]];
 $bstNormalResult = (new ScheduleBuilder($strategy, $battery))->applyBstWorkaround($bstNormal, ['x']);
@@ -1146,8 +1164,8 @@ check(
 );
 check(
     $bstSplitResult['groups'][1]['startHour'] === 23 && $bstSplitResult['groups'][1]['startMinute'] === 30
-        && $bstSplitResult['groups'][1]['endHour'] === 0 && $bstSplitResult['groups'][1]['endMinute'] === 0,
-    'the pre-midnight half (sorted second, starting 23:30) runs to end-of-day: got ' . json_encode($bstSplitResult['groups'][1]),
+        && $bstSplitResult['groups'][1]['endHour'] === 23 && $bstSplitResult['groups'][1]['endMinute'] === 59,
+    'the pre-midnight half (sorted second, starting 23:30) runs to end-of-day (23:59, not literal 0:00 — see ScheduleBuilder::avoidMidnightEnd()): got ' . json_encode($bstSplitResult['groups'][1]),
 );
 
 check(isBstDate(new DateTimeImmutable('2026-07-15 12:00:00', $pushTz), $pushTz) === true, 'isBstDate is true in mid-July');
@@ -1698,8 +1716,8 @@ check(array_keys($midnightSchedule) === ['2026-03-01', '2026-03-02'], 'buildMode
 $day1Charge = array_values(array_filter($midnightSchedule['2026-03-01']['groups'], fn($g) => $g['workMode'] === 'ForceCharge'));
 $day2Charge = array_values(array_filter($midnightSchedule['2026-03-02']['groups'], fn($g) => $g['workMode'] === 'ForceCharge'));
 check(
-    count($day1Charge) === 1 && $day1Charge[0]['startHour'] === 23 && $day1Charge[0]['startMinute'] === 30 && $day1Charge[0]['endHour'] === 0 && $day1Charge[0]['endMinute'] === 0,
-    'a ForceCharge interval crossing midnight is clipped to end at 00:00 on the first date: got ' . json_encode($day1Charge),
+    count($day1Charge) === 1 && $day1Charge[0]['startHour'] === 23 && $day1Charge[0]['startMinute'] === 30 && $day1Charge[0]['endHour'] === 23 && $day1Charge[0]['endMinute'] === 59,
+    'a ForceCharge interval crossing midnight is clipped to end at 23:59, not literal 0:00, on the first date — see ScheduleBuilder::avoidMidnightEnd(): got ' . json_encode($day1Charge),
 );
 check(
     count($day2Charge) === 1 && $day2Charge[0]['startHour'] === 0 && $day2Charge[0]['startMinute'] === 0 && $day2Charge[0]['endHour'] === 0 && $day2Charge[0]['endMinute'] === 30,
