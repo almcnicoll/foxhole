@@ -460,11 +460,15 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
 }
 
 /**
- * Called by override.php right after saving an override for one or more dates. Rebuilds
- * every currently-known date's schedule from *already-stored* prices (no new Octopus
- * call — this isn't a real run, just a re-overlay), applies whatever overrides exist per
- * date, and — if any date actually has one — pushes the resulting push window to FoxESS
- * immediately, same window derivation runScheduler() uses (ScheduleBuilder::buildPushWindow()).
+ * Called by override.php right after saving or clearing an override for one or more dates.
+ * Rebuilds every currently-known date's schedule from *already-stored* prices (no new
+ * Octopus call — this isn't a real run, just a re-overlay), applies whatever overrides
+ * still exist per date, and always pushes the resulting push window to FoxESS immediately
+ * — same window derivation runScheduler() uses (ScheduleBuilder::buildPushWindow()) —
+ * regardless of whether any override remains. Deliberately unconditional: clearing the
+ * last override for a date is itself a real change (the inverter is still running the
+ * override-based schedule from the last push) that needs to reach FoxESS, not just a
+ * no-op to skip because there's technically nothing left to overlay. See GitHub issue #12.
  * Always rebuilds from scratch rather than overlaying onto getScheduleForDate()'s stored
  * output — that's already-overridden from the last push, so re-overlaying onto it would
  * permanently lose whatever it trimmed the first time.
@@ -500,17 +504,6 @@ function reapplyOverrides(): array
         $dayInputs['costBasis'] = (new CostBasisProvider($config['cost_basis']))->getCostBasis(count($dayInputs['importSlots']));
     }
     unset($dayInputs);
-
-    $hasAnyOverride = false;
-    foreach (array_keys($slotsByDate) as $forDate) {
-        if (getOverridesForDate($forDate)) {
-            $hasAnyOverride = true;
-            break;
-        }
-    }
-    if (!$hasAnyOverride) {
-        return ['ok' => true, 'message' => 'Saved. None of the currently known dates (' . implode(', ', array_keys($slotsByDate)) . ') have an override — nothing to push now.'];
-    }
 
     $batteryConfig = getBatteryConfig($config['battery'] ?? []);
     // $scheduleBuilder is always constructed for applyOverrides()/buildPushWindow() below

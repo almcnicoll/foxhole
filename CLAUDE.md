@@ -975,6 +975,21 @@ through the full pipeline (DP forces the slot, then the post-hoc pass
 relabels it) produces a single clean group with the correct override
 explanation, not a duplicate or conflicting one.
 
+**Clearing the last override still has to push (GitHub issue #12).**
+`reapplyOverrides()` used to bail out early — "nothing to push now" — when
+none of the currently-known dates had an override left, on the reasoning
+that there was nothing to *overlay*. That's true but beside the point:
+removing an override is itself a real change, and the inverter is still
+running the override-based schedule from whatever push last happened. With
+the early return in place, clearing the last override silently left that
+stale schedule live on the inverter until the next regular cron run
+happened to recompute and push a normal one anyway. Fixed by making the
+function unconditional — it now always rebuilds every known date's
+schedule and pushes it, whether or not any override remains, exactly like
+`runScheduler()` already does regardless of whether a day has an override.
+`override.php` already called `reapplyOverrides()` unconditionally after
+every save/delete; the bug was entirely on this function's side.
+
 **A real bug found via live verification, not by inspection: SQLite TEXT
 comparison of ISO 8601 datetime strings isn't chronologically correct
 unless every value shares the same UTC offset.** `price_slots.slot_from` is
