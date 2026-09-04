@@ -173,7 +173,7 @@ function renderSolarTable(array $bucketsForColumn, DateTimeZone $timezone): void
 
 /**
  * Full-width chart above the price/solar tables: import/export price (left axis, fixed
- * -20..50p/kWh) and solar forecast (right axis, fixed 0..installed kWp) over however much
+ * -20..50p/kWh) and solar/usage (right axis, fixed 0..installed kWp) over however much
  * of the current day and beyond is actually known (GitHub issue #4 — often more than 24h
  * once tomorrow's Agile rates publish), with a "now" marker and the schedule mode tinted
  * behind each half-hour — same colours as the data table's row/badge tints (var(--row-*),
@@ -328,7 +328,7 @@ function renderPriceChart(array $slots, array $solarForecast, array $absoluteInt
             $px = $x($mid);
             $py = $yKw($kw);
             $solarPoints[] = sprintf('%.1f,%.1f', $px, $py);
-            $solarMarkers .= $marker($px, $py, 'var(--color-solar)', sprintf('Solar: %skW at %s', number_format($kw, 2), $mid->format('D H:i')));
+            $solarMarkers .= $marker($px, $py, 'var(--color-solar)', sprintf('Solar forecast: %skW at %s', number_format($kw, 2), $mid->format('D H:i')));
         }
     }
 
@@ -344,17 +344,23 @@ function renderPriceChart(array $slots, array $solarForecast, array $absoluteInt
     // rather than inventing a second usage model just for display. Historic rows are fetched
     // with the same "10 years back, harmless if most of that's empty" bound Schedulers.php
     // already uses for the same call, so this needs no new query shape.
+    //
+    // GitHub issue #13: actual solar generation shares this same $historicUsageRows fetch
+    // (the row already carries generation_kwh alongside usage_kwh — no second query) and
+    // is plotted solid in the same colour the forecast above uses, matching history.php's
+    // "solid = actual, dashed = predicted" convention (CLAUDE.md's chart colour standard) —
+    // the dashboard chart previously drew the forecast as a solid line and never plotted
+    // actual generation at all, inconsistent with history.php's own line styling.
     $usagePoints = [];
     $usageMarkers = '';
     $projectedUsagePoints = [];
     $projectedUsageMarkers = '';
+    $generationPoints = [];
+    $generationMarkers = '';
     if ($kwMax > 0) {
         $historicUsageRows = getHistoricGeneration((new DateTimeImmutable('-10 years', $timezone))->setTime(0, 0), $chartEnd);
 
         foreach ($historicUsageRows as $row) {
-            if ($row['usage_kwh'] === null) {
-                continue;
-            }
             $localFrom = $row['from']->setTimezone($timezone);
             if ($localFrom < $chartStart || $localFrom >= $chartEnd) {
                 continue;
@@ -364,11 +370,20 @@ function renderPriceChart(array $slots, array $solarForecast, array $absoluteInt
                 continue;
             }
             $mid = (new DateTimeImmutable('@' . intdiv($row['from']->getTimestamp() + $row['to']->getTimestamp(), 2)))->setTimezone($timezone);
-            $kw = min($row['usage_kwh'] / $durationHours, $kwMax);
             $px = $x($mid);
-            $py = $yKw($kw);
-            $usagePoints[] = sprintf('%.1f,%.1f', $px, $py);
-            $usageMarkers .= $marker($px, $py, 'var(--color-usage)', sprintf('Usage: %skW at %s', number_format($kw, 2), $mid->format('D H:i')));
+
+            if ($row['usage_kwh'] !== null) {
+                $kw = min($row['usage_kwh'] / $durationHours, $kwMax);
+                $py = $yKw($kw);
+                $usagePoints[] = sprintf('%.1f,%.1f', $px, $py);
+                $usageMarkers .= $marker($px, $py, 'var(--color-usage)', sprintf('Usage: %skW at %s', number_format($kw, 2), $mid->format('D H:i')));
+            }
+            if ($row['generation_kwh'] !== null) {
+                $kw = min($row['generation_kwh'] / $durationHours, $kwMax);
+                $py = $yKw($kw);
+                $generationPoints[] = sprintf('%.1f,%.1f', $px, $py);
+                $generationMarkers .= $marker($px, $py, 'var(--color-solar)', sprintf('Solar generation: %skW at %s', number_format($kw, 2), $mid->format('D H:i')));
+            }
         }
 
         $usageSummerKwhMonth = (float) getSetting('usage_summer_kwh_month', '300');
@@ -402,7 +417,7 @@ function renderPriceChart(array $slots, array $solarForecast, array $absoluteInt
         $nowLine = sprintf('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="var(--color-primary)" stroke-width="1.5" stroke-dasharray="4,3" />', $nowX, $marginTop, $nowX, $marginTop + $plotHeight);
     }
     ?>
-<svg class="price-chart" viewBox="0 0 <?= $width ?> <?= $height ?>" role="img" aria-label="Import and export price, and solar forecast, over the known period">
+<svg class="price-chart" viewBox="0 0 <?= $width ?> <?= $height ?>" role="img" aria-label="Import and export price, and solar generation/forecast, over the known period">
     <defs>
         <clipPath id="price-chart-plot"><rect x="<?= $marginLeft ?>" y="<?= $marginTop ?>" width="<?= $plotWidth ?>" height="<?= $plotHeight ?>" /></clipPath>
     </defs>
@@ -411,7 +426,8 @@ function renderPriceChart(array $slots, array $solarForecast, array $absoluteInt
         <?= $nowLine ?>
         <polyline points="<?= implode(' ', $importPoints) ?>" fill="none" stroke="var(--color-error)" stroke-width="2" />
         <?php if ($exportPoints): ?><polyline points="<?= implode(' ', $exportPoints) ?>" fill="none" stroke="var(--color-success)" stroke-width="2" /><?php endif; ?>
-        <?php if ($solarPoints): ?><polyline points="<?= implode(' ', $solarPoints) ?>" fill="none" stroke="var(--color-solar)" stroke-width="2" /><?php endif; ?>
+        <?php if ($generationPoints): ?><polyline points="<?= implode(' ', $generationPoints) ?>" fill="none" stroke="var(--color-solar)" stroke-width="2" /><?php endif; ?>
+        <?php if ($solarPoints): ?><polyline points="<?= implode(' ', $solarPoints) ?>" fill="none" stroke="var(--color-solar)" stroke-width="2" stroke-dasharray="5,4" /><?php endif; ?>
         <?php if ($usagePoints): ?><polyline points="<?= implode(' ', $usagePoints) ?>" fill="none" stroke="var(--color-usage)" stroke-width="2" /><?php endif; ?>
         <?php if ($projectedUsagePoints): ?><polyline points="<?= implode(' ', $projectedUsagePoints) ?>" fill="none" stroke="var(--color-usage)" stroke-width="2" stroke-dasharray="5,4" /><?php endif; ?>
     </g>
@@ -420,13 +436,14 @@ function renderPriceChart(array $slots, array $solarForecast, array $absoluteInt
     every series lands exactly on the clip boundary, and clip-path silently eats half their
     hit-circle there (confirmed live: elementFromPoint missed it), breaking hover for
     exactly those points. */ ?>
-    <g><?= $importMarkers . $exportMarkers . $solarMarkers . $usageMarkers . $projectedUsageMarkers ?></g>
+    <g><?= $importMarkers . $exportMarkers . $generationMarkers . $solarMarkers . $usageMarkers . $projectedUsageMarkers ?></g>
     <g font-size="10" fill="var(--color-muted)">
         <line x1="<?= $marginLeft ?>" y1="12" x2="<?= $marginLeft + 16 ?>" y2="12" stroke="var(--color-error)" stroke-width="2" /><text x="<?= $marginLeft + 20 ?>" y="15">Import price</text>
         <line x1="<?= $marginLeft + 110 ?>" y1="12" x2="<?= $marginLeft + 126 ?>" y2="12" stroke="var(--color-success)" stroke-width="2" /><text x="<?= $marginLeft + 130 ?>" y="15">Export price</text>
-        <?php if ($kwMax > 0): ?><line x1="<?= $marginLeft + 220 ?>" y1="12" x2="<?= $marginLeft + 236 ?>" y2="12" stroke="var(--color-solar)" stroke-width="2" /><text x="<?= $marginLeft + 240 ?>" y="15">Solar forecast</text><?php endif; ?>
-        <?php if ($usagePoints): ?><line x1="<?= $marginLeft + 330 ?>" y1="12" x2="<?= $marginLeft + 346 ?>" y2="12" stroke="var(--color-usage)" stroke-width="2" /><text x="<?= $marginLeft + 350 ?>" y="15">Usage</text><?php endif; ?>
-        <?php if ($projectedUsagePoints): ?><line x1="<?= $marginLeft + 400 ?>" y1="12" x2="<?= $marginLeft + 416 ?>" y2="12" stroke="var(--color-usage)" stroke-width="2" stroke-dasharray="4,3" /><text x="<?= $marginLeft + 420 ?>" y="15">Projected usage</text><?php endif; ?>
+        <?php if ($generationPoints): ?><line x1="<?= $marginLeft + 220 ?>" y1="12" x2="<?= $marginLeft + 236 ?>" y2="12" stroke="var(--color-solar)" stroke-width="2" /><text x="<?= $marginLeft + 240 ?>" y="15">Solar generation</text><?php endif; ?>
+        <?php if ($solarPoints): ?><line x1="<?= $marginLeft + 330 ?>" y1="12" x2="<?= $marginLeft + 346 ?>" y2="12" stroke="var(--color-solar)" stroke-width="2" stroke-dasharray="4,3" /><text x="<?= $marginLeft + 350 ?>" y="15">Solar forecast</text><?php endif; ?>
+        <?php if ($usagePoints): ?><line x1="<?= $marginLeft + 440 ?>" y1="12" x2="<?= $marginLeft + 456 ?>" y2="12" stroke="var(--color-usage)" stroke-width="2" /><text x="<?= $marginLeft + 460 ?>" y="15">Usage</text><?php endif; ?>
+        <?php if ($projectedUsagePoints): ?><line x1="<?= $marginLeft + 510 ?>" y1="12" x2="<?= $marginLeft + 526 ?>" y2="12" stroke="var(--color-usage)" stroke-width="2" stroke-dasharray="4,3" /><text x="<?= $marginLeft + 530 ?>" y="15">Projected usage</text><?php endif; ?>
     </g>
 </svg>
 <script>

@@ -274,6 +274,20 @@ why usage/projected usage there reuse the exact same `--color-usage` the
 dashboard introduced for the same pair (GitHub issue #9), rather than a new
 colour.
 
+**The dashboard chart didn't actually follow its own standard until GitHub
+issue #13.** `renderPriceChart()` only ever plotted the solar *forecast*,
+and drew it as a plain solid line — no dashing, and no actual-generation
+series to distinguish it from at all — inconsistent with `history.php`'s
+correct solid-generation/dashed-forecast pair. Fixed by reusing the same
+`$historicUsageRows` fetch the usage/projected-usage pair (issue #9) already
+pulls for this chart — that row already carries `generation_kwh` alongside
+`usage_kwh`, so no second query — and plotting it solid in `--color-solar`
+alongside the now-dashed forecast line, mirroring `history.php`'s `$series`
+definitions exactly (solid actual, dashed predicted, same hue). The usage
+and generation extraction loops were merged into one pass over
+`$historicUsageRows` while this was in there, rather than iterating it
+twice for two independent fields on the same row.
+
 - **`login.php`** — single password field, checked via
   `Store::verifySystemPassword()`. No password has been set until someone
   visits `settings.php` and sets one — until then the literal password is
