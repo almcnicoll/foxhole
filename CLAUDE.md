@@ -1010,19 +1010,17 @@ every save/delete; the bug was entirely on this function's side.
 **Octopus opt-in sessions: dashboard banner + one-click opt-in
 (user-requested).** Octopus runs ad-hoc opt-in events — "Power down" (Saving
 Sessions: use less, get paid) and "Fill your boots" (Free Electricity/Power
-Up: use more, it's free/cheap) — the exact same two kinds `overrides`/
+Up: use more, it's free/cheap) — the same two kinds `overrides`/
 `ScheduleBuilder::overrideModesFor()` already model, previously only
 enterable by hand via `override.php` once the user noticed one had been
 announced. This feature adds a header banner on `index.php` (today/tomorrow
-only) with an "Opt in" button, and a single-click flow
-(`opt-in.php`, POST-only/login-gated like `run-now.php`) that: reads live
-battery SoC, computes how much prep (force-charge before Power down,
-force-discharge before Fill your boots) is needed to reach the right target
-before the event, saves it as a normal override
-(`Store::saveOverride()`) and pushes it (`reapplyOverrides()` — 100% reused,
-no new push logic), and only then calls Octopus's own join API — never
-opting in if the push failed on any inverter. Explicit scope decisions,
-confirmed with the user before building:
+only) with an "Opt in" button, and a single-click flow (`opt-in.php`,
+POST-only/login-gated like `run-now.php`) that reads live battery SoC,
+computes how much prep (force-charge before Power down, force-discharge
+before Fill your boots) is needed to reach the right target before the
+event, saves it as a normal override (`Store::saveOverride()`), and pushes
+it (`reapplyOverrides()` — 100% reused, no new push logic). Explicit scope
+decisions, confirmed with the user before building:
 
 - **Manual button only, no cron-driven auto-opt-in.** The ask was a
   single-click dashboard action, not unattended automation — worth
@@ -1032,8 +1030,13 @@ confirmed with the user before building:
   time, not joining an announced event).
 - **Fail closed on unknown battery SoC.** If live SoC can't be read when
   "Opt in" is clicked, the whole flow aborts with a warning — no override
-  saved, no join call made. Never guess at battery state for something
+  saved, no push attempted. Never guess at battery state for something
   that costs/earns real money.
+- **Fill your boots needs no opt-in at all** (a correction made mid-build,
+  after the user realised the original spec had this wrong): it's an
+  invitation to use more power at a very low/free rate, not a scheme you
+  join. Only Power down actually calls an Octopus API to opt in —
+  see below.
 
 `src/SessionOptIn.php`'s `calculateOptInPrep()` is the prep-duration maths,
 a pure function (same "small, testable, no DB/network" precedent as
@@ -1047,94 +1050,108 @@ clamped to that midnight instead (less prep than ideal, not a crash) — the
 override system has no way to express a window spanning midnight, same
 limitation `override.php`'s own UI already has.
 
-`src/OctopusFlexClient.php` talks to Octopus's GraphQL API
-(`api.octopus.energy/v1/graphql/`). A full reference of every query/mutation
-is published at [docs.octopus.energy/graphql/reference/](https://docs.octopus.energy/graphql/reference/),
-with the basics of auth/usage at
-[docs.octopus.energy/graphql/guides/basics/](https://docs.octopus.energy/graphql/guides/basics/)
-— check there before re-deriving something via introspection again, though
-in practice the reference site has repeatedly proven too large to fetch
-usefully in one pass (see below); introspection against the live endpoint
-directly has been the more reliable source of truth so far. A first live
-spike failed outright on an invalid API key before anything past auth
-could be checked; a second pass used GraphQL's own schema introspection —
-which needs no token at all — to check the query/mutation *shapes*
-directly against the live production schema, which is authoritative
-regardless of whether a given key actually authenticates. Confirmed this
-way:
+**`src/OctopusFlexClient.php` uses two genuinely different Octopus GraphQL
+mechanisms, one per kind — found only after two earlier live spikes against
+the wrong endpoint came up empty.** The official reference
+([docs.octopus.energy/graphql/reference/](https://docs.octopus.energy/graphql/reference/),
+basics at
+[docs.octopus.energy/graphql/guides/basics/](https://docs.octopus.energy/graphql/guides/basics/))
+covers only the public `api.octopus.energy` schema — introspecting that one
+directly (no token needed for introspection) confirmed
+`customerFlexibilityCampaignEvents` for Fill your boots, but never turned up
+anything for actually joining a Power down event, because the real mechanism
+for that lives on a *second, undocumented host* entirely. That second host
+was found by reading a real, working third-party project
+(`mrdanielmitchell/automator-octopus-energy`, a Cloudflare Worker that
+auto-joins Saving Sessions — [see the blog post that led here](https://www.daniel-mitchell.com/blog/never-miss-an-octopus-energy-saving-session-again/)),
+then confirmed independently by introspecting that host's own schema too.
+**Everything below has now been live-tested end-to-end** (real API key,
+real account) — not just introspected:
 
-- `customerFlexibilityCampaignEvents(accountNumber: String!,
-  supplyPointIdentifier: String!, campaignSlug: String!, first: Int)`
-  returning `edges.node.{name, code, startAt, endAt, isEventParticipant}`.
-  **`supplyPointIdentifier` (MPAN) is required, not optional** — an
-  earlier version of this feature treated it as optional (nullable,
-  skipped if unset); that was wrong, fixed once introspection showed the
-  argument is non-null. `settings.php`'s Octopus fieldset now documents
-  it as required-if-using-the-feature, and `getAvailableSessions()` fails
-  fast with a clear message if it's missing rather than sending a null
-  value GraphQL would reject with a less helpful error.
-- `isEventParticipant` is a genuine API-side join-status boolean — a
-  pleasant surprise, since the original version of this feature assumed
-  no such field existed and tracked "opted in" purely locally. The banner
-  now prefers this field (it also reflects an opt-in made via Octopus's
-  own app), OR'd with the local `octopus_session_optins` record as a
-  fast-path fallback for the moment right after this app's own join call
-  succeeds.
-- The query itself still requires an `Authorization` header even though it
-  takes no API key as a query argument — confirmed live via error
-  `KT-CT-1112` ("You must provide the AUTHORIZATION header"). Auth is
-  still `obtainKrakenToken(input: {APIKey: $key})` (the input field is
-  `APIKey`, not `apiKey` — confirmed by the API's own error message
-  correcting the casing), sent as `Authorization: JWT <token>` — the
-  standard Kraken/Octopus convention, though no API key tried against
-  this account so far has actually authenticated (`KT-CT-1139`,
-  "Authentication failed"), so that header format has never actually been
-  exercised end-to-end.
-- **There is no `joinSavingSessionsEvent` mutation in the live schema at
-  all** — the original guess, taken from
-  `BottlecapDave/HomeAssistant-OctopusEnergy`'s service parameter naming,
-  was simply wrong; confirmed absent by introspecting every field on
-  `Mutation`. The two real candidates found —
-  `joinOctoplusCampaign(accountNumber: String)` (no event-specific
-  code/date argument at all) and `addCampaignToAccount(input:
-  {accountNumber, campaign, startDate, expiryDate})` (a bare `campaign`
-  string, no date/time — reads as enrolling in a whole named scheme, not
-  a specific announced occurrence) — don't obviously fit "join this
-  specific timed event by its `code`" at all. Guessing further here risks
-  a real, silently-wrong side effect on a live account (worse than a
-  clean failure), so `joinSession()` deliberately throws unconditionally
-  rather than calling either one speculatively. `opt-in.php`'s existing
-  error handling already does the right thing with that: preparation
-  still gets calculated, saved as an override, and pushed to the
-  inverter(s) — only the final "tell Octopus" step is blocked, with a
-  message pointing at opting in manually via the app for now. The
-  reliable way to actually confirm this mutation is capturing the real
-  request (browser DevTools, Network tab, filter "graphql") while opting
-  into a real session through Octopus's own app/website — the schema
-  itself doesn't reveal it.
-- The campaign slug for Power Down/Saving Sessions (`config.php`'s
-  `octopus.flex_campaign_slugs['power_down']`, currently a guess —
-  `saving_sessions`) is still unconfirmed — `campaignSlug` isn't a schema
-  enum, so introspection can't enumerate valid values, and Power Down
-  predates the Free Electricity GraphQL rollout enough that it may use a
-  different query shape entirely, not just a different slug on this one.
+- **Power down** → `api.backend.octopus.energy/v1/graphql/` — confirmed
+  live: `savingSessions { events(includeDev: false) { id code startAt endAt
+  rewardPerKwhInOctoPoints devEvent }, account(accountNumber) { joinedEvents
+  { eventId } } }`, no MPAN and no campaign slug at all. Dev events and
+  zero-reward events (both really occur in the live data) are filtered out,
+  same as automator-octopus-energy's own code. "Already joined" is matched
+  by `event.id` against `account.joinedEvents[].eventId` — **not** `code`,
+  which is a different field used only for the join call. Join is
+  `joinSavingSessionsEvent(input: {accountNumber, eventCode}) {
+  joinedEventCodes }` on the same host — confirmed live against a real
+  (already-past) event: it returns a real, correctly-shaped error rather
+  than a schema error, with the useful detail in
+  `extensions.{errorCode,reason}` (e.g. `OE-1308`, "Account cannot join
+  event after the start of the event.") rather than necessarily an
+  "already"-worded `message` — an earlier version of `joinSession()`
+  guessed that an "already ..." message meant success and swallowed it;
+  that guess is now known to be unreliable and was removed. Every join
+  error, whatever it says, propagates honestly to the user rather than
+  being guessed at — `getAvailableSessions()` already excludes sessions the
+  account has joined, so a failure here means something genuinely
+  unexpected happened, worth surfacing, not hiding.
+- **Fill your boots** → the public `api.octopus.energy`'s
+  `customerFlexibilityCampaignEvents(accountNumber, supplyPointIdentifier,
+  campaignSlug: "free_electricity", first)` — confirmed live, MPAN
+  (`supplyPointIdentifier`) is a required (non-null) argument for this
+  query specifically, unlike Power down which needs no MPAN at all. Since
+  this kind needs no opt-in (see above), there's no join method for it at
+  all — `getAvailableSessions()` always reports `alreadyJoined: false` for
+  it, and the dashboard/local `octopus_session_optins` record is the only
+  "opted in" signal that applies.
+- Auth for both hosts is `obtainKrakenToken(input: {APIKey: $key})` (the
+  input field is `APIKey`, not `apiKey` — confirmed live: the API's own
+  error message corrects the casing) against the main host, sent as a
+  **bare token** (`Authorization: <token>`, not `JWT <token>`) — confirmed
+  against automator-octopus-energy's own code (which comments this
+  explicitly for the backend host) and confirmed live that the main host
+  accepts the bare form too (it also tolerates a `JWT `-prefixed value, so
+  either would have worked there, but bare is simplest and definitely
+  works against both).
+- **`api.backend.octopus.energy` 403s a request with no `User-Agent`
+  header** — confirmed live: PHP's cURL sends none by default, unlike the
+  `curl` CLI tool (which is why manual curl-based spikes against this host
+  never hit this), and the response is a plain `<html>403 Forbidden</html>`
+  page, not a GraphQL error — nothing about the account or query, a bare
+  edge/WAF rejection. `graphql()` now always sets
+  `CURLOPT_USERAGENT`. automator-octopus-energy's own code sets one for
+  exactly this host too, presumably for the same reason.
+- Power down and Fill your boots are two **independent** data sources
+  (different hosts, different queries) — `getAvailableSessions()` catches
+  each one's `OctopusFlexException` separately so one failing (that 403
+  above was caught live, mid-build) can never suppress the other's
+  otherwise-working result. Same "attempt both, don't let one block the
+  other" reasoning `Runner.php` already applies to today's/tomorrow's
+  Octopus price fetch.
+- A backend schema that also looked like a plausible *unified* replacement
+  — `flexibilitySchemeSessions(schemeSlug, member: {accountNumber})` /
+  `optInToFlexibilitySchemeSession(input: {sessionCode, member})`, no MPAN
+  needed either — was found by the same introspection pass but never
+  adopted: nothing external confirms it actually works end-to-end the way
+  the Saving Sessions path above is proven to, and Power down doesn't need
+  it now. Worth revisiting if the Saving Sessions path is ever deprecated
+  (introspection shows both `isDeprecated: false` today).
 
-Every GraphQL call is logged via the existing `Store::saveApiLogEntry()`
-choke point (same table/page as FoxESS calls, distinguished by an endpoint
-string like `graphql:customerFlexibilityCampaignEvents:free_electricity`
-instead of a URL path, since every GraphQL call hits the same URL) —
+Every GraphQL call (either host) is logged via the existing
+`Store::saveApiLogEntry()` choke point (same table/page as FoxESS calls,
+distinguished by an endpoint string like `graphql:savingSessions` instead
+of a URL path, since every call to a given host hits the same URL) —
 confirmed live that Octopus, like FoxESS, wraps GraphQL errors inside an
 HTTP 200 response (an invalid API key produced a 200 with an `errors`
-array, not a 4xx), so the existing "don't trust the status code alone"
-api-log handling applies here too.
+array, not a 4xx — the 403 above is the one exception, a transport/edge
+rejection with no GraphQL body at all), so the existing "don't trust the
+status code alone" api-log handling applies here too.
 
 Octopus account credentials (`octopus_account_api_key`/
 `octopus_account_number`/`octopus_mpan`) live in the settings table via
 `Store::getOctopusAccountConfig()`, same "secrets belong in the settings
-table, not config.php" reasoning as `foxess_api_key` — optional as a
-*feature* (the banner simply doesn't appear if any of the three is unset,
+table, not config.php" reasoning as `foxess_api_key`. All optional: API key
++ account number alone are enough for Power down; MPAN is additionally
+needed only to also detect Fill your boots. The banner simply doesn't
+appear (or only shows Power down) if the relevant credentials are unset,
 same degrade-quietly precedent as the solar forecast's `solar_enabled`
-gate), but all three are required together once you want it at all.
+gate. `config.php`'s `octopus.free_electricity_campaign_slug` is the one
+remaining non-secret tunable this feature needs — Power down has no
+equivalent setting, since its API takes no slug at all.
 
 **A group ending at literal 0:00 collides with the next group starting at
 0:00 — FoxESS's v2 `scheduler/enable` doesn't treat that as "end of day"

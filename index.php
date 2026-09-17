@@ -24,15 +24,16 @@ $tomorrow = $today->modify('+1 day');
 // call means no banner, never a broken dashboard. See CLAUDE.md and src/OctopusFlexClient.php.
 $octopusAccountConfig = getOctopusAccountConfig();
 $optInSessions = [];
-// mpan is required, not optional — confirmed live that customerFlexibilityCampaignEvents'
-// supplyPointIdentifier argument is non-null (see OctopusFlexClient's doc comment).
-if ($octopusAccountConfig['api_key'] !== '' && $octopusAccountConfig['account_number'] !== '' && $octopusAccountConfig['mpan']) {
+// Power down only needs the API key/account number; Fill your boots additionally needs
+// the MPAN, and OctopusFlexClient::getAvailableSessions() silently skips just that half
+// if it's missing rather than the whole call failing — see that class's doc comment.
+if ($octopusAccountConfig['api_key'] !== '' && $octopusAccountConfig['account_number'] !== '') {
     try {
         $optInSessions = (new OctopusFlexClient(
             $octopusAccountConfig['api_key'],
             $octopusAccountConfig['account_number'],
             $octopusAccountConfig['mpan'],
-            $config['octopus']['flex_campaign_slugs'] ?? [],
+            $config['octopus']['free_electricity_campaign_slug'] ?? '',
         ))->getAvailableSessions($today, $tomorrow, $timezone);
     } catch (OctopusFlexException $e) {
         $optInSessions = [];

@@ -1885,29 +1885,28 @@ check(
     'no prep window is returned once $now is already past the event start',
 );
 
-// --- OctopusFlexClient: getAvailableSessions() — scripted to intercept the protected
-// graphql() choke point, same subclassing technique as FoxessClient::post()'s tests
-// above. Never touches the network. joinSession() needs no such scripting — it's a
-// deliberate unconditional throw (see its own doc comment), tested directly below.
+// --- OctopusFlexClient: getAvailableSessions()/joinSession() — scripted to intercept the
+// protected graphql() choke point, same subclassing technique as FoxessClient::post()'s
+// tests above. Never touches the network.
 class ScriptedOctopusFlexClient extends OctopusFlexClient
 {
-    public array $calls = [];
+    public array $calls = []; // each entry: [url, operationLabel]
 
     /** @param array<string, array> $scripted operationLabel => either a full {data:...} response, or ['throw' => 'message'] */
     public function __construct(
         private readonly array $scripted,
-        array $campaignSlugs = ['power_down' => 'saving_sessions', 'fill_your_boots' => 'free_electricity'],
         ?string $mpan = '1234567890123',
+        string $freeElectricityCampaignSlug = 'free_electricity',
     ) {
-        parent::__construct('key', 'ACC-1', $mpan, $campaignSlugs);
+        parent::__construct('key', 'ACC-1', $mpan, $freeElectricityCampaignSlug);
     }
 
-    protected function graphql(string $query, array $variables, string $operationLabel, bool $skipAuth = false, bool $isRetry = false): array
+    protected function graphql(string $url, string $query, array $variables, string $operationLabel, bool $skipAuth = false, bool $isRetry = false): array
     {
         // Intercepts the same choke point every real call (including authenticate()'s own
         // obtainKrakenToken call) goes through, same subclassing technique as
         // FoxessClient::post()'s tests above — authenticate() itself never actually runs.
-        $this->calls[] = $operationLabel;
+        $this->calls[] = [$url, $operationLabel];
         if (!array_key_exists($operationLabel, $this->scripted)) {
             throw new OctopusFlexException("unscripted call: $operationLabel");
         }
@@ -1922,55 +1921,91 @@ class ScriptedOctopusFlexClient extends OctopusFlexClient
 $flexTz = new DateTimeZone('Europe/London');
 $flexToday = new DateTimeImmutable('2026-05-01', $flexTz);
 $flexTomorrow = $flexToday->modify('+1 day');
+$backendUrl = 'https://api.backend.octopus.energy/v1/graphql/';
+$mainUrl = 'https://api.octopus.energy/v1/graphql/';
 
 $sessionsClient = new ScriptedOctopusFlexClient([
+    'savingSessions' => ['data' => ['savingSessions' => [
+        'events' => [
+            ['id' => 'id-tomorrow', 'code' => 'PD-TOMORROW', 'startAt' => '2026-05-02T17:00:00Z', 'endAt' => '2026-05-02T19:00:00Z', 'rewardPerKwhInOctoPoints' => 5, 'devEvent' => false],
+            ['id' => 'id-far', 'code' => 'PD-FAR', 'startAt' => '2026-05-10T17:00:00Z', 'endAt' => '2026-05-10T19:00:00Z', 'rewardPerKwhInOctoPoints' => 5, 'devEvent' => false],
+            ['id' => 'id-dev', 'code' => 'PD-DEV', 'startAt' => '2026-05-01T17:00:00Z', 'endAt' => '2026-05-01T19:00:00Z', 'rewardPerKwhInOctoPoints' => 5, 'devEvent' => true],
+            ['id' => 'id-zero', 'code' => 'PD-ZERO', 'startAt' => '2026-05-01T18:00:00Z', 'endAt' => '2026-05-01T20:00:00Z', 'rewardPerKwhInOctoPoints' => 0, 'devEvent' => false],
+        ],
+        'account' => ['joinedEvents' => [['eventId' => 'id-tomorrow']]],
+    ]]],
     'customerFlexibilityCampaignEvents:free_electricity' => ['data' => ['customerFlexibilityCampaignEvents' => ['edges' => [
-        ['node' => ['code' => 'FE-TODAY', 'startAt' => '2026-05-01T10:00:00Z', 'endAt' => '2026-05-01T12:00:00Z', 'isEventParticipant' => false]],
-        ['node' => ['code' => 'FE-FAR', 'startAt' => '2026-05-10T10:00:00Z', 'endAt' => '2026-05-10T12:00:00Z', 'isEventParticipant' => false]],
-    ]]]],
-    'customerFlexibilityCampaignEvents:saving_sessions' => ['data' => ['customerFlexibilityCampaignEvents' => ['edges' => [
-        ['node' => ['code' => 'PD-TOMORROW', 'startAt' => '2026-05-02T17:00:00Z', 'endAt' => '2026-05-02T19:00:00Z', 'isEventParticipant' => true]],
+        ['node' => ['code' => 'FE-TODAY', 'startAt' => '2026-05-01T10:00:00Z', 'endAt' => '2026-05-01T12:00:00Z']],
+        ['node' => ['code' => 'FE-FAR', 'startAt' => '2026-05-10T10:00:00Z', 'endAt' => '2026-05-10T12:00:00Z']],
     ]]]],
 ]);
 $flexSessions = $sessionsClient->getAvailableSessions($flexToday, $flexTomorrow, $flexTz);
-check(count($flexSessions) === 2, 'getAvailableSessions() filters out an event further ahead than today/tomorrow: got ' . count($flexSessions));
-check($flexSessions[0]['code'] === 'FE-TODAY' && $flexSessions[0]['kind'] === 'fill_your_boots' && $flexSessions[0]['alreadyJoined'] === false, 'today\'s fill_your_boots event is included, correctly labelled, and not yet joined');
-check($flexSessions[1]['code'] === 'PD-TOMORROW' && $flexSessions[1]['kind'] === 'power_down' && $flexSessions[1]['alreadyJoined'] === true, 'tomorrow\'s power_down event is included, sorted after today\'s by start time, and reports isEventParticipant as alreadyJoined');
-
-$noPowerDownClient = new ScriptedOctopusFlexClient(
-    ['customerFlexibilityCampaignEvents:free_electricity' => ['data' => ['customerFlexibilityCampaignEvents' => ['edges' => []]]]],
-    ['power_down' => '', 'fill_your_boots' => 'free_electricity'],
-);
-$noPowerDownClient->getAvailableSessions($flexToday, $flexTomorrow, $flexTz);
+check(count($flexSessions) === 2, 'getAvailableSessions() filters out events further ahead than today/tomorrow, and dev/zero-reward power_down events, from both sources: got ' . count($flexSessions));
+check($flexSessions[0]['code'] === 'FE-TODAY' && $flexSessions[0]['kind'] === 'fill_your_boots' && $flexSessions[0]['alreadyJoined'] === false, 'today\'s fill_your_boots event is included, correctly labelled, and never reports alreadyJoined from the API (no such concept for this kind)');
+check($flexSessions[1]['code'] === 'PD-TOMORROW' && $flexSessions[1]['kind'] === 'power_down' && $flexSessions[1]['alreadyJoined'] === true, 'tomorrow\'s power_down event is included, sorted after today\'s by start time, and matched as alreadyJoined via account.joinedEvents\' eventId (not code)');
 check(
-    !in_array('customerFlexibilityCampaignEvents:saving_sessions', $noPowerDownClient->calls, true),
-    'a kind with an empty/unconfigured campaign slug (power_down here) is skipped entirely, never queried: got ' . json_encode($noPowerDownClient->calls),
+    in_array([$backendUrl, 'savingSessions'], $sessionsClient->calls, true)
+    && in_array([$mainUrl, 'customerFlexibilityCampaignEvents:free_electricity'], $sessionsClient->calls, true),
+    'power_down is queried against the backend host and fill_your_boots against the main host: got ' . json_encode($sessionsClient->calls),
 );
 
-// supplyPointIdentifier (MPAN) is a confirmed-live required argument — getAvailableSessions()
-// must fail fast with a clear message rather than sending a null value GraphQL would reject
-// with a less helpful variable-coercion error.
+// Fill your boots is silently skipped (not an error) when no MPAN is configured — power
+// down needs no MPAN at all, so the whole call must still succeed.
+$noMpanClient = new ScriptedOctopusFlexClient([
+    'savingSessions' => ['data' => ['savingSessions' => ['events' => [], 'account' => ['joinedEvents' => []]]]],
+], mpan: null);
+$noMpanSessions = $noMpanClient->getAvailableSessions($flexToday, $flexTomorrow, $flexTz);
+check($noMpanSessions === [], 'no sessions found (power_down empty, fill_your_boots skipped) still returns cleanly, not an error');
+check(
+    !array_filter($noMpanClient->calls, fn($c) => str_starts_with($c[1], 'customerFlexibilityCampaignEvents')),
+    'fill_your_boots is never queried at all when no MPAN is configured: got ' . json_encode($noMpanClient->calls),
+);
+
+// A failing power_down query (confirmed live: api.backend.octopus.energy can return a
+// plain WAF 403 unrelated to the account) must not suppress an otherwise-working
+// fill_your_boots result, and vice versa — the two are independent data sources.
+$powerDownFailsClient = new ScriptedOctopusFlexClient([
+    'savingSessions' => ['throw' => 'Octopus GraphQL (savingSessions) returned HTTP 403: <html>...403 Forbidden...</html>'],
+    'customerFlexibilityCampaignEvents:free_electricity' => ['data' => ['customerFlexibilityCampaignEvents' => ['edges' => [
+        ['node' => ['code' => 'FE-TODAY', 'startAt' => '2026-05-01T10:00:00Z', 'endAt' => '2026-05-01T12:00:00Z']],
+    ]]]],
+]);
+$partialSessions = $powerDownFailsClient->getAvailableSessions($flexToday, $flexTomorrow, $flexTz);
+check(
+    count($partialSessions) === 1 && $partialSessions[0]['code'] === 'FE-TODAY',
+    'a failing power_down query still lets a working fill_your_boots result through: got ' . json_encode(array_column($partialSessions, 'code')),
+);
+
+// --- OctopusFlexClient: joinSession() — power_down only. Confirmed-live mutation shape
+// (against the real backend host, from a working third-party project's own source) ---
+$joinOkClient = new ScriptedOctopusFlexClient(['joinSavingSessionsEvent' => ['data' => ['joinSavingSessionsEvent' => ['joinedEventCodes' => ['PD-123']]]]]);
+$joinOkClient->joinSession('PD-123'); // must not throw
+check(true, 'joinSession() succeeds when the mutation confirms the event code as joined');
+check($joinOkClient->calls === [[$backendUrl, 'joinSavingSessionsEvent']], 'joinSession() calls the backend host, not the main one: got ' . json_encode($joinOkClient->calls));
+
 try {
-    (new ScriptedOctopusFlexClient([], mpan: null))->getAvailableSessions($flexToday, $flexTomorrow, $flexTz);
-    check(false, 'getAvailableSessions() should throw when no MPAN is configured');
+    (new ScriptedOctopusFlexClient(['joinSavingSessionsEvent' => ['data' => ['joinSavingSessionsEvent' => ['joinedEventCodes' => ['SOME-OTHER-CODE']]]]]))->joinSession('PD-123');
+    check(false, 'joinSession() should throw when the mutation succeeds but does not actually confirm the requested code as joined');
 } catch (OctopusFlexException $e) {
-    check(str_contains($e->getMessage(), 'MPAN'), 'the missing-MPAN error is clear about what\'s missing: got ' . $e->getMessage());
-}
-try {
-    (new ScriptedOctopusFlexClient([], mpan: ''))->getAvailableSessions($flexToday, $flexTomorrow, $flexTz);
-    check(false, 'getAvailableSessions() should also throw when the MPAN setting is an empty string, not just null');
-} catch (OctopusFlexException $e) {
-    check(true, 'empty-string MPAN is treated the same as unconfigured');
+    check(str_contains($e->getMessage(), 'PD-123'), 'the confirmation-mismatch error names the event code: got ' . $e->getMessage());
 }
 
-// joinSession() is deliberately unimplemented — there is no confirmed-safe mutation for
-// "join this specific event" (see OctopusFlexClient's own doc comment) — it must always
-// throw rather than silently guessing against a real account.
+// No idempotency swallowing (an earlier version guessed an "already ..."-worded message
+// meant success) — confirmed live that an ineligible-to-join event (tested against a real,
+// already-past/already-joined one) comes back as errorCode OE-1308 with the real reason in
+// extensions.reason, not necessarily an "already"-worded message, so every join error
+// (whatever it says) must propagate honestly rather than being guessed at.
 try {
-    (new ScriptedOctopusFlexClient([]))->joinSession('power_down', 'PD-123');
-    check(false, 'joinSession() should always throw until a real mutation is confirmed');
+    (new ScriptedOctopusFlexClient(['joinSavingSessionsEvent' => ['throw' => 'Octopus GraphQL (joinSavingSessionsEvent) error: Account ineligible to join Saving Sessions event. [OE-1308 — Account cannot join event after the start of the event.]']]))->joinSession('PD-123');
+    check(false, 'joinSession() should propagate an ineligibility error rather than swallowing it');
 } catch (OctopusFlexException $e) {
-    check(str_contains($e->getMessage(), 'power_down') && str_contains($e->getMessage(), 'PD-123'), 'the exception names the kind/event code that couldn\'t be joined: got ' . $e->getMessage());
+    check(str_contains($e->getMessage(), 'OE-1308'), 'the real error detail (errorCode/reason) reaches the caller: got ' . $e->getMessage());
+}
+try {
+    (new ScriptedOctopusFlexClient(['joinSavingSessionsEvent' => ['throw' => 'Octopus GraphQL (joinSavingSessionsEvent) error: Saving Sessions event not found']]))->joinSession('PD-999');
+    check(false, 'joinSession() should propagate a "not found" error too');
+} catch (OctopusFlexException $e) {
+    check(str_contains($e->getMessage(), 'not found'), 'the underlying error message is preserved: got ' . $e->getMessage());
 }
 
 if ($failures > 0) {

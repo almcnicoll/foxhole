@@ -89,6 +89,14 @@ $prepNote = $prep === null
         ? 'Preparation starts at local midnight (the ideal start was earlier than that, which the override system can\'t express) rather than the full calculated duration.'
         : 'Preparation window set automatically from the current battery level.');
 
+// Fill your boots needs no opt-in at all (confirmed with the user) — it's an invitation to
+// use more power, not a scheme to join. Applying the optimised charge override above *is*
+// the whole action; there's nothing further to tell Octopus.
+if ($kind === 'fill_your_boots') {
+    recordSessionOptIn($code, $kind, $forDate, $now);
+    redirectResult(true, "$label: pushed the optimised schedule ($prepNote)");
+}
+
 $octopusConfig = getOctopusAccountConfig();
 if ($octopusConfig['api_key'] === '' || $octopusConfig['account_number'] === '') {
     redirectResult(false, "$label preparation was saved and pushed, but Octopus account credentials aren't configured (settings.php) — opt-in was not sent.");
@@ -99,9 +107,9 @@ try {
         $octopusConfig['api_key'],
         $octopusConfig['account_number'],
         $octopusConfig['mpan'],
-        $config['octopus']['flex_campaign_slugs'] ?? [],
+        $config['octopus']['free_electricity_campaign_slug'] ?? '',
     );
-    $flexClient->joinSession($kind, $code);
+    $flexClient->joinSession($code);
 } catch (OctopusFlexException $e) {
     redirectResult(false, "$label preparation was saved and pushed, but opting in with Octopus failed: " . $e->getMessage());
 }

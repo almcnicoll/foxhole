@@ -4,115 +4,184 @@ require_once __DIR__ . '/Exceptions.php';
 require_once __DIR__ . '/Store.php';
 
 /**
- * Talks to Octopus's GraphQL API (api.octopus.energy/v1/graphql/) to discover and join
- * ad-hoc opt-in sessions — "Power down" (Saving Sessions: use less, get paid) and
- * "Fill your boots" (Free Electricity/Power Up: use more, it's free/cheap) — the same two
- * kinds `overrides`/`ScheduleBuilder::overrideModesFor()` already model. Deliberately
- * scoped to just these ad-hoc, announced-then-joined events, not Octopus's separate
- * "Weekend Happy Hour" mechanism (booking one future slot ahead of time, a different API
- * shape) — out of scope for this feature by explicit decision.
+ * Talks to Octopus's GraphQL APIs to discover "Power down" (Saving Sessions: use less,
+ * get paid) and "Fill your boots" (Free Electricity/Power Up: use more, it's free/cheap)
+ * opt-in sessions — the same two kinds `overrides`/`ScheduleBuilder::overrideModesFor()`
+ * already model. Deliberately scoped to just these ad-hoc, announced events, not Octopus's
+ * separate "Weekend Happy Hour" mechanism (booking one future slot ahead of time, a
+ * different API shape) — out of scope for this feature by explicit decision.
  *
- * **Several pieces of this class are best-effort, not confirmed live**, in the same spirit
- * as this app's `fdSoc`/`fdPwr` FoxESS fields. Confirmed by live GraphQL introspection
- * against the real, unauthenticated endpoint (schema introspection needs no token, so this
- * much was checkable even without a working API key):
+ * **Two genuinely different mechanisms, one per kind** — discovered by reading a real,
+ * working third-party project (`mrdanielmitchell/automator-octopus-energy`, a Cloudflare
+ * Worker that auto-joins Saving Sessions) after two earlier live spikes against the wrong
+ * endpoint kept coming up empty:
  *
- * - `customerFlexibilityCampaignEvents(accountNumber: String!, supplyPointIdentifier: String!, campaignSlug: String!, first: Int)`
- *   returning a connection of `{name, code, startAt, endAt, isEventParticipant}` nodes —
- *   confirmed live. **`supplyPointIdentifier` (MPAN) is a required (non-null) argument,
- *   not optional** — an earlier version of this class treated it as optional; that was
- *   wrong. `isEventParticipant` is a genuine API-side join-status boolean — this class
- *   prefers it over the local `octopus_session_optins` table (which still exists as a
- *   fast-path/fallback — see Store.php), since it also reflects an opt-in made via
- *   Octopus's own app, not just one made through this feature.
- * - The query itself still requires an `Authorization` header despite not taking an API
- *   key as a query argument — confirmed live (`KT-CT-1112`, "You must provide the
- *   AUTHORIZATION header"). Auth is `obtainKrakenToken(input: {APIKey: $key})` — the input
- *   field is `APIKey`, not `apiKey` (confirmed live: the API's own error message corrects
- *   the casing) — but no API key tested against this account so far has actually
- *   authenticated (`KT-CT-1139`, "Authentication failed"), so the resulting JWT has never
- *   actually been exercised. The `Authorization: JWT <token>` header format below is the
- *   standard Kraken/Octopus convention, not independently confirmed against this account.
- * - **Not confirmed**: the campaign slug for Power Down/Saving Sessions — `campaignSlug`
- *   isn't a schema enum (introspection can't enumerate valid values), and Power Down
- *   predates the Free Electricity GraphQL rollout, so it may use a different query
- *   entirely, not just a different slug on this one. See config.php's
- *   `octopus.flex_campaign_slugs`.
- * - **Not confirmed, and NOT implemented as a guess**: there is no `joinSavingSessionsEvent`
- *   mutation in the live schema at all — confirmed absent by introspecting every Mutation
- *   field. The closest real candidates are `joinOctoplusCampaign(accountNumber: String)`
- *   (no event-specific code argument at all — looks like generic Octoplus rewards-program
- *   enrollment, not a specific timed session) and `addCampaignToAccount(input:
- *   {accountNumber, campaign, startDate, expiryDate})` (a bare `campaign` string with no
- *   date/time — looks like enrolling in a whole named scheme, not a specific announced
- *   occurrence). Neither one's semantics for "join this specific event by its `code`" are
- *   confirmed, and firing either one blind against a real account risks an unintended
- *   enrollment rather than a clean failure — `joinSession()` below deliberately throws
- *   rather than guessing. The reliable way to confirm this is capturing the real request
- *   (browser DevTools, Network tab, filter "graphql") while opting into a real session via
- *   Octopus's own app/website.
+ * - **Power down** uses `api.backend.octopus.energy/v1/graphql/` — a *different host* from
+ *   the public `api.octopus.energy` one, undocumented in the public GraphQL reference and
+ *   never found by introspecting the public endpoint (which is why the first pass here
+ *   concluded `joinSavingSessionsEvent` "doesn't exist" — it exists, just not there).
+ *   Confirmed by reading that project's actual source and by introspecting this backend
+ *   endpoint directly (introspection needs no auth): `savingSessions { events(includeDev:
+ *   false) { id code rewardPerKwhInOctoPoints startAt endAt devEvent }, account(accountNumber)
+ *   { hasJoinedCampaign, joinedEvents { eventId } } }` — no MPAN, no campaign slug, no
+ *   arguments at all on `savingSessions` itself. Join is `joinSavingSessionsEvent(input:
+ *   {accountNumber, eventCode}) { joinedEventCodes }` — exactly the shape this class
+ *   originally guessed, just aimed at the wrong host. Auth header is the **bare token**
+ *   (`Authorization: <token>`), not `JWT <token>` — that project's own code comments this
+ *   explicitly, and it's real, currently-running code, not a guess.
+ * - **Fill your boots requires no opt-in at all** (confirmed with the user — a
+ *   misunderstanding in this feature's original spec): it's an invitation to use more
+ *   power at a very low/free rate, not a scheme you join. This class still needs to
+ *   *detect* one, via the public `api.octopus.energy` endpoint's
+ *   `customerFlexibilityCampaignEvents(accountNumber, supplyPointIdentifier, campaignSlug:
+ *   "free_electricity", first)` (confirmed live shape from the very first spike) — MPAN
+ *   *is* required for this one query specifically (confirmed live: non-null argument) —
+ *   but there's no corresponding join method in this class at all. opt-in.php just applies
+ *   the optimised charge override and reports success; see its own comment.
+ *
+ * A backend GraphQL schema that also looked promising for a *unified* mechanism —
+ * `flexibilitySchemeSessions(schemeSlug, member: {accountNumber})` /
+ * `optInToFlexibilitySchemeSession(input: {sessionCode, member})`, no MPAN needed either —
+ * was found by the same introspection pass but never adopted: unlike the Saving Sessions
+ * path above, nothing external confirms it actually works end-to-end, and Power down
+ * doesn't need it now that the proven path is in use. Worth revisiting if the Saving
+ * Sessions path is ever deprecated (introspection shows both `isDeprecated: false` today).
+ *
+ * **Live-tested end-to-end against a real account and a real, working API key** (not just
+ * introspection this time): `obtainKrakenToken` authenticates; `savingSessions` returns
+ * real Power down event history including `account.joinedEvents`; `customerFlexibilityCampaignEvents`
+ * returns real Fill your boots event history; `joinSavingSessionsEvent` was exercised
+ * against a real (already-past) event and returned a real, correctly-shaped error rather
+ * than a schema error — see `joinSession()`'s own doc comment for what that revealed about
+ * error shape. The bare-token `Authorization` header works against *both* hosts (the main
+ * one also accepts a `JWT `-prefixed value, but bare is simplest and definitely works).
  */
 class OctopusFlexClient
 {
-    private const BASE_URL = 'https://api.octopus.energy/v1/graphql/';
+    private const MAIN_URL = 'https://api.octopus.energy/v1/graphql/';
+    private const BACKEND_URL = 'https://api.backend.octopus.energy/v1/graphql/';
 
     private ?string $token = null;
 
-    /** @param array{power_down: string, fill_your_boots: string} $campaignSlugs kind => Octopus campaign slug; an empty slug skips that kind entirely (not yet configured/confirmed) */
     public function __construct(
         private readonly string $apiKey,
         private readonly string $accountNumber,
         private readonly ?string $mpan,
-        private readonly array $campaignSlugs,
+        private readonly string $freeElectricityCampaignSlug,
     ) {
     }
 
     /**
      * @return array<int, array{kind: string, code: string, start: DateTimeImmutable, end: DateTimeImmutable, alreadyJoined: bool}>
-     *         sorted by start time, filtered to sessions starting on $today or $tomorrow (local)
+     *         sorted by start time, filtered to sessions starting on $today or $tomorrow (local).
+     *         Power down needs only the API key/account number; Fill your boots additionally
+     *         needs the MPAN, and is silently skipped (not an error) if it isn't configured —
+     *         same "degrade quietly" precedent as an empty campaign slug used to be.
      */
     public function getAvailableSessions(DateTimeImmutable $today, DateTimeImmutable $tomorrow, DateTimeZone $timezone): array
     {
-        if ($this->mpan === null || $this->mpan === '') {
-            throw new OctopusFlexException('Octopus account MPAN is required (settings.php) — confirmed live that customerFlexibilityCampaignEvents\' supplyPointIdentifier argument is non-null');
-        }
-
         $todayStr = $today->format('Y-m-d');
         $tomorrowStr = $tomorrow->format('Y-m-d');
+        $inRange = fn(DateTimeImmutable $start) => in_array($start->setTimezone($timezone)->format('Y-m-d'), [$todayStr, $tomorrowStr], true);
 
+        // Power down (backend host) and Fill your boots (main host) are two entirely
+        // independent data sources — one failing (a transient backend outage, a
+        // misconfigured MPAN, whatever) must never silently suppress the other, same
+        // "attempt both, don't let one block the other" reasoning Runner.php already
+        // applies to today's/tomorrow's Octopus price fetch. Caught here rather than by
+        // the caller (index.php) so a partial result is still the class's own contract,
+        // not something every caller has to remember to reassemble.
         $sessions = [];
-        foreach ($this->campaignSlugs as $kind => $slug) {
-            if ($slug === '') {
-                continue;
-            }
-            foreach ($this->queryCampaignEvents($slug) as $event) {
-                $start = new DateTimeImmutable($event['startAt']);
-                $localDate = $start->setTimezone($timezone)->format('Y-m-d');
-                if ($localDate !== $todayStr && $localDate !== $tomorrowStr) {
+        try {
+            foreach ($this->querySavingSessions() as $event) {
+                $start = new DateTimeImmutable($event['start']);
+                if (!$inRange($start)) {
                     continue;
                 }
                 $sessions[] = [
-                    'kind' => $kind,
-                    'code' => (string) $event['code'],
+                    'kind' => 'power_down',
+                    'code' => $event['code'],
                     'start' => $start,
-                    'end' => new DateTimeImmutable($event['endAt']),
-                    'alreadyJoined' => (bool) ($event['isEventParticipant'] ?? false),
+                    'end' => new DateTimeImmutable($event['end']),
+                    'alreadyJoined' => $event['alreadyJoined'],
                 ];
             }
+        } catch (OctopusFlexException $e) {
+            // swallowed deliberately — see comment above; Fill your boots below still runs
         }
+
+        if ($this->mpan !== null && $this->mpan !== '' && $this->freeElectricityCampaignSlug !== '') {
+            try {
+                foreach ($this->queryCampaignEvents($this->freeElectricityCampaignSlug) as $event) {
+                    $start = new DateTimeImmutable($event['startAt']);
+                    if (!$inRange($start)) {
+                        continue;
+                    }
+                    $sessions[] = [
+                        'kind' => 'fill_your_boots',
+                        'code' => (string) $event['code'],
+                        'start' => $start,
+                        'end' => new DateTimeImmutable($event['endAt']),
+                        // No API-side join concept for this kind at all (see class doc
+                        // comment) — index.php ORs this with the local octopus_session_optins
+                        // record, which is the only source of truth that actually applies here.
+                        'alreadyJoined' => false,
+                    ];
+                }
+            } catch (OctopusFlexException $e) {
+                // swallowed deliberately — see comment above
+            }
+        }
+
         usort($sessions, fn($a, $b) => $a['start'] <=> $b['start']);
         return $sessions;
     }
 
-    /** @return array<int, array{code: string, startAt: string, endAt: string, isEventParticipant: ?bool}> */
+    /**
+     * @return array<int, array{code: string, start: string, end: string, alreadyJoined: bool}>
+     *         Filters out dev/test events and zero-reward events, same as
+     *         automator-octopus-energy's own `getSavingSessions()` — a reward of 0
+     *         OctoPoints/kWh isn't a real opt-in opportunity.
+     */
+    private function querySavingSessions(): array
+    {
+        $query = 'query($accountNumber: String!) {
+            savingSessions {
+                events(includeDev: false) { id code startAt endAt rewardPerKwhInOctoPoints devEvent }
+                account(accountNumber: $accountNumber) { joinedEvents { eventId } }
+            }
+        }';
+        $result = $this->graphql(self::BACKEND_URL, $query, ['accountNumber' => $this->accountNumber], 'savingSessions');
+        $data = $result['data']['savingSessions'] ?? null;
+        if ($data === null) {
+            return [];
+        }
+        $joinedIds = array_column($data['account']['joinedEvents'] ?? [], 'eventId');
+
+        $events = [];
+        foreach ($data['events'] ?? [] as $event) {
+            if (($event['devEvent'] ?? false) || (float) ($event['rewardPerKwhInOctoPoints'] ?? 0) <= 0) {
+                continue;
+            }
+            $events[] = [
+                'code' => (string) $event['code'],
+                'start' => $event['startAt'],
+                'end' => $event['endAt'],
+                'alreadyJoined' => in_array($event['id'], $joinedIds, true),
+            ];
+        }
+        return $events;
+    }
+
+    /** @return array<int, array{code: string, startAt: string, endAt: string}> */
     private function queryCampaignEvents(string $slug): array
     {
         $query = 'query($accountNumber: String!, $mpan: String!, $campaignSlug: String!) {
             customerFlexibilityCampaignEvents(accountNumber: $accountNumber, supplyPointIdentifier: $mpan, campaignSlug: $campaignSlug, first: 10) {
-                edges { node { code startAt endAt isEventParticipant } }
+                edges { node { code startAt endAt } }
             }
         }';
-        $result = $this->graphql($query, [
+        $result = $this->graphql(self::MAIN_URL, $query, [
             'accountNumber' => $this->accountNumber,
             'mpan' => $this->mpan,
             'campaignSlug' => $slug,
@@ -122,27 +191,36 @@ class OctopusFlexClient
     }
 
     /**
-     * Deliberately unimplemented — see this class's own doc comment. There is no confirmed
-     * (or even plausible-and-safe-to-guess) mutation for "join this specific event by its
-     * code" in the live schema: `joinSavingSessionsEvent` doesn't exist at all, and the two
-     * real candidates found (`joinOctoplusCampaign`, `addCampaignToAccount`) don't take an
-     * event code/date and look like they enrol in something else entirely. Guessing here
-     * risks a real, hard-to-notice wrong side effect on a real account — worse than a clean
-     * failure — so this throws unconditionally until the real mutation is confirmed (ideally
-     * via a captured real request, see the class doc comment). opt-in.php's existing
-     * error handling already surfaces this correctly: preparation still gets calculated,
-     * saved as an override, and pushed to the inverter(s) — only the final "tell Octopus"
-     * step is blocked.
+     * Joins a Power down (Saving Sessions) event — there is no equivalent for Fill your
+     * boots, which needs no opt-in at all (see class doc comment); callers must not call
+     * this for that kind.
+     *
+     * No idempotency swallowing here (an earlier version guessed that an "already ..."
+     * -worded error meant success) — confirmed live, on a real already-joined event, that
+     * ineligibility (already joined, or too late to join, or anything else) comes back as
+     * errorCode `OE-1308` with the real reason in `extensions.reason`
+     * ("Account cannot join event after the start of the event.", in that test), not an
+     * "already"-worded message. Guessing which OE-1308 reasons are safe to swallow risks
+     * masking a genuine failure as success, so every error is surfaced honestly to the
+     * caller instead — getAvailableSessions() already excludes sessions the account has
+     * joined, so an OE-1308 here in practice means something unexpected happened between
+     * that check and this call, which is worth surfacing, not hiding.
      */
-    public function joinSession(string $kind, string $code): void
+    public function joinSession(string $code): void
     {
-        throw new OctopusFlexException(sprintf(
-            'Octopus\'s join-session mutation has not been confirmed yet (see CLAUDE.md\'s '
-            . '"Octopus opt-in sessions" section and OctopusFlexClient\'s own doc comment) — '
-            . 'opt in manually via the Octopus app for the %s event %s for now.',
-            $kind,
-            $code,
-        ));
+        $mutation = 'mutation($accountNumber: String!, $eventCode: String!) {
+            joinSavingSessionsEvent(input: {accountNumber: $accountNumber, eventCode: $eventCode}) {
+                joinedEventCodes
+            }
+        }';
+        $result = $this->graphql(self::BACKEND_URL, $mutation, [
+            'accountNumber' => $this->accountNumber,
+            'eventCode' => $code,
+        ], 'joinSavingSessionsEvent');
+        $joinedCodes = $result['data']['joinSavingSessionsEvent']['joinedEventCodes'] ?? [];
+        if (!in_array($code, $joinedCodes, true)) {
+            throw new OctopusFlexException("Octopus's join call for $code succeeded but didn't confirm it as joined (returned: " . implode(', ', $joinedCodes) . ')');
+        }
     }
 
     private function authenticate(): string
@@ -151,7 +229,7 @@ class OctopusFlexClient
             return $this->token;
         }
         $query = 'mutation($apiKey: String!) { obtainKrakenToken(input: {APIKey: $apiKey}) { token } }';
-        $result = $this->graphql($query, ['apiKey' => $this->apiKey], 'obtainKrakenToken', skipAuth: true);
+        $result = $this->graphql(self::MAIN_URL, $query, ['apiKey' => $this->apiKey], 'obtainKrakenToken', skipAuth: true);
         $token = $result['data']['obtainKrakenToken']['token'] ?? null;
         if (!is_string($token) || $token === '') {
             throw new OctopusFlexException('Octopus GraphQL authentication succeeded but returned no token');
@@ -160,32 +238,37 @@ class OctopusFlexClient
     }
 
     /**
-     * The one choke point every GraphQL call goes through — logged via
-     * Store::saveApiLogEntry() exactly like FoxessClient::post(), so these calls show up
-     * in the same api-log.php page/table, distinguished by their $operationLabel (e.g.
-     * `graphql:customerFlexibilityCampaignEvents:free_electricity`) rather than a URL
-     * path, since every GraphQL call hits the same URL. Single retry on transient network
-     * failure only, no backoff — same rule OctopusClient::httpGet()/FoxessClient::post()
-     * already follow (spec §12).
+     * The one choke point every GraphQL call goes through (against either host) — logged
+     * via Store::saveApiLogEntry() exactly like FoxessClient::post(), so these calls show
+     * up in the same api-log.php page/table, distinguished by their $operationLabel (e.g.
+     * `graphql:savingSessions`) rather than a URL path, since every call to a given host
+     * hits the same URL. Single retry on transient network failure only, no backoff — same
+     * rule OctopusClient::httpGet()/FoxessClient::post() already follow (spec §12).
      */
-    protected function graphql(string $query, array $variables, string $operationLabel, bool $skipAuth = false, bool $isRetry = false): array
+    protected function graphql(string $url, string $query, array $variables, string $operationLabel, bool $skipAuth = false, bool $isRetry = false): array
     {
         $headers = ['Content-Type: application/json'];
         if (!$skipAuth) {
-            // "JWT " prefix is the standard Kraken/Octopus convention — see this class's
-            // own doc comment for why it hasn't actually been exercised against a real,
-            // successfully-authenticated token yet.
-            $headers[] = 'Authorization: JWT ' . $this->authenticate();
+            // Bare token, not "JWT <token>" — confirmed against automator-octopus-energy's
+            // own code (real, currently-running against this exact backend host), which
+            // comments this explicitly. See this class's own doc comment.
+            $headers[] = 'Authorization: ' . $this->authenticate();
         }
 
         $body = json_encode(['query' => $query, 'variables' => $variables]);
-        $ch = curl_init(self::BASE_URL);
+        $ch = curl_init($url);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => 20,
             CURLOPT_POST => true,
             CURLOPT_POSTFIELDS => $body,
             CURLOPT_HTTPHEADER => $headers,
+            // Confirmed live: api.backend.octopus.energy's edge/WAF returns a plain 403
+            // (no GraphQL body at all) to a request with no User-Agent — PHP's cURL sends
+            // none by default, unlike the `curl` CLI tool, which is why manual curl-based
+            // spikes against this same host never hit this. automator-octopus-energy's own
+            // code sets one for exactly this host for what's presumably the same reason.
+            CURLOPT_USERAGENT => 'foxhole/1.0 (+https://github.com/almcnicoll/foxhole)',
         ]);
         $raw = curl_exec($ch);
         $errno = curl_errno($ch);
@@ -203,7 +286,7 @@ class OctopusFlexClient
 
         if ($errno !== 0) {
             if (!$isRetry) {
-                return $this->graphql($query, $variables, $operationLabel, $skipAuth, true);
+                return $this->graphql($url, $query, $variables, $operationLabel, $skipAuth, true);
             }
             throw new OctopusFlexException("cURL error calling Octopus GraphQL ($operationLabel): $error");
         }
@@ -215,10 +298,17 @@ class OctopusFlexClient
             throw new OctopusFlexException("Octopus GraphQL ($operationLabel) returned non-JSON response: $raw");
         }
         if (!empty($decoded['errors'])) {
+            $firstError = $decoded['errors'][0];
+            // errorCode/reason (e.g. OE-1308, "Account cannot join event after the start
+            // of the event.") carry the actually-useful detail for join failures — plain
+            // `message` alone can be a generic "ineligible" wrapper. Confirmed live
+            // against a real, already-past Saving Sessions event.
+            $detail = array_filter([$firstError['extensions']['errorCode'] ?? null, $firstError['extensions']['reason'] ?? null]);
             throw new OctopusFlexException(sprintf(
-                'Octopus GraphQL (%s) error: %s',
+                'Octopus GraphQL (%s) error: %s%s',
                 $operationLabel,
-                $decoded['errors'][0]['message'] ?? 'unknown',
+                $firstError['message'] ?? 'unknown',
+                $detail ? ' [' . implode(' — ', $detail) . ']' : '',
             ));
         }
 
