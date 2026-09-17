@@ -355,6 +355,22 @@ fieldset {
     color: var(--color-error);
 }
 
+.optin-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+.optin-row + .optin-row {
+    margin-top: 0.5rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--color-warning);
+}
+.optin-row form {
+    margin: 0;
+}
+
 .page-header {
     display: flex;
     justify-content: space-between;

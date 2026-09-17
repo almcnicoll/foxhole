@@ -17,3 +17,7 @@ class FoxessPushException extends RuntimeException
 class SolarForecastException extends RuntimeException
 {
 }
+
+class OctopusFlexException extends RuntimeException
+{
+}

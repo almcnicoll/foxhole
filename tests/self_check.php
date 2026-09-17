@@ -19,6 +19,8 @@ require_once __DIR__ . '/../src/PriceProvider.php';
 require_once __DIR__ . '/../src/FoxessClient.php';
 require_once __DIR__ . '/../src/HistoryFetcher.php';
 require_once __DIR__ . '/../src/Runner.php';
+require_once __DIR__ . '/../src/OctopusFlexClient.php';
+require_once __DIR__ . '/../src/SessionOptIn.php';
 
 $failures = 0;
 $checks = 0;
@@ -1823,6 +1825,142 @@ $noLeakForced = buildForcedActionsFromOverrides($noLeakSlots, $overrideTz);
 check($noLeakForced === [null, null], "2026-04-02's fill_your_boots override doesn't leak into 2026-04-05's slots: got " . json_encode($noLeakForced));
 
 check(overrideWindowInstants('2026-04-06', $overrideTz, '10:00', '10:00', 'ForceCharge') === null, 'an empty/invalid override window (end <= start) is ignored rather than corrupting the forced-actions array');
+
+// --- Store: Octopus account settings + local opt-in tracking (octopus_session_optins) ---
+check(getOctopusAccountConfig() === ['api_key' => '', 'account_number' => '', 'mpan' => null], 'getOctopusAccountConfig() defaults to empty/null with nothing saved');
+setSetting('octopus_account_api_key', 'sk_test_123');
+setSetting('octopus_account_number', 'A-1234');
+check(getOctopusAccountConfig() === ['api_key' => 'sk_test_123', 'account_number' => 'A-1234', 'mpan' => null], 'getOctopusAccountConfig() reflects saved credentials, mpan stays null when never saved');
+setSetting('octopus_mpan', '1200000123456');
+check(getOctopusAccountConfig()['mpan'] === '1200000123456', 'mpan round-trips once saved');
+
+check(isSessionOptedIn('EVT-1') === false, 'no opt-in record yet for an unknown event code');
+recordSessionOptIn('EVT-1', 'power_down', '2026-04-10', new DateTimeImmutable('2026-04-09 12:00:00'));
+check(isSessionOptedIn('EVT-1') === true, 'recordSessionOptIn() makes isSessionOptedIn() true for that event code');
+recordSessionOptIn('EVT-1', 'power_down', '2026-04-10', new DateTimeImmutable('2026-04-09 13:00:00'));
+check(isSessionOptedIn('EVT-1') === true, 're-recording the same event code upserts rather than duplicating/erroring');
+recordSessionOptIn('EVT-OLD', 'fill_your_boots', '2020-01-01', new DateTimeImmutable('2020-01-01'));
+pruneOldSessionOptIns('2026-01-01');
+check(isSessionOptedIn('EVT-OLD') === false, 'pruneOldSessionOptIns() removes records for dates before the given cutoff');
+check(isSessionOptedIn('EVT-1') === true, 'pruneOldSessionOptIns() leaves current/future dates alone');
+
+// --- SessionOptIn: calculateOptInPrep() — pure prep-window math for opt-in.php's
+// single-click flow. $battery here (capacity 10kWh, 3kW charge/discharge, reserve 15%)
+// is the same fixture already defined above for the ScheduleBuilder/override tests.
+$prepTz = new DateTimeZone('Europe/London');
+
+check(
+    calculateOptInPrep('power_down', new DateTimeImmutable('2026-04-10 18:00', $prepTz), 100.0, $battery, new DateTimeImmutable('2026-04-10 08:00', $prepTz), $prepTz) === null,
+    'power_down needs no prep when the battery is already at 100%',
+);
+$powerDownPrep = calculateOptInPrep('power_down', new DateTimeImmutable('2026-04-10 18:00', $prepTz), 40.0, $battery, new DateTimeImmutable('2026-04-10 08:00', $prepTz), $prepTz);
+check(
+    $powerDownPrep !== null && $powerDownPrep['start']->format('H:i') === '16:00' && $powerDownPrep['end']->format('H:i') === '18:00' && $powerDownPrep['clamped'] === false,
+    'power_down at 40% SoC needs (100-40)/100*10kWh / 3kW = 2h of ForceCharge prep immediately before the event: got ' . json_encode($powerDownPrep ? [$powerDownPrep['start']->format('H:i'), $powerDownPrep['end']->format('H:i')] : null),
+);
+
+check(
+    calculateOptInPrep('fill_your_boots', new DateTimeImmutable('2026-04-10 12:00', $prepTz), 10.0, $battery, new DateTimeImmutable('2026-04-10 08:00', $prepTz), $prepTz) === null,
+    'fill_your_boots needs no prep when the battery is already at/below the reserve SoC floor',
+);
+$bootsPrep = calculateOptInPrep('fill_your_boots', new DateTimeImmutable('2026-04-10 12:00', $prepTz), 80.0, $battery, new DateTimeImmutable('2026-04-10 08:00', $prepTz), $prepTz);
+check(
+    $bootsPrep !== null && $bootsPrep['start']->format('H:i') === '09:30' && $bootsPrep['end']->format('H:i') === '12:00' && $bootsPrep['clamped'] === false,
+    'fill_your_boots at 80% SoC needs (80-15)/100*10kWh / 3kW = 2.1667h, rounded up to 2.5h of ForceDischarge prep: got ' . json_encode($bootsPrep ? [$bootsPrep['start']->format('H:i'), $bootsPrep['end']->format('H:i')] : null),
+);
+
+// The naturally-required prep would start the day before the event (01:00 minus 3h) —
+// clamped to local midnight of the event's own date instead, since the override system
+// can't express a window spanning midnight.
+$clampedPrep = calculateOptInPrep('fill_your_boots', new DateTimeImmutable('2026-04-10 01:00', $prepTz), 95.0, $battery, new DateTimeImmutable('2026-04-09 20:00', $prepTz), $prepTz);
+check(
+    $clampedPrep !== null && $clampedPrep['start']->format('Y-m-d H:i') === '2026-04-10 00:00' && $clampedPrep['end']->format('H:i') === '01:00' && $clampedPrep['clamped'] === true,
+    'a prep window that would need to start before local midnight is clamped to midnight instead, and flagged as clamped: got ' . json_encode($clampedPrep),
+);
+
+// $now already past the point where prep would need to start (and past the event itself)
+// leaves no usable prep window at all.
+check(
+    calculateOptInPrep('power_down', new DateTimeImmutable('2026-04-10 18:00', $prepTz), 40.0, $battery, new DateTimeImmutable('2026-04-10 18:30', $prepTz), $prepTz) === null,
+    'no prep window is returned once $now is already past the event start',
+);
+
+// --- OctopusFlexClient: getAvailableSessions()/joinSession() — scripted to intercept the
+// protected graphql() choke point, same subclassing technique as FoxessClient::post()'s
+// tests above. Never touches the network.
+class ScriptedOctopusFlexClient extends OctopusFlexClient
+{
+    public array $calls = [];
+
+    /** @param array<string, array> $scripted operationLabel => either a full {data:...} response, or ['throw' => 'message'] */
+    public function __construct(
+        private readonly array $scripted,
+        array $campaignSlugs = ['power_down' => 'saving_sessions', 'fill_your_boots' => 'free_electricity'],
+    ) {
+        parent::__construct('key', 'ACC-1', null, $campaignSlugs);
+    }
+
+    protected function graphql(string $query, array $variables, string $operationLabel, bool $skipAuth = false, bool $isRetry = false): array
+    {
+        // Intercepts the same choke point every real call (including authenticate()'s own
+        // obtainKrakenToken call) goes through, same subclassing technique as
+        // FoxessClient::post()'s tests above — authenticate() itself never actually runs.
+        $this->calls[] = $operationLabel;
+        if (!array_key_exists($operationLabel, $this->scripted)) {
+            throw new OctopusFlexException("unscripted call: $operationLabel");
+        }
+        $entry = $this->scripted[$operationLabel];
+        if (isset($entry['throw'])) {
+            throw new OctopusFlexException($entry['throw']);
+        }
+        return $entry;
+    }
+}
+
+$flexTz = new DateTimeZone('Europe/London');
+$flexToday = new DateTimeImmutable('2026-05-01', $flexTz);
+$flexTomorrow = $flexToday->modify('+1 day');
+
+$sessionsClient = new ScriptedOctopusFlexClient([
+    'customerFlexibilityCampaignEvents:free_electricity' => ['data' => ['customerFlexibilityCampaignEvents' => ['edges' => [
+        ['node' => ['code' => 'FE-TODAY', 'startAt' => '2026-05-01T10:00:00Z', 'endAt' => '2026-05-01T12:00:00Z']],
+        ['node' => ['code' => 'FE-FAR', 'startAt' => '2026-05-10T10:00:00Z', 'endAt' => '2026-05-10T12:00:00Z']],
+    ]]]],
+    'customerFlexibilityCampaignEvents:saving_sessions' => ['data' => ['customerFlexibilityCampaignEvents' => ['edges' => [
+        ['node' => ['code' => 'PD-TOMORROW', 'startAt' => '2026-05-02T17:00:00Z', 'endAt' => '2026-05-02T19:00:00Z']],
+    ]]]],
+]);
+$flexSessions = $sessionsClient->getAvailableSessions($flexToday, $flexTomorrow, $flexTz);
+check(count($flexSessions) === 2, 'getAvailableSessions() filters out an event further ahead than today/tomorrow: got ' . count($flexSessions));
+check($flexSessions[0]['code'] === 'FE-TODAY' && $flexSessions[0]['kind'] === 'fill_your_boots', 'today\'s fill_your_boots event is included and correctly labelled');
+check($flexSessions[1]['code'] === 'PD-TOMORROW' && $flexSessions[1]['kind'] === 'power_down', 'tomorrow\'s power_down event is included, sorted after today\'s by start time');
+
+$noPowerDownClient = new ScriptedOctopusFlexClient(
+    ['customerFlexibilityCampaignEvents:free_electricity' => ['data' => ['customerFlexibilityCampaignEvents' => ['edges' => []]]]],
+    ['power_down' => '', 'fill_your_boots' => 'free_electricity'],
+);
+$noPowerDownClient->getAvailableSessions($flexToday, $flexTomorrow, $flexTz);
+check(
+    !in_array('customerFlexibilityCampaignEvents:saving_sessions', $noPowerDownClient->calls, true),
+    'a kind with an empty/unconfigured campaign slug (power_down here) is skipped entirely, never queried: got ' . json_encode($noPowerDownClient->calls),
+);
+
+try {
+    (new ScriptedOctopusFlexClient(['joinSavingSessionsEvent:power_down' => [
+        'throw' => 'Octopus GraphQL (joinSavingSessionsEvent:power_down) error: Account is already signed up for this event',
+    ]]))->joinSession('power_down', 'PD-123');
+    check(true, 'joinSession() swallows an "already ..." error as success (idempotent for a double-click/two-tab race)');
+} catch (OctopusFlexException $e) {
+    check(false, 'joinSession() should not throw for an "already ..." error, got: ' . $e->getMessage());
+}
+try {
+    (new ScriptedOctopusFlexClient(['joinSavingSessionsEvent:fill_your_boots' => [
+        'throw' => 'Octopus GraphQL (joinSavingSessionsEvent:fill_your_boots) error: Saving Sessions event not found',
+    ]]))->joinSession('fill_your_boots', 'FE-999');
+    check(false, 'joinSession() should propagate a genuine (non-"already") error');
+} catch (OctopusFlexException $e) {
+    check(str_contains($e->getMessage(), 'not found'), 'the underlying error message is preserved: got ' . $e->getMessage());
+}
 
 if ($failures > 0) {
     fwrite(STDERR, "\n$failures/$checks checks failed\n");

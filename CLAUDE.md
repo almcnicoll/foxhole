@@ -30,6 +30,7 @@ config.example.php    # template, safe to commit
 run.php               # cron entry point (CLI-only, supports --dry-run/--classic/--intelligent)
 run-now.php           # manual trigger for the same pipeline (login-only, POST-only)
 cron.php              # web-triggerable cron alternative (secret-token-gated, GET) for hosts with no CLI cron
+opt-in.php            # one-click Octopus opt-in-session flow (login-only, POST-only), see "Octopus opt-in sessions" below
 index.php             # dashboard (password-walled)
 login.php / logout.php
 settings.php          # FoxESS credentials + system password form (password-walled)
@@ -57,6 +58,8 @@ src/
   Schedulers.php        # pluggable scheduler registry — see "Pluggable schedulers" below
   FoxessClient.php      # signs + sends requests to the FoxESS OpenAPI
   HistoryFetcher.php    # backfills/catches up historic_generation (generation + usage) from FoxESS's report/query endpoint
+  OctopusFlexClient.php # opt-in-sessions GraphQL client (api.octopus.energy/v1/graphql/), see "Octopus opt-in sessions" below
+  SessionOptIn.php      # calculateOptInPrep() — pure prep-window maths for opt-in.php
 tests/
   self_check.php        # standalone assert-style test for ScheduleBuilder/CostBasisProvider/Store
 logs/
@@ -1003,6 +1006,97 @@ schedule and pushes it, whether or not any override remains, exactly like
 `runScheduler()` already does regardless of whether a day has an override.
 `override.php` already called `reapplyOverrides()` unconditionally after
 every save/delete; the bug was entirely on this function's side.
+
+**Octopus opt-in sessions: dashboard banner + one-click opt-in
+(user-requested).** Octopus runs ad-hoc opt-in events — "Power down" (Saving
+Sessions: use less, get paid) and "Fill your boots" (Free Electricity/Power
+Up: use more, it's free/cheap) — the exact same two kinds `overrides`/
+`ScheduleBuilder::overrideModesFor()` already model, previously only
+enterable by hand via `override.php` once the user noticed one had been
+announced. This feature adds a header banner on `index.php` (today/tomorrow
+only) with an "Opt in" button, and a single-click flow
+(`opt-in.php`, POST-only/login-gated like `run-now.php`) that: reads live
+battery SoC, computes how much prep (force-charge before Power down,
+force-discharge before Fill your boots) is needed to reach the right target
+before the event, saves it as a normal override
+(`Store::saveOverride()`) and pushes it (`reapplyOverrides()` — 100% reused,
+no new push logic), and only then calls Octopus's own join API — never
+opting in if the push failed on any inverter. Explicit scope decisions,
+confirmed with the user before building:
+
+- **Manual button only, no cron-driven auto-opt-in.** The ask was a
+  single-click dashboard action, not unattended automation — worth
+  revisiting later, but a separate conversation.
+- **Ad-hoc sessions only** — not Octopus's separate "Weekend Happy Hour"
+  booking mechanism (a different API shape: booking a future slot ahead of
+  time, not joining an announced event).
+- **Fail closed on unknown battery SoC.** If live SoC can't be read when
+  "Opt in" is clicked, the whole flow aborts with a warning — no override
+  saved, no join call made. Never guess at battery state for something
+  that costs/earns real money.
+
+`src/SessionOptIn.php`'s `calculateOptInPrep()` is the prep-duration maths,
+a pure function (same "small, testable, no DB/network" precedent as
+`Schedulers.php`'s `modellingWindowEnd()`): energy needed is capacity ×
+the SoC gap to the target (100% for Power down, `reserve_soc` for Fill your
+boots — the same floor `overrideModesFor()`'s own `ForceDischarge` prep
+already targets), duration is that energy over the relevant max charge/
+discharge power, rounded up to the nearest half hour. If the naturally
+required start falls before local midnight of the event's own date, it's
+clamped to that midnight instead (less prep than ideal, not a crash) — the
+override system has no way to express a window spanning midnight, same
+limitation `override.php`'s own UI already has.
+
+`src/OctopusFlexClient.php` talks to Octopus's GraphQL API
+(`api.octopus.energy/v1/graphql/`) — confirmed live: auth is
+`obtainKrakenToken(input: {APIKey: $key})` (the input field is `APIKey`,
+not `apiKey` — confirmed by the API's own error message correcting the
+casing), and `customerFlexibilityCampaignEvents(accountNumber,
+supplyPointIdentifier, campaignSlug, first)` returning
+`edges.node.{code, startAt, endAt}` is the right shape for Free
+Electricity/Power Up (`campaignSlug: "free_electricity"`) specifically.
+**Not confirmed, and needing live verification before trusting this in
+production** (a live spike attempted while building this failed on an
+invalid API key before any of the below could be checked — same
+"best-effort guess, don't trust inference blindly" territory as `fdSoc`/
+`fdPwr`):
+
+- The campaign slug for Power Down/Saving Sessions (`config.php`'s
+  `octopus.flex_campaign_slugs['power_down']`, currently a guess —
+  `saving_sessions` — since Power Down predates the Free Electricity
+  GraphQL rollout and may use a different query shape entirely, not just a
+  different slug on the same query).
+- Whether `supplyPointIdentifier` (MPAN) is actually required, or the
+  account number alone is sufficient — asked for in `settings.php` but
+  optional, passed as `null` when not configured.
+- The real join mutation name/input shape for either campaign — best guess
+  is `joinSavingSessionsEvent(input: {accountNumber, eventCode})`, per
+  `BottlecapDave/HomeAssistant-OctopusEnergy`'s own service parameters
+  (`event_code`); may need splitting into two mutations once confirmed.
+
+`joinSession()` treats any "already ..."-shaped GraphQL error as success
+rather than a failure, so a double-click or two open tabs can't surface a
+spurious warning for something that's already true. Every GraphQL call is
+logged via the existing `Store::saveApiLogEntry()` choke point (same table/
+page as FoxESS calls, distinguished by an endpoint string like
+`graphql:customerFlexibilityCampaignEvents:free_electricity` instead of a
+URL path, since every GraphQL call hits the same URL) — confirmed live that
+Octopus, like FoxESS, wraps GraphQL errors inside an HTTP 200 response
+(a dummy API key produced a 200 with an `errors` array, not a 4xx), so the
+existing "don't trust the status code alone" api-log handling applies here
+too.
+
+"Opted in" state is tracked purely locally (`octopus_session_optins`,
+`Store::recordSessionOptIn()`/`isSessionOptedIn()`) rather than trusting an
+API-side join-status field, since whether Octopus's API even exposes one
+per event hasn't been confirmed live either — this table is the one source
+of truth this app fully controls. Octopus account credentials
+(`octopus_account_api_key`/`octopus_account_number`/`octopus_mpan`) live in
+the settings table via `Store::getOctopusAccountConfig()`, same "secrets
+belong in the settings table, not config.php" reasoning as
+`foxess_api_key` — entirely optional, and the banner simply doesn't appear
+if they're unset, same degrade-quietly precedent as the solar forecast's
+`solar_enabled` gate.
 
 **A group ending at literal 0:00 collides with the next group starting at
 0:00 — FoxESS's v2 `scheduler/enable` doesn't treat that as "end of day"

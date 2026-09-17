@@ -6,6 +6,7 @@ require_once __DIR__ . '/src/Auth.php';
 require_once __DIR__ . '/src/Layout.php';
 require_once __DIR__ . '/src/FoxessClient.php';
 require_once __DIR__ . '/src/HalfHourlyUsageEstimator.php';
+require_once __DIR__ . '/src/OctopusFlexClient.php';
 
 requireLogin();
 
@@ -16,6 +17,25 @@ $timezone = new DateTimeZone($config['strategy']['timezone'] ?? 'Europe/London')
 // migration fallback for whichever keys haven't been saved via settings.php yet.
 $minSoc = (float) getBatteryConfig($config['battery'] ?? [])['min_soc_on_grid'];
 $today = new DateTimeImmutable('today', $timezone);
+$tomorrow = $today->modify('+1 day');
+
+// Opt-in sessions banner (Power down / Fill your boots) — best-effort, degrades quietly
+// like the battery SoC reads below: an unconfigured Octopus account or a failed live
+// call means no banner, never a broken dashboard. See CLAUDE.md and src/OctopusFlexClient.php.
+$octopusAccountConfig = getOctopusAccountConfig();
+$optInSessions = [];
+if ($octopusAccountConfig['api_key'] !== '' && $octopusAccountConfig['account_number'] !== '') {
+    try {
+        $optInSessions = (new OctopusFlexClient(
+            $octopusAccountConfig['api_key'],
+            $octopusAccountConfig['account_number'],
+            $octopusAccountConfig['mpan'],
+            $config['octopus']['flex_campaign_slugs'] ?? [],
+        ))->getAvailableSessions($today, $tomorrow, $timezone);
+    } catch (OctopusFlexException $e) {
+        $optInSessions = [];
+    }
+}
 
 // GitHub issue #4 ("Date-time-aware scheduling"): shows every currently-known day's
 // prices and schedule, not just a single fetched batch — price_slots is a permanent,
@@ -535,7 +555,53 @@ function renderBatteryStatus(array $batterySocs, float $minSoc): string
     return "<div class=\"battery-status\">$items</div>";
 }
 
+/**
+ * One row per available opt-in session (today/tomorrow only — see the data-gathering
+ * above), each either a "Opt in" button (POSTs to opt-in.php, the single-click flow
+ * documented in CLAUDE.md) or an "Opted in" badge if Store::isSessionOptedIn() already
+ * has a record for it. "Opted in" state is tracked purely locally — see
+ * octopus_session_optins in Store.php — since whether Octopus's own API exposes a
+ * per-event join-status field hasn't been confirmed live.
+ *
+ * @param array<int, array{kind: string, code: string, start: DateTimeImmutable, end: DateTimeImmutable}> $sessions
+ */
+function renderOptInBanner(array $sessions, DateTimeZone $timezone): void
+{
+    if (!$sessions) {
+        return;
+    }
+    $labels = ['power_down' => 'Power down', 'fill_your_boots' => 'Fill your boots'];
+    ?>
+<div class="alert alert-warning optin-banner">
+    <?php foreach ($sessions as $session):
+        $label = $labels[$session['kind']] ?? $session['kind'];
+        $localStart = $session['start']->setTimezone($timezone);
+        $localEnd = $session['end']->setTimezone($timezone);
+        $window = $localStart->format('D j M, H:i') . '–' . $localEnd->format('H:i');
+        $optedIn = isSessionOptedIn($session['code']);
+    ?>
+    <div class="optin-row">
+        <span><strong><?= htmlspecialchars($label) ?></strong> available <?= htmlspecialchars($window) ?></span>
+        <?php if ($optedIn): ?>
+        <span class="badge badge-active">Opted in</span>
+        <?php else: ?>
+        <form method="post" action="opt-in.php">
+            <input type="hidden" name="kind" value="<?= htmlspecialchars($session['kind']) ?>">
+            <input type="hidden" name="code" value="<?= htmlspecialchars($session['code']) ?>">
+            <input type="hidden" name="event_start" value="<?= htmlspecialchars($session['start']->format(DATE_ATOM)) ?>">
+            <input type="hidden" name="event_end" value="<?= htmlspecialchars($session['end']->format(DATE_ATOM)) ?>">
+            <button type="submit">Opt in</button>
+        </form>
+        <?php endif; ?>
+    </div>
+    <?php endforeach; ?>
+</div>
+    <?php
+}
+
 renderHeader('Dashboard', headerExtra: renderBatteryStatus($batterySocs, $minSoc));
+
+renderOptInBanner($optInSessions, $timezone);
 
 $ran = $_GET['ran'] ?? null;
 $ranOk = ($_GET['ok'] ?? null) === '1';

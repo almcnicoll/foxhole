@@ -8,6 +8,16 @@ return [
         // default 'fixed' — Octopus's half-hourly outgoing (export/sale) tariff.
         'export_product_code' => 'AGILE-OUTGOING-19-05-13',
         'export_tariff_code'  => 'E-1R-AGILE-OUTGOING-19-05-13-C',
+        // Campaign slugs for the opt-in-sessions GraphQL API (src/OctopusFlexClient.php).
+        // 'free_electricity' is confirmed live for Fill your boots; 'saving_sessions' for
+        // Power down is an unconfirmed guess — verify against a real account (a live spike
+        // attempted while building this failed on an invalid API key before it could be
+        // checked) and correct it here if it's wrong. An empty slug skips that kind
+        // entirely rather than guessing further.
+        'flex_campaign_slugs' => [
+            'fill_your_boots' => 'free_electricity',
+            'power_down' => 'saving_sessions',
+        ],
     ],
     'foxess' => [
         // api_key / device_sn are no longer set here — enter them via settings.php,

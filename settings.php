@@ -52,6 +52,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!$deviceSns) {
         $errors[] = 'At least one device serial number is required.';
     }
+
+    $octopusAccountApiKey = trim((string) ($_POST['octopus_account_api_key'] ?? ''));
+    $octopusAccountNumber = trim((string) ($_POST['octopus_account_number'] ?? ''));
+    $octopusMpan = trim((string) ($_POST['octopus_mpan'] ?? ''));
     if ($newPassword !== '' || $confirmPassword !== '') {
         if ($newPassword !== $confirmPassword) {
             $errors[] = 'New password and confirmation do not match.';
@@ -110,6 +114,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (!$errors) {
         setSetting('foxess_api_key', $apiKey);
         setSetting('foxess_device_sns', implode("\n", $deviceSns));
+        setSetting('octopus_account_api_key', $octopusAccountApiKey);
+        setSetting('octopus_account_number', $octopusAccountNumber);
+        setSetting('octopus_mpan', $octopusMpan);
         foreach ($priceKinds as $kind => [$defaultMode, $defaultFixed]) {
             setSetting("{$kind}_price_mode", $priceModes[$kind]);
             if ($priceModes[$kind] === 'fixed') {
@@ -138,6 +145,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 } else {
     $apiKey = getSetting('foxess_api_key', '');
+    $octopusAccountApiKey = getSetting('octopus_account_api_key', '');
+    $octopusAccountNumber = getSetting('octopus_account_number', '');
+    $octopusMpan = getSetting('octopus_mpan', '');
     // foxess_device_sn (singular) is the pre-multi-inverter key — fall back to it once,
     // purely so an existing single value shows up as a starting point instead of a blank
     // box the first time this page loads after the upgrade.
@@ -198,6 +208,22 @@ renderHeader('Settings');
         <input type="text" id="api_key" name="api_key" value="<?= htmlspecialchars($apiKey) ?>" required>
         <label for="device_sns">Device serial numbers (one per line — the same schedule is pushed to each)</label>
         <textarea id="device_sns" name="device_sns" rows="3" required><?= htmlspecialchars($deviceSnsRaw) ?></textarea>
+    </fieldset>
+
+    <fieldset>
+        <legend>Octopus account</legend>
+        <p class="muted">Optional — only needed for the dashboard's opt-in session banner ("Power down"/"Fill your
+            boots"). Leave blank to hide that banner entirely. Your account API key is on
+            <a href="https://octopus.energy/dashboard/developer/" target="_blank" rel="noopener">Octopus's developer
+                dashboard</a> — separate from the FoxESS key above.</p>
+        <label for="octopus_account_api_key">API key</label>
+        <input type="text" id="octopus_account_api_key" name="octopus_account_api_key"
+            value="<?= htmlspecialchars($octopusAccountApiKey) ?>">
+        <label for="octopus_account_number">Account number</label>
+        <input type="text" id="octopus_account_number" name="octopus_account_number"
+            value="<?= htmlspecialchars($octopusAccountNumber) ?>">
+        <label for="octopus_mpan">MPAN (optional — leave blank unless opt-in session lookups fail without it)</label>
+        <input type="text" id="octopus_mpan" name="octopus_mpan" value="<?= htmlspecialchars($octopusMpan) ?>">
     </fieldset>
 
     <fieldset>

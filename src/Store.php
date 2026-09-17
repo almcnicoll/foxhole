@@ -131,6 +131,19 @@ function db(?string $overridePath = null): PDO
         prep_end TEXT,
         PRIMARY KEY (for_date, kind)
     )");
+    // Our own local record of "we already told Octopus we're in" for an opt-in session
+    // (see src/OctopusFlexClient.php, opt-in.php). Needed regardless of whether Octopus's
+    // own API exposes a per-event join-status field, since that hasn't been confirmed
+    // live (see CLAUDE.md) — this table is the one source of truth this app fully
+    // controls for rendering the dashboard's "Opted in" badge. event_code is Octopus's
+    // own identifier for the session, so it's naturally the primary key — one opt-in per
+    // event, ever.
+    $pdo->exec('CREATE TABLE IF NOT EXISTS octopus_session_optins (
+        event_code TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        for_date TEXT NOT NULL,
+        opted_at TEXT NOT NULL
+    )');
     // Deliberately not disposable, same reasoning as historic_generation — this table
     // exists specifically to answer "what did we actually send/receive, over time," so
     // rows are never deleted. Only the request_body/response_body columns get redacted
@@ -209,6 +222,27 @@ function getModellingConfig(): array
     return [
         'soc_bin_kwh' => (float) (getSetting('modelling_soc_bin_kwh') ?? '0.1'),
         'min_end_soc_pct' => (int) (getSetting('modelling_min_end_soc_pct') ?? '20'),
+    ];
+}
+
+/**
+ * Octopus account credentials for the GraphQL opt-in-sessions API (src/OctopusFlexClient.php)
+ * — distinct from config.php's octopus.product_code/tariff_code (non-secret, not
+ * user-specific) the same way foxess_api_key is distinct from foxess.base_url: these are
+ * the user's own account secrets, so they live in the settings table, editable from
+ * settings.php, never in a file only editable via SSH/FTP. mpan is optional — whether
+ * Octopus's flexibility-campaign query actually requires a supply point identifier
+ * alongside the account number hasn't been confirmed live (see CLAUDE.md), so it's asked
+ * for but not required.
+ *
+ * @return array{api_key: string, account_number: string, mpan: ?string}
+ */
+function getOctopusAccountConfig(): array
+{
+    return [
+        'api_key' => getSetting('octopus_account_api_key', ''),
+        'account_number' => getSetting('octopus_account_number', ''),
+        'mpan' => getSetting('octopus_mpan') ?: null,
     ];
 }
 
@@ -602,6 +636,32 @@ function getOverridesForDate(string $forDate): array
 function pruneOldOverrides(string $today): void
 {
     db()->prepare('DELETE FROM overrides WHERE for_date < ?')->execute([$today]);
+}
+
+/** Records a successful Octopus opt-in join — see octopus_session_optins in db(). */
+function recordSessionOptIn(string $eventCode, string $kind, string $forDate, DateTimeImmutable $optedAt): void
+{
+    $stmt = db()->prepare('INSERT INTO octopus_session_optins (event_code, kind, for_date, opted_at) VALUES (:event_code, :kind, :for_date, :opted_at)
+        ON CONFLICT(event_code) DO UPDATE SET opted_at = excluded.opted_at');
+    $stmt->execute([
+        'event_code' => $eventCode,
+        'kind' => $kind,
+        'for_date' => $forDate,
+        'opted_at' => $optedAt->format(DATE_ATOM),
+    ]);
+}
+
+function isSessionOptedIn(string $eventCode): bool
+{
+    $stmt = db()->prepare('SELECT 1 FROM octopus_session_optins WHERE event_code = ?');
+    $stmt->execute([$eventCode]);
+    return $stmt->fetchColumn() !== false;
+}
+
+/** Same date-linked reasoning as pruneOldOverrides() — an opt-in record for a date that's passed can never match a future banner check again. */
+function pruneOldSessionOptIns(string $today): void
+{
+    db()->prepare('DELETE FROM octopus_session_optins WHERE for_date < ?')->execute([$today]);
 }
 
 /**
