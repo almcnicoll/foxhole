@@ -1153,6 +1153,53 @@ gate. `config.php`'s `octopus.free_electricity_campaign_slug` is the one
 remaining non-secret tunable this feature needs — Power down has no
 equivalent setting, since its API takes no slug at all.
 
+**A real production failure, found from the user's own report and the API
+log, not a live test: `reapplyOverrides()` had no top-level try/catch at
+all, so an uncaught exception anywhere in the scheduler-build pipeline
+silently killed the whole request — including opt-in.php's own Power down
+opt-in click, before it ever reached `OctopusFlexClient::joinSession()`.**
+Reported live, 2026-09-17: a Power down "Opt in" click correctly saved the
+override and (per the dashboard) appeared to set the right force-charge/
+self-use slots, but the event was never actually joined on Octopus's own
+site. The API log was the tell: two `graphql:savingSessions` calls
+(ordinary dashboard loads either side of the click) but **no**
+`graphql:joinSavingSessionsEvent` — and not even a second
+`graphql:obtainKrakenToken` — anywhere in between. Since
+`OctopusFlexClient::graphql()` logs via `saveApiLogEntry()` immediately
+after every real network attempt, total silence there means `joinSession()`
+itself was never invoked, not that it was invoked and failed.
+
+`runScheduler()` already wraps its entire body in exactly the two-tier
+catch this needed (`OctopusFetchException|ScheduleBuildException|FoxessPushException`,
+then a `Throwable` catch-all) — `reapplyOverrides()` was a bare function
+with none of that, a pre-existing gap `override.php` already carried (it
+too has no try/catch around its own `reapplyOverrides()` call) but had
+never been observed to trigger before this feature gave it a new, more
+consequential way to matter. `opt-in.php`'s own code only wraps the
+`joinSession()` call in try/catch; if `reapplyOverrides()` itself threw
+(plausible from deep inside the scheduler-build pipeline — e.g. the
+modelling scheduler's own `ScheduleBuildException` for a window/price-slot
+mismatch, though the exact trigger on this account wasn't confirmed from
+the log alone), the whole request dies as an uncaught PHP fatal error
+**before any FoxESS or Octopus call is even attempted** — matching the
+observed silence exactly. `saveOverride()` runs immediately before this and
+is a plain DB write, unaffected by anything downstream — which is why the
+override was genuinely saved even though the rest of the click's own work
+never happened; the schedule that then looked "successfully set" most
+likely actually came from the next regular cron run picking up the
+already-saved override on its own, not from this click's own push.
+
+Fixed by giving `reapplyOverrides()` the identical two-tier catch
+`runScheduler()` already has, verbatim in structure — same exception types,
+same `Throwable` safety net, same `alertOnFailure()` call (labelled
+"override reapply" instead of "scheduler" so the two are distinguishable in
+an alert email). This is a general fix, not opt-in-specific: `override.php`
+gets the same protection against a silent crash on hand-entered overrides
+that it always should have had. No dedicated regression test — this is the
+same class of untested integration-level catch `runScheduler()`'s own
+catch already is, needing a full config/Store/scheduler scaffold
+disproportionate to what a unit test buys here.
+
 **A group ending at literal 0:00 collides with the next group starting at
 0:00 — FoxESS's v2 `scheduler/enable` doesn't treat that as "end of day"
 the way this app's own code does.** Reproduced live 2026-09-04: a genuine,
