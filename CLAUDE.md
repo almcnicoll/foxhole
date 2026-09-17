@@ -1048,12 +1048,20 @@ override system has no way to express a window spanning midnight, same
 limitation `override.php`'s own UI already has.
 
 `src/OctopusFlexClient.php` talks to Octopus's GraphQL API
-(`api.octopus.energy/v1/graphql/`). A first live spike failed outright on
-an invalid API key before anything past auth could be checked; a second
-pass used GraphQL's own schema introspection — which needs no token at
-all — to check the query/mutation *shapes* directly against the live
-production schema, which is authoritative regardless of whether a given
-key actually authenticates. Confirmed this way:
+(`api.octopus.energy/v1/graphql/`). A full reference of every query/mutation
+is published at [docs.octopus.energy/graphql/reference/](https://docs.octopus.energy/graphql/reference/),
+with the basics of auth/usage at
+[docs.octopus.energy/graphql/guides/basics/](https://docs.octopus.energy/graphql/guides/basics/)
+— check there before re-deriving something via introspection again, though
+in practice the reference site has repeatedly proven too large to fetch
+usefully in one pass (see below); introspection against the live endpoint
+directly has been the more reliable source of truth so far. A first live
+spike failed outright on an invalid API key before anything past auth
+could be checked; a second pass used GraphQL's own schema introspection —
+which needs no token at all — to check the query/mutation *shapes*
+directly against the live production schema, which is authoritative
+regardless of whether a given key actually authenticates. Confirmed this
+way:
 
 - `customerFlexibilityCampaignEvents(accountNumber: String!,
   supplyPointIdentifier: String!, campaignSlug: String!, first: Int)`
