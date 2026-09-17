@@ -24,7 +24,9 @@ $tomorrow = $today->modify('+1 day');
 // call means no banner, never a broken dashboard. See CLAUDE.md and src/OctopusFlexClient.php.
 $octopusAccountConfig = getOctopusAccountConfig();
 $optInSessions = [];
-if ($octopusAccountConfig['api_key'] !== '' && $octopusAccountConfig['account_number'] !== '') {
+// mpan is required, not optional — confirmed live that customerFlexibilityCampaignEvents'
+// supplyPointIdentifier argument is non-null (see OctopusFlexClient's doc comment).
+if ($octopusAccountConfig['api_key'] !== '' && $octopusAccountConfig['account_number'] !== '' && $octopusAccountConfig['mpan']) {
     try {
         $optInSessions = (new OctopusFlexClient(
             $octopusAccountConfig['api_key'],
@@ -558,12 +560,13 @@ function renderBatteryStatus(array $batterySocs, float $minSoc): string
 /**
  * One row per available opt-in session (today/tomorrow only — see the data-gathering
  * above), each either a "Opt in" button (POSTs to opt-in.php, the single-click flow
- * documented in CLAUDE.md) or an "Opted in" badge if Store::isSessionOptedIn() already
- * has a record for it. "Opted in" state is tracked purely locally — see
- * octopus_session_optins in Store.php — since whether Octopus's own API exposes a
- * per-event join-status field hasn't been confirmed live.
+ * documented in CLAUDE.md) or an "Opted in" badge. "Opted in" prefers Octopus's own
+ * `isEventParticipant` field (confirmed live to exist — see OctopusFlexClient) since it
+ * also reflects an opt-in made via Octopus's own app; Store::isSessionOptedIn()'s local
+ * record is an OR'd-in fallback for the moment right after this app's own join call
+ * succeeds, in case the API hasn't caught up yet.
  *
- * @param array<int, array{kind: string, code: string, start: DateTimeImmutable, end: DateTimeImmutable}> $sessions
+ * @param array<int, array{kind: string, code: string, start: DateTimeImmutable, end: DateTimeImmutable, alreadyJoined: bool}> $sessions
  */
 function renderOptInBanner(array $sessions, DateTimeZone $timezone): void
 {
@@ -578,7 +581,7 @@ function renderOptInBanner(array $sessions, DateTimeZone $timezone): void
         $localStart = $session['start']->setTimezone($timezone);
         $localEnd = $session['end']->setTimezone($timezone);
         $window = $localStart->format('D j M, H:i') . '–' . $localEnd->format('H:i');
-        $optedIn = isSessionOptedIn($session['code']);
+        $optedIn = $session['alreadyJoined'] || isSessionOptedIn($session['code']);
     ?>
     <div class="optin-row">
         <span><strong><?= htmlspecialchars($label) ?></strong> available <?= htmlspecialchars($window) ?></span>

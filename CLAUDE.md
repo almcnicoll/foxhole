@@ -1048,55 +1048,85 @@ override system has no way to express a window spanning midnight, same
 limitation `override.php`'s own UI already has.
 
 `src/OctopusFlexClient.php` talks to Octopus's GraphQL API
-(`api.octopus.energy/v1/graphql/`) — confirmed live: auth is
-`obtainKrakenToken(input: {APIKey: $key})` (the input field is `APIKey`,
-not `apiKey` — confirmed by the API's own error message correcting the
-casing), and `customerFlexibilityCampaignEvents(accountNumber,
-supplyPointIdentifier, campaignSlug, first)` returning
-`edges.node.{code, startAt, endAt}` is the right shape for Free
-Electricity/Power Up (`campaignSlug: "free_electricity"`) specifically.
-**Not confirmed, and needing live verification before trusting this in
-production** (a live spike attempted while building this failed on an
-invalid API key before any of the below could be checked — same
-"best-effort guess, don't trust inference blindly" territory as `fdSoc`/
-`fdPwr`):
+(`api.octopus.energy/v1/graphql/`). A first live spike failed outright on
+an invalid API key before anything past auth could be checked; a second
+pass used GraphQL's own schema introspection — which needs no token at
+all — to check the query/mutation *shapes* directly against the live
+production schema, which is authoritative regardless of whether a given
+key actually authenticates. Confirmed this way:
 
+- `customerFlexibilityCampaignEvents(accountNumber: String!,
+  supplyPointIdentifier: String!, campaignSlug: String!, first: Int)`
+  returning `edges.node.{name, code, startAt, endAt, isEventParticipant}`.
+  **`supplyPointIdentifier` (MPAN) is required, not optional** — an
+  earlier version of this feature treated it as optional (nullable,
+  skipped if unset); that was wrong, fixed once introspection showed the
+  argument is non-null. `settings.php`'s Octopus fieldset now documents
+  it as required-if-using-the-feature, and `getAvailableSessions()` fails
+  fast with a clear message if it's missing rather than sending a null
+  value GraphQL would reject with a less helpful error.
+- `isEventParticipant` is a genuine API-side join-status boolean — a
+  pleasant surprise, since the original version of this feature assumed
+  no such field existed and tracked "opted in" purely locally. The banner
+  now prefers this field (it also reflects an opt-in made via Octopus's
+  own app), OR'd with the local `octopus_session_optins` record as a
+  fast-path fallback for the moment right after this app's own join call
+  succeeds.
+- The query itself still requires an `Authorization` header even though it
+  takes no API key as a query argument — confirmed live via error
+  `KT-CT-1112` ("You must provide the AUTHORIZATION header"). Auth is
+  still `obtainKrakenToken(input: {APIKey: $key})` (the input field is
+  `APIKey`, not `apiKey` — confirmed by the API's own error message
+  correcting the casing), sent as `Authorization: JWT <token>` — the
+  standard Kraken/Octopus convention, though no API key tried against
+  this account so far has actually authenticated (`KT-CT-1139`,
+  "Authentication failed"), so that header format has never actually been
+  exercised end-to-end.
+- **There is no `joinSavingSessionsEvent` mutation in the live schema at
+  all** — the original guess, taken from
+  `BottlecapDave/HomeAssistant-OctopusEnergy`'s service parameter naming,
+  was simply wrong; confirmed absent by introspecting every field on
+  `Mutation`. The two real candidates found —
+  `joinOctoplusCampaign(accountNumber: String)` (no event-specific
+  code/date argument at all) and `addCampaignToAccount(input:
+  {accountNumber, campaign, startDate, expiryDate})` (a bare `campaign`
+  string, no date/time — reads as enrolling in a whole named scheme, not
+  a specific announced occurrence) — don't obviously fit "join this
+  specific timed event by its `code`" at all. Guessing further here risks
+  a real, silently-wrong side effect on a live account (worse than a
+  clean failure), so `joinSession()` deliberately throws unconditionally
+  rather than calling either one speculatively. `opt-in.php`'s existing
+  error handling already does the right thing with that: preparation
+  still gets calculated, saved as an override, and pushed to the
+  inverter(s) — only the final "tell Octopus" step is blocked, with a
+  message pointing at opting in manually via the app for now. The
+  reliable way to actually confirm this mutation is capturing the real
+  request (browser DevTools, Network tab, filter "graphql") while opting
+  into a real session through Octopus's own app/website — the schema
+  itself doesn't reveal it.
 - The campaign slug for Power Down/Saving Sessions (`config.php`'s
   `octopus.flex_campaign_slugs['power_down']`, currently a guess —
-  `saving_sessions` — since Power Down predates the Free Electricity
-  GraphQL rollout and may use a different query shape entirely, not just a
-  different slug on the same query).
-- Whether `supplyPointIdentifier` (MPAN) is actually required, or the
-  account number alone is sufficient — asked for in `settings.php` but
-  optional, passed as `null` when not configured.
-- The real join mutation name/input shape for either campaign — best guess
-  is `joinSavingSessionsEvent(input: {accountNumber, eventCode})`, per
-  `BottlecapDave/HomeAssistant-OctopusEnergy`'s own service parameters
-  (`event_code`); may need splitting into two mutations once confirmed.
+  `saving_sessions`) is still unconfirmed — `campaignSlug` isn't a schema
+  enum, so introspection can't enumerate valid values, and Power Down
+  predates the Free Electricity GraphQL rollout enough that it may use a
+  different query shape entirely, not just a different slug on this one.
 
-`joinSession()` treats any "already ..."-shaped GraphQL error as success
-rather than a failure, so a double-click or two open tabs can't surface a
-spurious warning for something that's already true. Every GraphQL call is
-logged via the existing `Store::saveApiLogEntry()` choke point (same table/
-page as FoxESS calls, distinguished by an endpoint string like
-`graphql:customerFlexibilityCampaignEvents:free_electricity` instead of a
-URL path, since every GraphQL call hits the same URL) — confirmed live that
-Octopus, like FoxESS, wraps GraphQL errors inside an HTTP 200 response
-(a dummy API key produced a 200 with an `errors` array, not a 4xx), so the
-existing "don't trust the status code alone" api-log handling applies here
-too.
+Every GraphQL call is logged via the existing `Store::saveApiLogEntry()`
+choke point (same table/page as FoxESS calls, distinguished by an endpoint
+string like `graphql:customerFlexibilityCampaignEvents:free_electricity`
+instead of a URL path, since every GraphQL call hits the same URL) —
+confirmed live that Octopus, like FoxESS, wraps GraphQL errors inside an
+HTTP 200 response (an invalid API key produced a 200 with an `errors`
+array, not a 4xx), so the existing "don't trust the status code alone"
+api-log handling applies here too.
 
-"Opted in" state is tracked purely locally (`octopus_session_optins`,
-`Store::recordSessionOptIn()`/`isSessionOptedIn()`) rather than trusting an
-API-side join-status field, since whether Octopus's API even exposes one
-per event hasn't been confirmed live either — this table is the one source
-of truth this app fully controls. Octopus account credentials
-(`octopus_account_api_key`/`octopus_account_number`/`octopus_mpan`) live in
-the settings table via `Store::getOctopusAccountConfig()`, same "secrets
-belong in the settings table, not config.php" reasoning as
-`foxess_api_key` — entirely optional, and the banner simply doesn't appear
-if they're unset, same degrade-quietly precedent as the solar forecast's
-`solar_enabled` gate.
+Octopus account credentials (`octopus_account_api_key`/
+`octopus_account_number`/`octopus_mpan`) live in the settings table via
+`Store::getOctopusAccountConfig()`, same "secrets belong in the settings
+table, not config.php" reasoning as `foxess_api_key` — optional as a
+*feature* (the banner simply doesn't appear if any of the three is unset,
+same degrade-quietly precedent as the solar forecast's `solar_enabled`
+gate), but all three are required together once you want it at all.
 
 **A group ending at literal 0:00 collides with the next group starting at
 0:00 — FoxESS's v2 `scheduler/enable` doesn't treat that as "end of day"

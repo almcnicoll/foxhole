@@ -212,8 +212,10 @@ renderHeader('Settings');
 
     <fieldset>
         <legend>Octopus account</legend>
-        <p class="muted">Optional — only needed for the dashboard's opt-in session banner ("Power down"/"Fill your
-            boots"). Leave blank to hide that banner entirely. Your account API key is on
+        <p class="muted">Optional as a whole — only needed for the dashboard's opt-in session banner ("Power
+            down"/"Fill your boots"). Leave all three fields blank to hide that banner entirely; if you want the
+            banner, all three are required together (confirmed live: Octopus's API requires the MPAN, it isn't just
+            a nice-to-have). Your account API key is on
             <a href="https://octopus.energy/dashboard/developer/" target="_blank" rel="noopener">Octopus's developer
                 dashboard</a> — separate from the FoxESS key above.</p>
         <label for="octopus_account_api_key">API key</label>
@@ -222,7 +224,7 @@ renderHeader('Settings');
         <label for="octopus_account_number">Account number</label>
         <input type="text" id="octopus_account_number" name="octopus_account_number"
             value="<?= htmlspecialchars($octopusAccountNumber) ?>">
-        <label for="octopus_mpan">MPAN (optional — leave blank unless opt-in session lookups fail without it)</label>
+        <label for="octopus_mpan">MPAN (required if using the fields above — your electricity meter point identifier)</label>
         <input type="text" id="octopus_mpan" name="octopus_mpan" value="<?= htmlspecialchars($octopusMpan) ?>">
     </fieldset>
 
