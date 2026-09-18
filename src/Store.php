@@ -746,6 +746,26 @@ function getAllApiLogEntriesForLevelFilter(?int $statusCode, bool $noResponseOnl
 }
 
 /**
+ * Every entry logged since $since (inclusive), most-recent-first, capped at
+ * API_LOG_LEVEL_FILTER_MAX_ROWS for the same sanity-backstop reason
+ * getAllApiLogEntriesForLevelFilter() is — api-log-download.php's "last N days" export.
+ * String comparison against the stored `called_at` TEXT column is safe here (unlike the
+ * price_slots pitfall CLAUDE.md documents): every row was written via the same
+ * `new DateTimeImmutable('now')` construction (no caller-supplied timezone to diverge
+ * from), so $since — built the identical way by the caller — always carries the same
+ * UTC offset as what's stored, and DATE_ATOM's offset suffix sorts correctly whenever
+ * both sides share one offset.
+ */
+function getApiLogEntriesSince(DateTimeImmutable $since): array
+{
+    $stmt = db()->prepare('SELECT * FROM api_log WHERE called_at >= ? ORDER BY id DESC LIMIT ?');
+    $stmt->bindValue(1, $since->format(DATE_ATOM));
+    $stmt->bindValue(2, API_LOG_LEVEL_FILTER_MAX_ROWS, PDO::PARAM_INT);
+    $stmt->execute();
+    return array_map('mapApiLogRow', $stmt->fetchAll(PDO::FETCH_ASSOC));
+}
+
+/**
  * Every FoxESS call either succeeds outright (HTTP 200, errno 0), fails at the network level
  * (no status code at all), or comes back HTTP 200 with a non-zero `errno` — FoxESS wraps
  * logical/business errors inside a 200 response rather than a non-2xx status, so colouring

@@ -730,6 +730,15 @@ check(
 check(count(getApiLogEntries(1)) === 1, 'getApiLogEntries() respects its $limit argument');
 check(count(getApiLogEntries(10, 1)) === 2, 'getApiLogEntries() respects its $offset argument');
 
+// --- Store: getApiLogEntriesSince() (api-log-download.php's "last N days" export) ---
+// At this point the throwaway DB has exactly 3 rows: $logNow, $logSecondEntryAt
+// ($logNow +8 days -1 hour), and $logNow +8 days.
+check(count(getApiLogEntriesSince($logNow)) === 3, 'getApiLogEntriesSince() from the earliest entry\'s own timestamp includes every row (>=, not >)');
+check(count(getApiLogEntriesSince($logNow->modify('+8 days'))) === 1, 'a cutoff of exactly the latest entry\'s timestamp excludes the one an hour earlier');
+check(count(getApiLogEntriesSince($logNow->modify('+8 days')->modify('-2 hours'))) === 2, 'a cutoff between the second and third entries includes only those two');
+check(getApiLogEntriesSince($logNow->modify('+100 days')) === [], 'a cutoff after every logged entry finds nothing');
+check(getApiLogEntriesSince($logNow)[0]['endpoint'] === '/op/v1/device/scheduler/get', 'getApiLogEntriesSince() returns most-recent-first, same as getApiLogEntries()');
+
 // --- Store: api_log status/level filtering (GitHub issue #8) — api-log.php's filter dropdowns.
 // At this point the throwaway DB has 3 rows: two status=200 (one redacted-to-null body, one
 // fresh with errno 0 — both read as 'success'), one status=null (a transport failure, 'error').

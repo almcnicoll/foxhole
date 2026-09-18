@@ -322,6 +322,46 @@ fieldset {
     background: var(--color-error);
 }
 
+.btn-secondary {
+    background: var(--color-muted);
+}
+.btn-secondary:hover {
+    background: var(--color-text);
+    color: var(--color-bg);
+}
+
+/* api-log.php's "Download logs" modal — native <dialog>, no JS library needed for a
+   show/hide-with-backdrop box. */
+dialog {
+    background: var(--color-bg);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    padding: 1.2rem;
+    max-width: 420px;
+    width: 90vw;
+}
+dialog::backdrop {
+    background: rgba(0, 0, 0, 0.5);
+}
+dialog form {
+    gap: 1rem;
+}
+.dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.6rem;
+}
+.download-mode-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-weight: normal;
+}
+.download-mode-row input[type="number"] {
+    width: 5.5em;
+}
+
 .error {
     color: var(--color-error);
 }

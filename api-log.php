@@ -77,10 +77,36 @@ renderHeader('API log');
 ?>
 
 <p class="muted">
-    Every request this app sends to the FoxESS API, most recent first — endpoint, what was sent, and what came
-    back. Request/response bodies older than 7 days are automatically cleared to keep the log small; the call
-    itself (time, endpoint, status) is kept indefinitely.
+    Every request this app sends to the FoxESS or Octopus opt-in-sessions APIs, most recent first — endpoint, what
+    was sent, and what came back. Request/response bodies older than 7 days are automatically cleared to keep the
+    log small; the call itself (time, endpoint, status) is kept indefinitely.
+    <button type="button" onclick="document.getElementById('download-log-dialog').showModal()">Download logs</button>
 </p>
+
+<dialog id="download-log-dialog">
+    <form method="get" action="api-log-download.php">
+        <h3>Download logs</h3>
+        <p class="muted">
+            Exports the full request/response bodies as JSON, for debugging a production issue offline — entries
+            older than 7 days only have their call signature (time/endpoint/status), same as above.
+        </p>
+        <label class="download-mode-row">
+            <input type="radio" name="mode" value="days" checked
+                onchange="document.getElementById('download-days').disabled=false;document.getElementById('download-calls').disabled=true;">
+            Last <input type="number" id="download-days" name="days" value="7" min="1" max="365"> days
+        </label>
+        <label class="download-mode-row">
+            <input type="radio" name="mode" value="calls"
+                onchange="document.getElementById('download-days').disabled=true;document.getElementById('download-calls').disabled=false;">
+            Last <input type="number" id="download-calls" name="calls" value="100" min="1" max="<?= API_LOG_LEVEL_FILTER_MAX_ROWS ?>" disabled>
+            calls (max <?= API_LOG_LEVEL_FILTER_MAX_ROWS ?>)
+        </label>
+        <div class="dialog-actions">
+            <button type="button" class="btn-secondary" onclick="document.getElementById('download-log-dialog').close()">Cancel</button>
+            <button type="submit">Download</button>
+        </div>
+    </form>
+</dialog>
 
 <?php if ($hasAnyLoggedAtAll): ?>
 <form method="get" class="api-log-filters">

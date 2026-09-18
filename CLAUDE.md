@@ -37,6 +37,7 @@ settings.php          # FoxESS credentials + system password form (password-wall
 schedulers.php         # pick/preview the active scheduler (password-walled), see "Pluggable schedulers" below
 history.php            # generation-vs-forecast history, day/week/month/year (password-walled)
 api-log.php            # every FoxESS API call, most recent first (password-walled), see "API call log" below
+api-log-download.php   # JSON export of the API log for a given window (password-walled, GET), see "Download logs" below
 history-fetch.php      # manual trigger for the generation history backfill/catch-up (login-only, POST-only)
 assets/
   style.css            # the only stylesheet — every page links this, no per-page CSS
@@ -1447,6 +1448,41 @@ The status dropdown's options are `Store::getDistinctApiLogStatusCodes()` — wh
 codes are actually present in the log, never a hardcoded guess list — plus a
 conditionally-shown "No response" option (`Store::hasApiLogNoResponseEntries()`) that
 only appears once a transport failure has actually happened.
+
+**"Download logs" (user-requested, to help debug production issues offline).**
+`api-log.php` gained a "Download logs" button opening a native `<dialog>`
+modal — no JS library, `showModal()`/`.close()` and one small inline
+`onchange` per radio to grey out whichever number input isn't the active
+mode, the same "native platform feature is enough" bias this app already
+applies to `<progress>` for the battery indicator. Two export modes, both
+GET (read-only, no state changes, same trust level as `api-log.php`/
+`history.php` themselves — no POST-only requirement): "last N days"
+(`Store::getApiLogEntriesSince()`, new — a plain `WHERE called_at >= ?`,
+capped at the same `API_LOG_LEVEL_FILTER_MAX_ROWS` sanity backstop
+`getAllApiLogEntriesForLevelFilter()` already uses) and "last N calls"
+(reuses the existing `getApiLogEntries($limit)` unchanged). Both inputs are
+clamped server-side too (`api-log-download.php`), not just via the HTML
+`max` attribute — days to 365, calls to `API_LOG_LEVEL_FILTER_MAX_ROWS` —
+since an HTML attribute is only ever a UI hint, never enforcement.
+
+The export is unfiltered by whatever status/level dropdown happens to be
+selected on the page — deliberately: debugging a production issue benefits
+from seeing everything in the window, not whatever subset the viewer had
+last selected for browsing.
+
+`api-log-download.php` decodes each stored `request_body`/`response_body`
+back into real JSON (`json_decode`, falling back to the raw string when it
+isn't valid JSON — a transport failure's cURL error text, or
+`api.backend.octopus.energy`'s plain-HTML 403 page, see
+`OctopusFlexClient`'s own doc comment) before re-encoding the whole export,
+so each call's payload nests as genuine JSON objects rather than a JSON
+string escaped inside a string — a `jq` query (or any JSON-aware tool) can
+reach straight into a body field without a second parse step, which is the
+literal point of "bearing in mind the payload of each call will be JSON."
+An entry redacted past the 7-day retention window (see `saveApiLogEntry()`)
+naturally exports with both body fields `null` — "only the call signature
+will be present" falls out of exporting exactly what's actually stored,
+with no special-casing needed for that case specifically.
 
 **Rate-limit/quota detection surfaces on the dashboard and history page, not just the API
 log's red badge (GitHub issue #7).** The API log already coloured a rate-limited call red
