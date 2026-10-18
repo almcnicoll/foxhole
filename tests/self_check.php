@@ -2017,6 +2017,88 @@ try {
     check(str_contains($e->getMessage(), 'not found'), 'the underlying error message is preserved: got ' . $e->getMessage());
 }
 
+// --- Weekend Happy Hours (free electricity): OctopusFlexClient::getWeekendHappyHours(),
+// bookedHappyHourWindows(), syncBookedHappyHourOverrides() ---
+$hhFixture = ['data' => ['savingSessions' => [
+    'events' => [
+        ['id' => 1, 'code' => 'PD-1', 'startAt' => '2026-05-02T17:00:00Z', 'endAt' => '2026-05-02T18:00:00Z', 'status' => 'UPCOMING', 'eventType' => 'TURN_DOWN', 'capacityStatus' => null, 'rewardPerKwhInOctoPoints' => 80, 'devEvent' => false],
+        ['id' => 2, 'code' => 'HH-LOW', 'startAt' => '2026-05-01T10:00:00Z', 'endAt' => '2026-05-01T11:00:00Z', 'status' => 'UPCOMING', 'eventType' => 'WEEKEND_HAPPY_HOUR', 'capacityStatus' => 'LOW', 'rewardPerKwhInOctoPoints' => 0, 'devEvent' => false],
+        ['id' => 3, 'code' => 'HH-DONE', 'startAt' => '2026-05-01T09:00:00Z', 'endAt' => '2026-05-01T10:00:00Z', 'status' => 'DONE', 'eventType' => 'WEEKEND_HAPPY_HOUR', 'capacityStatus' => null, 'rewardPerKwhInOctoPoints' => 0, 'devEvent' => false],
+        ['id' => 4, 'code' => 'HH-FAR', 'startAt' => '2026-05-09T10:00:00Z', 'endAt' => '2026-05-09T11:00:00Z', 'status' => 'UPCOMING', 'eventType' => 'WEEKEND_HAPPY_HOUR', 'capacityStatus' => 'AVAILABLE', 'rewardPerKwhInOctoPoints' => 0, 'devEvent' => false],
+        ['id' => 5, 'code' => 'TU-1', 'startAt' => '2026-05-01T12:00:00Z', 'endAt' => '2026-05-01T13:00:00Z', 'status' => 'UPCOMING', 'eventType' => 'TURN_UP', 'capacityStatus' => null, 'rewardPerKwhInOctoPoints' => 50, 'devEvent' => false],
+        ['id' => 6, 'code' => 'HH-BOOKED', 'startAt' => '2026-05-01T11:00:00Z', 'endAt' => '2026-05-01T12:00:00Z', 'status' => 'UPCOMING', 'eventType' => 'WEEKEND_HAPPY_HOUR', 'capacityStatus' => 'AVAILABLE', 'rewardPerKwhInOctoPoints' => 0, 'devEvent' => false],
+    ],
+    'account' => ['joinedEvents' => [['eventId' => 6]]],
+]]];
+$hhClient = new ScriptedOctopusFlexClient(['savingSessions' => $hhFixture], mpan: null);
+$hhSlots = $hhClient->getWeekendHappyHours($flexToday, $flexTomorrow, $flexTz);
+check(array_column($hhSlots, 'code') === ['HH-DONE', 'HH-LOW', 'HH-BOOKED'], 'getWeekendHappyHours() returns only WEEKEND_HAPPY_HOUR events within today/tomorrow (not TURN_DOWN/TURN_UP, not the far-future one), sorted by start: got ' . json_encode(array_column($hhSlots, 'code')));
+check($hhSlots[0]['status'] === 'DONE', 'a finished slot is still returned, with its DONE status, so the scheduled sync can tell "ended" from "booking vanished"');
+check($hhSlots[1]['booked'] === false && $hhSlots[1]['capacity'] === 'LOW', 'an unbooked slot reports booked=false and its capacity');
+check($hhSlots[2]['booked'] === true, 'a slot whose id is in account.joinedEvents reports booked=true');
+$hhPowerDown = $hhClient->getAvailableSessions($flexToday, $flexTomorrow, $flexTz);
+check(array_column($hhPowerDown, 'code') === ['PD-1'], 'Power down no longer mistakes a TURN_UP event (even one with a positive reward) for a Power down: got ' . json_encode(array_column($hhPowerDown, 'code')));
+check(count(array_filter($hhClient->calls, fn($c) => $c[1] === 'savingSessions')) === 1, 'Power down and happy hours share one savingSessions fetch per client instance');
+
+// bookedHappyHourWindows(): adjacent booked slots merge, unbooked ones never count.
+$hhSlot = fn(string $from, string $to, bool $booked) => ['start' => new DateTimeImmutable($from, $flexTz), 'end' => new DateTimeImmutable($to, $flexTz), 'booked' => $booked];
+$windows = bookedHappyHourWindows([
+    $hhSlot('2027-03-06 11:00', '2027-03-06 12:00', false),
+    $hhSlot('2027-03-06 12:00', '2027-03-06 13:00', true),
+    $hhSlot('2027-03-06 13:00', '2027-03-06 14:00', true),
+    $hhSlot('2027-03-06 14:00', '2027-03-06 15:00', false),
+], $flexTz);
+check(array_keys($windows) === ['2027-03-06'] && $windows['2027-03-06']['start']->format('H:i') === '12:00' && $windows['2027-03-06']['end']->format('H:i') === '14:00', 'two adjacent booked slots merge into one 12:00-14:00 window, unbooked neighbours excluded: got ' . json_encode(array_map(fn($w) => [$w['start']->format('H:i'), $w['end']->format('H:i')], $windows)));
+$disjoint = bookedHappyHourWindows([
+    $hhSlot('2027-03-06 15:00', '2027-03-06 16:00', true),
+    $hhSlot('2027-03-06 11:00', '2027-03-06 12:00', true),
+], $flexTz);
+check($disjoint['2027-03-06']['start']->format('H:i') === '11:00' && $disjoint['2027-03-06']['end']->format('H:i') === '12:00', 'disjoint booked windows on one date keep only the earliest (never widened across the unbooked gap)');
+check(bookedHappyHourWindows([$hhSlot('2027-03-06 11:00', '2027-03-06 12:00', false)], $flexTz) === [], 'nothing booked means no windows');
+$overnight = bookedHappyHourWindows([$hhSlot('2027-03-06 23:00', '2027-03-07 00:00', true), $hhSlot('2027-03-07 00:00', '2027-03-07 01:00', true)], $flexTz);
+check($overnight['2027-03-06']['end']->format('Y-m-d H:i') === '2027-03-06 23:59', 'a window crossing midnight is clipped to 23:59 of its start date (override times are same-day H:i)');
+
+// syncBookedHappyHourOverrides(): runs against the throwaway test DB. Battery fixture $battery
+// (10kWh, 3kW charge/discharge, reserve 15%): from 80% SoC, 6.5kWh / 3kW = 2h10m -> rounds up to 2.5h of prep.
+$syncNow = new DateTimeImmutable('2027-03-06 08:00', $flexTz);
+$socExplodes = function (): ?float { throw new RuntimeException('SoC must not be read when nothing needs prep'); };
+
+$syncNotes = syncBookedHappyHourOverrides([
+    $hhSlot('2027-03-06 12:00', '2027-03-06 13:00', true),
+    $hhSlot('2027-03-06 13:00', '2027-03-06 14:00', true),
+], fn() => 80.0, $battery, $syncNow, $flexTz);
+$saved = getOverridesForDate('2027-03-06');
+check(count($saved) === 1 && $saved[0]['kind'] === 'fill_your_boots' && $saved[0]['event_start'] === '12:00' && $saved[0]['event_end'] === '14:00' && $saved[0]['prep_start'] === '09:30' && $saved[0]['prep_end'] === '12:00', 'a booked 12:00-14:00 happy hour becomes a fill_your_boots override with a 2.5h ForceDischarge prep ahead of it: got ' . json_encode($saved));
+check(count($syncNotes) === 1 && str_contains($syncNotes[0], '2027-03-06'), 'the sync reports what it did, for the run log');
+
+// An SoC outage later must neither rewrite nor drop the override it already made.
+syncBookedHappyHourOverrides([$hhSlot('2027-03-06 12:00', '2027-03-06 13:00', true), $hhSlot('2027-03-06 13:00', '2027-03-06 14:00', true)], fn() => null, $battery, $syncNow, $flexTz);
+$kept = getOverridesForDate('2027-03-06')[0];
+check($kept['prep_start'] === '09:30' && $kept['event_end'] === '14:00', 'unreadable SoC leaves an existing happy-hour override (and its prep) exactly as it was');
+
+// Booking cancelled (a *successful* fetch that no longer shows it booked) removes our override...
+syncBookedHappyHourOverrides([$hhSlot('2027-03-06 12:00', '2027-03-06 13:00', false)], $socExplodes, $battery, $syncNow, $flexTz);
+check(getOverridesForDate('2027-03-06') === [], 'a cancelled booking removes the override the sync itself created, without needing a SoC read');
+
+// ...but a hand-entered override for the same date is never touched, in either direction.
+saveOverride('2027-03-07', 'fill_your_boots', '10:00', '11:00', null, null);
+$manualNotes = syncBookedHappyHourOverrides([$hhSlot('2027-03-07 12:00', '2027-03-07 13:00', true)], fn() => 80.0, $battery, $syncNow, $flexTz);
+$manual = getOverridesForDate('2027-03-07')[0];
+check($manual['event_start'] === '10:00' && $manual['prep_start'] === null, 'a manual fill_your_boots override is never overwritten by a booked happy hour: got ' . json_encode($manual));
+check(str_contains($manualNotes[0], 'manual'), 'and the sync says why it left it alone');
+syncBookedHappyHourOverrides([], $socExplodes, $battery, $syncNow, $flexTz);
+check(count(getOverridesForDate('2027-03-07')) === 1, 'a manual override is not removed when the sync later sees nothing booked (it was never ours)');
+
+// No readable SoC and no existing override: still schedule the free hour itself, just without prep.
+syncBookedHappyHourOverrides([$hhSlot('2027-03-08 12:00', '2027-03-08 13:00', true)], fn() => null, $battery, $syncNow, $flexTz);
+$noPrep = getOverridesForDate('2027-03-08')[0];
+check($noPrep['event_start'] === '12:00' && $noPrep['prep_start'] === null, 'with SoC unreadable and nothing existing, the free hour is still scheduled, just without prep');
+
+// A window that has already finished is not (re)scheduled.
+$lateNow = new DateTimeImmutable('2027-03-09 16:00', $flexTz);
+syncBookedHappyHourOverrides([$hhSlot('2027-03-09 12:00', '2027-03-09 14:00', true)], $socExplodes, $battery, $lateNow, $flexTz);
+check(getOverridesForDate('2027-03-09') === [], 'a booked window that ended before the sync ran creates no override');
+
 if ($failures > 0) {
     fwrite(STDERR, "\n$failures/$checks checks failed\n");
     exit(1);

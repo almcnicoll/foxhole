@@ -24,19 +24,28 @@ $tomorrow = $today->modify('+1 day');
 // call means no banner, never a broken dashboard. See CLAUDE.md and src/OctopusFlexClient.php.
 $octopusAccountConfig = getOctopusAccountConfig();
 $optInSessions = [];
+$happyHours = [];
 // Power down only needs the API key/account number; Fill your boots additionally needs
 // the MPAN, and OctopusFlexClient::getAvailableSessions() silently skips just that half
 // if it's missing rather than the whole call failing — see that class's doc comment.
+// Weekend Happy Hours (today's actual free electricity) need neither — and share the one
+// savingSessions fetch Power down already makes, so this costs no extra API call.
 if ($octopusAccountConfig['api_key'] !== '' && $octopusAccountConfig['account_number'] !== '') {
+    $flexClient = new OctopusFlexClient(
+        $octopusAccountConfig['api_key'],
+        $octopusAccountConfig['account_number'],
+        $octopusAccountConfig['mpan'],
+        $config['octopus']['free_electricity_campaign_slug'] ?? '',
+    );
     try {
-        $optInSessions = (new OctopusFlexClient(
-            $octopusAccountConfig['api_key'],
-            $octopusAccountConfig['account_number'],
-            $octopusAccountConfig['mpan'],
-            $config['octopus']['free_electricity_campaign_slug'] ?? '',
-        ))->getAvailableSessions($today, $tomorrow, $timezone);
+        $optInSessions = $flexClient->getAvailableSessions($today, $tomorrow, $timezone);
     } catch (OctopusFlexException $e) {
         $optInSessions = [];
+    }
+    try {
+        $happyHours = $flexClient->getWeekendHappyHours($today, $tomorrow, $timezone);
+    } catch (OctopusFlexException $e) {
+        $happyHours = [];
     }
 }
 
@@ -603,9 +612,47 @@ function renderOptInBanner(array $sessions, DateTimeZone $timezone): void
     <?php
 }
 
+/**
+ * Free-electricity (Octopus Weekend Happy Hour) banner: shown only when there are free
+ * hours still ahead today/tomorrow that could be booked, and *none* of the ones still
+ * ahead are booked — once any is booked the scheduled run (Runner.php's
+ * syncHappyHoursFromOctopus()) turns it into a fill-your-boots override by itself, so
+ * there's nothing left to nag about. Foxhole never books on the user's behalf (a booking
+ * spends a token), hence a link to Octopus's own page rather than a button. FULL slots
+ * aren't offered — they can't be booked — and the account number in the link is the
+ * configured one, not a hardcoded one.
+ *
+ * @param array<int, array{start: DateTimeImmutable, end: DateTimeImmutable, status: string, booked: bool, capacity: ?string}> $slots OctopusFlexClient::getWeekendHappyHours()
+ */
+function renderFreeHoursBanner(array $slots, string $accountNumber, DateTimeZone $timezone, DateTimeImmutable $now): void
+{
+    $ahead = array_values(array_filter($slots, fn($s) => $s['status'] !== 'DONE' && $s['end'] > $now));
+    if (!$ahead || array_filter($ahead, fn($s) => $s['booked'])) {
+        return;
+    }
+    $bookable = array_values(array_filter($ahead, fn($s) => $s['capacity'] !== 'FULL'));
+    if (!$bookable) {
+        return;
+    }
+    $labels = array_map(function ($s) use ($timezone) {
+        $start = $s['start']->setTimezone($timezone);
+        return $start->format('D j M, H:i') . '–' . $s['end']->setTimezone($timezone)->format('H:i')
+            . ($s['capacity'] === 'LOW' ? ' (low availability)' : '');
+    }, $bookable);
+    $url = 'https://octopus.energy/dashboard/new/accounts/' . rawurlencode($accountNumber) . '/saving-sessions/terms';
+    ?>
+<div class="alert alert-success free-hours-banner">
+    <strong>Free electricity is available:</strong> <?= htmlspecialchars(implode('; ', $labels)) ?>.
+    None are booked, so Foxhole won't fill the battery for them.
+    <a href="<?= htmlspecialchars($url) ?>" target="_blank" rel="noopener">Book on Octopus</a>
+</div>
+    <?php
+}
+
 renderHeader('Dashboard', headerExtra: renderBatteryStatus($batterySocs, $minSoc));
 
 renderOptInBanner($optInSessions, $timezone);
+renderFreeHoursBanner($happyHours, $octopusAccountConfig['account_number'], $timezone, new DateTimeImmutable('now'));
 
 $ran = $_GET['ran'] ?? null;
 $ranOk = ($_GET['ok'] ?? null) === '1';

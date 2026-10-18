@@ -13,6 +13,8 @@ require_once __DIR__ . '/UsageEstimator.php';
 require_once __DIR__ . '/FoxessClient.php';
 require_once __DIR__ . '/SolarForecastClient.php';
 require_once __DIR__ . '/HistoryFetcher.php';
+require_once __DIR__ . '/OctopusFlexClient.php';
+require_once __DIR__ . '/SessionOptIn.php';
 
 /**
  * Runs the full fetch -> build -> (push) pipeline once. Shared by run.php
@@ -165,6 +167,23 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
                 $historyRateLimited = str_contains($historyResult['message'], 'rate-limiting');
             } catch (Throwable $e) {
                 $logger->warn('Generation history fetch failed, skipping: ' . $e->getMessage());
+            }
+        }
+
+        // Booked Octopus Weekend Happy Hours (free electricity) become fill-your-boots
+        // overrides *here*, ahead of the schedule build below, so the override-aware code
+        // further down (applyOverrides(), the modelling scheduler's forced actions) picks
+        // them up exactly as if they'd been entered on override.php. Real runs only: this
+        // needs FoxESS credentials for the SoC read and writes override rows, neither of
+        // which a --dry-run should depend on. Best-effort like the history fetch above — an
+        // Octopus outage must never abort the run, it just means no happy-hour changes
+        // this time (and, deliberately, no teardown of an existing one either; see
+        // syncBookedHappyHourOverrides()).
+        if (!$dryRun) {
+            try {
+                syncHappyHoursFromOctopus($config, $logger, $now, $timezone);
+            } catch (Throwable $e) {
+                $logger->warn('Happy hour sync failed, skipping: ' . $e->getMessage());
             }
         }
 
@@ -720,4 +739,69 @@ function alertOnFailure(array $config, string $subject, string $message): void
     }
     // Best-effort only — the caller's exit code (cron) or on-screen message (UI) is the real signal.
     @mail($to, $subject, $message);
+}
+
+/**
+ * Fetches Octopus's Weekend Happy Hour slots for today/tomorrow and reconciles them into
+ * fill-your-boots overrides — see syncBookedHappyHourOverrides() for what that means and
+ * OctopusFlexClient::getWeekendHappyHours() for where the data comes from. A no-op when no
+ * Octopus API key/account number is configured (the feature is optional, same as the
+ * dashboard banner). A failed fetch returns without touching any override: the sync must
+ * only ever reconcile against a successful read, or a transient Octopus error would look
+ * like "every booking was cancelled".
+ */
+function syncHappyHoursFromOctopus(array $config, Logger $logger, DateTimeImmutable $now, DateTimeZone $timezone): void
+{
+    $octopus = getOctopusAccountConfig();
+    if ($octopus['api_key'] === '' || $octopus['account_number'] === '') {
+        return;
+    }
+    $today = $now->setTimezone($timezone)->setTime(0, 0);
+    try {
+        $slots = (new OctopusFlexClient(
+            $octopus['api_key'],
+            $octopus['account_number'],
+            $octopus['mpan'],
+            $config['octopus']['free_electricity_campaign_slug'] ?? '',
+        ))->getWeekendHappyHours($today, $today->modify('+1 day'), $timezone);
+    } catch (OctopusFlexException $e) {
+        $logger->warn('Happy hour lookup failed, leaving any existing happy hour overrides as they are: ' . $e->getMessage());
+        return;
+    }
+
+    $notes = syncBookedHappyHourOverrides(
+        $slots,
+        fn() => readAverageBatterySoc($config, $logger),
+        getBatteryConfig($config['battery'] ?? []),
+        $now,
+        $timezone,
+    );
+    foreach ($notes as $note) {
+        $logger->info($note);
+    }
+}
+
+/**
+ * Average live SoC across the configured inverters, or null if none could be read. A
+ * reading of exactly 0% is excluded — a battery-less inverter reports that, and averaging
+ * it in against a real battery elsewhere on the account gives a nonsense low figure (same
+ * rule, same reason as runScheduler()'s own SoC gathering for the forecast-weighted and
+ * modelling schedulers, which this deliberately mirrors rather than refactors).
+ */
+function readAverageBatterySoc(array $config, Logger $logger): ?float
+{
+    $apiKey = getSetting('foxess_api_key', '');
+    $deviceSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('foxess_device_sns', '')))));
+    $readings = [];
+    foreach ($deviceSns as $sn) {
+        try {
+            $soc = (new FoxessClient($apiKey, $sn, $config['foxess']['base_url']))->getBatterySoc();
+            if ($soc !== null && $soc > 0.0) {
+                $readings[] = $soc;
+            }
+        } catch (FoxessPushException $e) {
+            $logger->warn("Battery SoC read from $sn failed, excluding from average: " . $e->getMessage());
+        }
+    }
+    return $readings ? array_sum($readings) / count($readings) : null;
 }

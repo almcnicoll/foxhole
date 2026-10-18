@@ -44,26 +44,14 @@ $now = new DateTimeImmutable('now', $timezone);
 $label = $kind === 'power_down' ? 'Power down' : 'Fill your boots';
 
 // Fail closed on an unknown battery SoC (confirmed with the user) — never guess at
-// battery state for something that costs/earns real money. Same per-device averaging
-// Runner.php's reapplyOverrides() already uses for the forecast-weighted/modelling
-// schedulers' own live SoC read.
-$apiKey = getSetting('foxess_api_key', '');
-$deviceSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('foxess_device_sns', '')))));
-$socReadings = [];
-foreach ($deviceSns as $sn) {
-    try {
-        $soc = (new FoxessClient($apiKey, $sn, $config['foxess']['base_url']))->getBatterySoc();
-        if ($soc !== null) {
-            $socReadings[] = $soc;
-        }
-    } catch (FoxessPushException $e) {
-        // one device's failure doesn't necessarily invalidate the others — see the check below
-    }
-}
-if (!$socReadings) {
+// battery state for something that costs/earns real money. Uses Runner.php's
+// readAverageBatterySoc(), which skips a 0% reading (a battery-less inverter reports that;
+// this page used to average it in against the real battery's reading, roughly halving the
+// SoC the prep maths saw on a two-inverter install where one has no battery).
+$currentSocPercent = readAverageBatterySoc($config, new Logger(__DIR__ . '/logs/scheduler.log'));
+if ($currentSocPercent === null) {
     redirectResult(false, "$label opt-in aborted: couldn't read live battery SoC from any configured inverter, so preparation can't be calculated safely. Try again once FoxESS is reachable.");
 }
-$currentSocPercent = array_sum($socReadings) / count($socReadings);
 
 $batteryConfig = getBatteryConfig($config['battery'] ?? []);
 $prep = calculateOptInPrep($kind, $eventStart, $currentSocPercent, $batteryConfig, $now, $timezone);

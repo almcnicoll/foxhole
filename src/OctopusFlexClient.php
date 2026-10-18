@@ -62,6 +62,7 @@ class OctopusFlexClient
     private const BACKEND_URL = 'https://api.backend.octopus.energy/v1/graphql/';
 
     private ?string $token = null;
+    private ?array $savingSessionsData = null;
 
     public function __construct(
         private readonly string $apiKey,
@@ -138,29 +139,102 @@ class OctopusFlexClient
     }
 
     /**
-     * @return array<int, array{code: string, start: string, end: string, alreadyJoined: bool}>
-     *         Filters out dev/test events and zero-reward events, same as
-     *         automator-octopus-energy's own `getSavingSessions()` — a reward of 0
-     *         OctoPoints/kWh isn't a real opt-in opportunity.
+     * Free-electricity hours Octopus currently runs as **Weekend Happy Hour** events —
+     * confirmed live 2026-10-18: the old `free_electricity` campaign (see
+     * getAvailableSessions()' Fill your boots half) stopped in Oct 2025, and today's free
+     * hours instead appear in the backend host's `savingSessions.events` with
+     * `eventType: WEEKEND_HAPPY_HOUR` and zero OctoPoints reward (which is why Power down
+     * filters them out). Unlike the old campaign these *are* booked per hour (a
+     * `bookSavingSessionsWeekendHappyHourEvent` mutation, spending a token) — this class
+     * only reads them; it never books. "Booked" is `account.joinedEvents` matched by
+     * event id, same as Power down.
+     *
+     * Throws OctopusFlexException on a failed fetch, unlike getAvailableSessions() — the
+     * callers (Runner.php's scheduled sync, index.php's banner) need to tell "nothing
+     * booked" apart from "couldn't find out", since the sync must not tear down a booked
+     * hour's override on a transient API failure.
+     *
+     * @return array<int, array{id: int, code: string, start: DateTimeImmutable, end: DateTimeImmutable, status: string, booked: bool, capacity: ?string}>
+     *         today's and tomorrow's (local) slots, sorted by start time — finished ones
+     *         (`status` DONE) included, deliberately: the scheduled sync keys off every
+     *         *booked* slot of the day and must not read "this hour just ended" as "this
+     *         booking disappeared"; callers that only want what's still ahead (the dashboard
+     *         banner) filter on `status`/`end` themselves. `capacity` is AVAILABLE/LOW/FULL,
+     *         or null when Octopus doesn't report one (it does for ended events too).
      */
-    private function querySavingSessions(): array
+    public function getWeekendHappyHours(DateTimeImmutable $today, DateTimeImmutable $tomorrow, DateTimeZone $timezone): array
     {
+        $data = $this->fetchSavingSessions();
+        $joinedIds = array_column($data['account']['joinedEvents'] ?? [], 'eventId');
+        $wanted = [$today->format('Y-m-d'), $tomorrow->format('Y-m-d')];
+
+        $slots = [];
+        foreach ($data['events'] ?? [] as $event) {
+            if (($event['eventType'] ?? null) !== 'WEEKEND_HAPPY_HOUR' || ($event['devEvent'] ?? false)) {
+                continue;
+            }
+            $start = new DateTimeImmutable($event['startAt']);
+            if (!in_array($start->setTimezone($timezone)->format('Y-m-d'), $wanted, true)) {
+                continue;
+            }
+            $slots[] = [
+                'id' => (int) $event['id'],
+                'code' => (string) $event['code'],
+                'start' => $start,
+                'end' => new DateTimeImmutable($event['endAt']),
+                'status' => (string) ($event['status'] ?? 'UPCOMING'),
+                'booked' => in_array($event['id'], $joinedIds, true),
+                'capacity' => $event['capacityStatus'] ?? null,
+            ];
+        }
+        usort($slots, fn($a, $b) => $a['start'] <=> $b['start']);
+        return $slots;
+    }
+
+    /**
+     * One `savingSessions` fetch per client instance, shared by Power down and the
+     * Weekend Happy Hour lookup — they read different slices of the same response, and a
+     * dashboard load shouldn't pay for (or log) it twice. A failed fetch isn't cached, so
+     * the second caller retries rather than inheriting the first's failure silently.
+     *
+     * @return array{events: array, account: array}
+     */
+    private function fetchSavingSessions(): array
+    {
+        if ($this->savingSessionsData !== null) {
+            return $this->savingSessionsData;
+        }
         $query = 'query($accountNumber: String!) {
             savingSessions {
-                events(includeDev: false) { id code startAt endAt rewardPerKwhInOctoPoints devEvent }
+                events(includeDev: false) { id code startAt endAt status eventType capacityStatus rewardPerKwhInOctoPoints devEvent }
                 account(accountNumber: $accountNumber) { joinedEvents { eventId } }
             }
         }';
         $result = $this->graphql(self::BACKEND_URL, $query, ['accountNumber' => $this->accountNumber], 'savingSessions');
-        $data = $result['data']['savingSessions'] ?? null;
-        if ($data === null) {
-            return [];
-        }
+        return $this->savingSessionsData = $result['data']['savingSessions'] ?? ['events' => [], 'account' => []];
+    }
+
+    /**
+     * @return array<int, array{code: string, start: string, end: string, alreadyJoined: bool}>
+     *         Filters out dev/test events and zero-reward events, same as
+     *         automator-octopus-energy's own `getSavingSessions()` — a reward of 0
+     *         OctoPoints/kWh isn't a real opt-in opportunity. Also TURN_DOWN only: a
+     *         TURN_UP/WEEKEND_HAPPY_HOUR event is the opposite action (use *more* power) and
+     *         must never be offered as a Power down; a response with no `eventType` at all
+     *         (older fixtures) is treated as TURN_DOWN, which is all this field ever held
+     *         before happy hours were added to it.
+     */
+    private function querySavingSessions(): array
+    {
+        $data = $this->fetchSavingSessions();
         $joinedIds = array_column($data['account']['joinedEvents'] ?? [], 'eventId');
 
         $events = [];
         foreach ($data['events'] ?? [] as $event) {
             if (($event['devEvent'] ?? false) || (float) ($event['rewardPerKwhInOctoPoints'] ?? 0) <= 0) {
+                continue;
+            }
+            if (($event['eventType'] ?? 'TURN_DOWN') !== 'TURN_DOWN') {
                 continue;
             }
             $events[] = [

@@ -60,7 +60,7 @@ src/
   FoxessClient.php      # signs + sends requests to the FoxESS OpenAPI
   HistoryFetcher.php    # backfills/catches up historic_generation (generation + usage) from FoxESS's report/query endpoint
   OctopusFlexClient.php # opt-in-sessions GraphQL client (api.octopus.energy/v1/graphql/), see "Octopus opt-in sessions" below
-  SessionOptIn.php      # calculateOptInPrep() — pure prep-window maths for opt-in.php
+  SessionOptIn.php      # calculateOptInPrep() prep-window maths for opt-in.php, plus the booked-happy-hour -> fill_your_boots override sync (see "Weekend Happy Hours")
 tests/
   self_check.php        # standalone assert-style test for ScheduleBuilder/CostBasisProvider/Store
 logs/
@@ -1032,12 +1032,20 @@ decisions, confirmed with the user before building:
 - **Fail closed on unknown battery SoC.** If live SoC can't be read when
   "Opt in" is clicked, the whole flow aborts with a warning — no override
   saved, no push attempted. Never guess at battery state for something
-  that costs/earns real money.
+  that costs/earns real money. The reading is `Runner.php`'s
+  `readAverageBatterySoc()`, which excludes a 0% reading (a battery-less
+  inverter reports that) — `opt-in.php` originally averaged it in, halving
+  the SoC the prep maths saw on a two-inverter install where one has no
+  battery. With only battery-less inverters configured it now fails closed
+  (no usable reading) rather than prepping from 0%.
 - **Fill your boots needs no opt-in at all** (a correction made mid-build,
   after the user realised the original spec had this wrong): it's an
   invitation to use more power at a very low/free rate, not a scheme you
   join. Only Power down actually calls an Octopus API to opt in —
-  see below.
+  see below. (Correct for the original `free_electricity` campaign this was
+  written about, which stopped in Oct 2025 — today's free electricity is a
+  different mechanism that *does* need booking per hour; see "Weekend Happy
+  Hours" below.)
 
 `src/SessionOptIn.php`'s `calculateOptInPrep()` is the prep-duration maths,
 a pure function (same "small, testable, no DB/network" precedent as
@@ -1153,6 +1161,70 @@ same degrade-quietly precedent as the solar forecast's `solar_enabled`
 gate. `config.php`'s `octopus.free_electricity_campaign_slug` is the one
 remaining non-secret tunable this feature needs — Power down has no
 equivalent setting, since its API takes no slug at all.
+
+**Weekend Happy Hours: today's free electricity, booked per hour — detected on every
+scheduled run and turned into fill-your-boots overrides (user-requested, minimal by design).**
+Found 2026-10-18 by asking the API directly what free hours existed that afternoon: the
+`customerFlexibilityCampaignEvents(free_electricity)` query above only holds the 2025 series
+(last event 25 Oct 2025), so the existing "Fill your boots" detection finds nothing. Octopus's
+current free hours are `savingSessions.events` entries with `eventType: WEEKEND_HAPPY_HOUR`
+on the same backend host Power down uses — consecutive one-hour slots (Sundays, ~10:00-14:00
+UTC so far), `rewardPerKwhInOctoPoints: 0` (which is why Power down's reward filter already
+hid them), each with a live `capacityStatus` (AVAILABLE/LOW/FULL) and a `status`
+(UPCOMING/ONGOING/DONE). They're *booked* individually, spending a token (`account.tokenBalance`;
+`bookSavingSessionsWeekendHappyHourEvent`), and a booked one appears in `account.joinedEvents`
+matched by event `id`, exactly as a joined Power down does. The old campaign path is
+deliberately kept as-is — Octopus may bring it back — so there are now two independent
+free-electricity sources; the happy-hour one is additive.
+
+- **Foxhole only reads, never books.** A booking spends a token the user may want elsewhere,
+  so booking stays a manual step on Octopus's site — `OctopusFlexClient::getWeekendHappyHours()`
+  has no write counterpart, deliberately.
+- **Scheduled run** (`Runner.php`'s `syncHappyHoursFromOctopus()`, real runs only, before the
+  schedule is built, best-effort — an Octopus failure logs a warning and never aborts the run):
+  fetches today's/tomorrow's slots and calls `SessionOptIn.php`'s
+  `syncBookedHappyHourOverrides()`, which writes a normal `fill_your_boots` override
+  (`Store::saveOverride()`) for each date with a booked window. No new scheduling code:
+  `ScheduleBuilder::overrideModesFor()` already means "ForceDischarge ahead to make room,
+  ForceCharge for the event", and `applyOverrides()` / the modelling scheduler's forced
+  actions already honour that for every scheduler. Prep length comes from
+  `calculateOptInPrep()` (same maths as the opt-in button) off live SoC
+  (`readAverageBatterySoc()`, excluding the 0% a battery-less inverter reports). Runs
+  hourly with the cron, so prep re-shrinks as SoC falls and the booking is picked up within
+  the hour of being made.
+- **Adjacent booked slots merge into one window** (`bookedHappyHourWindows()`); only booked
+  slots count, since an unbooked free hour earns nothing and charging for it would pay full
+  price. The `overrides` table holds one `fill_your_boots` row per date, so *disjoint* booked
+  windows on one date keep only the earliest — widening across the gap would force-charge
+  unbooked hours, which is worse than missing a window. A window crossing midnight is clipped
+  to 23:59 (override times are same-day `H:i`). Known limitation, not a bug.
+- **Which override rows are ours** is tracked in the `happy_hour_override_dates` setting (a
+  JSON list of local dates). A *manual* `fill_your_boots` override for the same date always
+  wins and is never overwritten or deleted; a row we wrote is deleted if a later *successful*
+  fetch no longer shows the booking (cancelled). A failed fetch touches nothing — otherwise a
+  transient Octopus error would look like "every booking was cancelled". A window that has
+  already finished is left alone (our row stays so the day's recorded plan stays accurate).
+  Finished slots (`status: DONE`) are deliberately still returned by `getWeekendHappyHours()`
+  so "this hour ended" is never mistaken for "this booking vanished".
+- **Unreadable SoC degrades to no prep, not no charge**: the free-hour charge is the part
+  that earns money, so it's still scheduled; an override that already exists is left
+  untouched rather than rewritten without the prep it had. (Contrast opt-in.php, which fails
+  closed on SoC — there a wrong guess spends real money on an Octopus opt-in.)
+- **Dashboard banner** (`index.php`'s `renderFreeHoursBanner()`): shown when free hours are
+  still ahead today/tomorrow, at least one isn't FULL, and *none* of the ones still ahead are
+  booked — once one is booked the scheduler handles it and there's nothing to nag about.
+  Links to `https://octopus.energy/dashboard/new/accounts/<configured account number>/saving-sessions/terms`
+  (the configured `octopus_account_number`, never a hardcoded one). Happy hours share the
+  single `savingSessions` fetch Power down already makes per client instance, so this adds
+  no API call per page load.
+- **`getAvailableSessions()` now filters Power down to `eventType: TURN_DOWN`** — previously
+  it filtered only on reward > 0, which would have offered a `TURN_UP` event (the opposite
+  action) as a Power down opt-in. A response with no `eventType` at all is still treated as
+  `TURN_DOWN`.
+
+Verified live against the real account (read-only, throwaway DB): the four Sunday slots
+parsed, the booked 14:00-15:00 one became a 14:00-15:00 override with a 2h discharge ahead of
+it, and exactly one `savingSessions` call was made.
 
 **A real production failure, found from the user's own report and the API
 log, not a live test: `reapplyOverrides()` had no top-level try/catch at
