@@ -74,13 +74,20 @@ renderHeader('Override');
 <?php foreach ($errors as $error): ?><p class="error"><?= htmlspecialchars($error) ?></p><?php endforeach; ?>
 <?php if ($notice): ?><p class="notice"><?= htmlspecialchars($notice) ?></p><?php endif; ?>
 
-<p class="muted">
-  Octopus sometimes runs "Fill your boots" (use more power) or "Power down" (use less) events.
-  Set the event window here and, optionally, a period beforehand to prepare the battery for it.
-  Overrides only apply to the date they're set for and don't carry over to the next day.
-</p>
+<?php /* Collapsed by default — it's reference text, and on a phone it pushed the form off-screen. */ ?>
+<details class="accordion">
+  <summary><h3>Instructions</h3></summary>
+  <p class="muted">
+    Octopus sometimes runs "Fill your boots" (use more power) or "Power down" (use less) events.
+    Set the event window here and, optionally, a period beforehand to prepare the battery for it —
+    the "Discharge" times (Fill your boots) or "Charge" times (Power down) force the battery that
+    way first. Entering a start time fills in an end an hour later if the end is still blank; change
+    it if the window is a different length.
+    Overrides only apply to the date they're set for and don't carry over to the next day.
+  </p>
+</details>
 
-<form method="post">
+<form method="post" class="override-form">
   <?php foreach ($dates as $which => $date): ?>
     <fieldset>
       <legend><?= htmlspecialchars(ucfirst($which) . ' (' . $date->format('D j M') . ')') ?></legend>
@@ -104,7 +111,7 @@ renderHeader('Override');
           <div class="time-range">
             <div class="time-field">
               <label for="<?= $prefix ?>event_start">Event start</label>
-              <input type="time" id="<?= $prefix ?>event_start" name="<?= $prefix ?>event_start" value="<?= htmlspecialchars($existing['event_start'] ?? '') ?>">
+              <input type="time" id="<?= $prefix ?>event_start" name="<?= $prefix ?>event_start" value="<?= htmlspecialchars($existing['event_start'] ?? '') ?>" data-autofill-end="<?= $prefix ?>event_end">
             </div>
             <div class="time-field">
               <label for="<?= $prefix ?>event_end">Event end</label>
@@ -113,11 +120,11 @@ renderHeader('Override');
           </div>
           <div class="time-range">
             <div class="time-field">
-              <label for="<?= $prefix ?>prep_start">Prepare from (optional — force <?= $prepAction ?>)</label>
-              <input type="time" id="<?= $prefix ?>prep_start" name="<?= $prefix ?>prep_start" value="<?= htmlspecialchars($existing['prep_start'] ?? '') ?>">
+              <label for="<?= $prefix ?>prep_start" title="Optional — forces a <?= $prepAction ?> beforehand"><?= ucfirst($prepAction) ?> from</label>
+              <input type="time" id="<?= $prefix ?>prep_start" name="<?= $prefix ?>prep_start" value="<?= htmlspecialchars($existing['prep_start'] ?? '') ?>" data-autofill-end="<?= $prefix ?>prep_end">
             </div>
             <div class="time-field">
-              <label for="<?= $prefix ?>prep_end">Prepare until</label>
+              <label for="<?= $prefix ?>prep_end"><?= ucfirst($prepAction) ?> until</label>
               <input type="time" id="<?= $prefix ?>prep_end" name="<?= $prefix ?>prep_end" value="<?= htmlspecialchars($existing['prep_end'] ?? '') ?>">
             </div>
           </div>
@@ -127,6 +134,31 @@ renderHeader('Override');
   <?php endforeach; ?>
   <button type="submit">Save overrides</button>
 </form>
+
+<script>
+// Entering a start time fills in an end an hour later — for all eight start/end pairs
+// (event + prepare, x 2 kinds, x 2 dates), each wired by its start input's data-autofill-end.
+// Only ever fills an end that's blank, or one this script itself filled and the user hasn't
+// since touched (so retyping the start's minutes mid-entry doesn't leave a stale end behind);
+// a manually-entered or already-saved end is never overwritten. Clamped to 23:59, since an
+// override window can't span midnight.
+document.querySelectorAll('input[data-autofill-end]').forEach(function (start) {
+    var end = document.getElementById(start.dataset.autofillEnd);
+    var autoFilled = false;
+    end.addEventListener('input', function () { autoFilled = false; });
+    function fill() {
+        if (start.value === '' || (end.value !== '' && !autoFilled)) {
+            return;
+        }
+        var parts = start.value.split(':');
+        var minutes = Math.min(parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10) + 60, 23 * 60 + 59);
+        end.value = ('0' + Math.floor(minutes / 60)).slice(-2) + ':' + ('0' + (minutes % 60)).slice(-2);
+        autoFilled = true;
+    }
+    start.addEventListener('input', fill);
+    start.addEventListener('change', fill);
+});
+</script>
 
 <?php
 renderFooter();

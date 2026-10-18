@@ -294,22 +294,45 @@ fieldset {
    waste a whole row each on both mobile and desktop. */
 .time-range {
     display: flex;
-    flex-wrap: wrap;
+    /* A pair never wraps: the two fields share the row and shrink to fit instead
+       (override.php's labels are short enough — "Discharge until" is the longest — that
+       they fit even on a 320px phone). */
+    flex-wrap: nowrap;
     gap: 0.8rem;
 }
 .time-field {
     display: flex;
     flex-direction: column;
     gap: 0.3rem;
-    /* Caps how wide a field gets so a long label (e.g. "Prepare from (optional — force
-       discharge)") wraps onto multiple lines instead of forcing the field wide enough to
-       fit unbroken — without this, that one long label alone pushed its pair past a phone
-       viewport's width and defeated the whole point of .time-range's side-by-side layout. */
+    /* Equal shares of the row, capped on wide screens. min-width: 0 is what lets a flex item
+       shrink below its content's natural width at all. The old design instead capped width
+       and let a long label ("Prepare from (optional — force discharge)") wrap to several
+       lines, which kept the pair on one row but left its two inputs at different heights. */
+    flex: 1 1 0;
     min-width: 0;
     max-width: 9.5rem;
 }
+.time-field label {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
 .time-field input[type="time"] {
-    width: auto;
+    width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+}
+
+/* override.php on a phone: the kind boxes nest inside the date boxes, so every level of
+   border + padding comes out of the width the two time inputs share. */
+@media (max-width: 640px) {
+    .override-form {
+        gap: 0.5rem;
+    }
+    .override-form fieldset {
+        padding: 0.5rem;
+        gap: 0.5rem;
+    }
 }
 
 .btn-clear {

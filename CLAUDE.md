@@ -405,6 +405,26 @@ twice for two independent fields on the same row.
   no rates fetched yet) shows an inline error in that box rather than
   breaking the whole page.
 
+- **`override.php`** — a date box per day (today/tomorrow) holding a box per kind (Fill your
+  boots / Power down), each with two start/end pairs: the event window and an optional prep
+  window (`saveOverride()`'s `prep_*`). Phone layout (user-requested): every pair stays on one
+  row, so `.time-range` is `flex-wrap: nowrap` with equal-share `.time-field`s and the labels
+  are short enough never to wrap — "Event start/end", and "Discharge from/until" (Fill your
+  boots) or "Charge from/until" (Power down) in place of the old "Prepare from (optional —
+  force discharge)", whose wrapping left the two inputs at different heights; the
+  "optional" note moved to the label's `title` and the collapsed Instructions accordion.
+  Verified at 320px (every pair on one row, nothing clipped, no horizontal scroll). The nested
+  fieldsets' padding tightens under 640px since every border level comes out of the width the
+  two inputs share. The intro text is a closed-by-default `<details class="accordion">`, same
+  component as the dashboard's solar forecast.
+
+  Entering a start time fills a blank end an hour later (a small inline script, wired by a
+  `data-autofill-end` attribute on each of the eight start inputs). It only writes an end that
+  is blank, or one the script itself filled and the user hasn't edited since (so re-typing the
+  start's minutes doesn't strand a stale end — real typing into a time field fires `input`
+  at every valid intermediate value); a saved or hand-entered end is never overwritten. It
+  clamps at 23:59, because an override window can't span midnight.
+
 Auth is a native PHP session (`src/Auth.php`, `session_start()` +
 `$_SESSION['authed']`) — no token store, no "remember me," nothing custom.
 `requireLogin()` at the top of a page redirects to `login.php` if there's no
