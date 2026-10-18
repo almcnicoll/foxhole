@@ -353,6 +353,28 @@ twice for two independent fields on the same row.
   `reserve_soc` is specifically about how far force-discharge is allowed to
   drain the battery, which reads as the more apt "minimum SoC" for a
   general-purpose indicator.
+
+  **Compact dashboard (user-requested tidy-up).** The long explanatory text is hidden
+  behind a click: `expandableText()` renders only the head ("Rates last fetched …", and
+  each day's scheduler narrative up to its forecast-usage figure — `splitDaySummary()`
+  cuts at `forecast usage` / `assumed usage N kWh`, and a summary with neither, like the
+  classic scheduler's one-liner, is shown whole) as a native `<details>`, with a "…"
+  chip, and the remainder revealed in place. The remainder sits *inside* the `<summary>`
+  (toggled by CSS on `[open]`), not as the details body, because a details body always
+  starts on a new line and this should read as one sentence growing. The solar forecast
+  is a closed-by-default `<details class="accordion">`. The price chart's viewBox height
+  went 320 → 480 (+50%; every y position derives from `$height`).
+
+  The rates tables (`.rates-table`) are denser, and have the app's first mobile
+  breakpoint (`max-width: 640px`): 12px text, tighter cell padding, and the time column
+  collapses to the start time plus a thin `→` (slots are contiguous, so the next row's
+  start is this row's end) via `.t-end`/`.t-arrow` spans. **The tall rows were mostly a
+  layout bug, not padding**: `.slot-columns` (a wrapping flex row) defaulted to
+  `align-items: stretch`, and a wrapped flex line is as tall as its items at their
+  320px *min-width* (where the cells wrap onto extra lines), so every row got padded out
+  to that height even after the table grew wider — measured 44px rows where the content
+  needs 27px. `align-items: flex-start` fixes it at every width (the desktop table went
+  1084px → 672px tall).
 - **`settings.php`** — FoxESS `api_key`/`device_sns` (pre-filled from
   `Store`, plain text — the user themself set them, no reason to hide them
   from themself; `device_sns` is a `<textarea>`, one serial per line — see

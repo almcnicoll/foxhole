@@ -143,6 +143,45 @@ function slotWorkMode(DateTimeImmutable $instant, array $absoluteIntervals): str
     return 'SelfUse';
 }
 
+/**
+ * Muted explanatory text that shows only $headHtml until clicked, then reveals $restHtml
+ * inline in the same paragraph — a native <details>, no JS. The rest lives *inside* the
+ * <summary> (hidden/shown by CSS on [open]) rather than as the details body, because a
+ * details body always starts on a new line, and this should read as one flowing sentence
+ * growing in place. Both arguments are already-escaped HTML; an empty $restHtml just
+ * renders as plain text with nothing to expand.
+ */
+function expandableText(string $headHtml, string $restHtml): string
+{
+    if (trim($restHtml) === '') {
+        return '<div class="muted">' . $headHtml . '</div>';
+    }
+    $restHtml = ltrim($restHtml);
+    // A remainder that starts with a comma continues the headline's own sentence and must
+    // attach directly; anything else (a new sentence, a dash clause) needs a space first.
+    $separator = str_starts_with($restHtml, ',') ? '' : ' ';
+    return '<div class="muted"><details class="inline-more"><summary title="Click to show more">'
+        . $headHtml . '<span class="more-dots">…</span><span class="more-rest">' . $separator . $restHtml . '</span>'
+        . '</summary></details></div>';
+}
+
+/**
+ * A scheduler's day summary split for display: everything up to and including the forecast
+ * usage figure is the headline ("Modelling scheduler: 12.3kWh forecast usage", "Solar
+ * forecast: 5.0kWh today, assumed usage 12.0kWh"), the remainder (solar, projected cost,
+ * battery SoC...) only shows when clicked. A summary with no usage figure — the classic
+ * scheduler's one-line peak note is already short — is returned whole as the headline.
+ *
+ * @return array{0: string, 1: string} [headline, remainder], both plain text (unescaped)
+ */
+function splitDaySummary(string $summary): array
+{
+    if (preg_match('/^(.*?(?:forecast usage|assumed usage [\d.]+kWh))(.*)$/s', $summary, $m) && trim($m[2], " .\t\n\r") !== '') {
+        return [$m[1], $m[2]];
+    }
+    return [$summary, ''];
+}
+
 /** @param array<int, array{from: DateTimeImmutable, to: DateTimeImmutable, watt_hours: int, fetched_at: DateTimeImmutable}> $forecast */
 function renderSolarForecast(array $forecast, DateTimeZone $timezone): void
 {
@@ -150,7 +189,9 @@ function renderSolarForecast(array $forecast, DateTimeZone $timezone): void
         return;
     }
     ?>
-<h3>Solar forecast</h3>
+<?php /* A native <details> accordion, closed by default — the figures are long and rarely needed at a glance. */ ?>
+<details class="accordion">
+<summary><h3>Solar forecast</h3></summary>
 <p class="muted">Estimated generation, fetched <?= htmlspecialchars($forecast[0]['fetched_at']->setTimezone($timezone)->format('D j M, H:i')) ?> — not yet used to shape the schedule.</p>
 <?php
   // Two columns like the price table below — split by calendar day (today's remaining
@@ -172,6 +213,7 @@ function renderSolarForecast(array $forecast, DateTimeZone $timezone): void
     <?php renderSolarTable($todayBuckets, $timezone); ?>
     <?php renderSolarTable($laterBuckets, $timezone); ?>
 </div>
+</details>
 <?php
 }
 
@@ -232,7 +274,7 @@ function renderPriceChart(array $slots, array $solarForecast, array $absoluteInt
     }
 
     $width = 1000;
-    $height = 320;
+    $height = 480; // was 320 — 50% taller, user-requested; every y position below derives from this
     $marginLeft = 46;
     $marginRight = 54;
     $marginTop = 30;
@@ -510,7 +552,7 @@ function renderPriceChart(array $slots, array $solarForecast, array $absoluteInt
 function renderSlotTable(array $slotsForColumn, DateTimeZone $timezone, array $absoluteIntervals): void
 {
     ?>
-<table>
+<table class="rates-table">
     <thead>
         <tr>
             <th>Time</th>
@@ -526,7 +568,8 @@ function renderSlotTable(array $slotsForColumn, DateTimeZone $timezone, array $a
           $mode = slotWorkMode($slot['from'], $absoluteIntervals);
       ?>
         <tr class="row-<?= htmlspecialchars($mode) ?>">
-            <td><?= htmlspecialchars($localFrom->format('H:i')) ?>–<?= htmlspecialchars($localTo->format('H:i')) ?></td>
+            <?php /* Start–end on a wide screen; on a phone (see .rates-table in style.css) just the start time and a thin arrow, since slots are contiguous and the next row's start is this one's end. */ ?>
+            <td class="slot-time"><?= htmlspecialchars($localFrom->format('H:i')) ?><span class="t-end">–<?= htmlspecialchars($localTo->format('H:i')) ?></span><span class="t-arrow" aria-hidden="true">→</span></td>
             <td class="currency"><?= htmlspecialchars(number_format($slot['import_rate'], 2)) ?></td>
             <td class="currency">
                 <?= $slot['export_rate'] !== null ? htmlspecialchars(number_format($slot['export_rate'], 2)) : '—' ?>
@@ -691,8 +734,11 @@ $schedulerFlagWarnings = json_decode(getSetting('scheduler_flag_warnings_json', 
     </div>
 </form>
 <?php else: ?>
-<p class="muted">
-    Rates last fetched <?= htmlspecialchars(getLatestPriceFetchedAt()->setTimezone($timezone)->format('D j M, H:i')) ?>.
+<?php
+// Only the "last fetched" sentence shows by default; the rest of this explanatory text
+// expands on click (see expandableText()).
+ob_start();
+?>
     Every run recomputes and pushes the schedule to your inverter(s) regardless of whether it changed from last time
     (see the banner above for the outcome of the most recent one triggered from here).
     <?php foreach ($scheduleByDate as $forDate => $daySchedule): ?>
@@ -706,7 +752,10 @@ $schedulerFlagWarnings = json_decode(getSetting('scheduler_flag_warnings_json', 
     No schedule computed yet for <?= htmlspecialchars($forDate) ?>.
         <?php endif; ?>
     <?php endforeach; ?>
-</p>
+<?php
+$fetchedExplanation = trim((string) preg_replace('/\s+/', ' ', ob_get_clean()));
+echo expandableText('Rates last fetched ' . htmlspecialchars(getLatestPriceFetchedAt()->setTimezone($timezone)->format('D j M, H:i')) . '.', $fetchedExplanation);
+?>
 
 <?php
 // A day that computed to zero forced periods (self-use throughout — a legitimate, common
@@ -727,7 +776,7 @@ foreach ($scheduleByDate as $forDate => $daySchedule) {
 <h3>Energy plan</h3>
 <?php foreach ($scheduleByDate as $forDate => $daySchedule): $daySummary = getScheduleSummary($forDate); if ($daySchedule['explanations'] || $daySummary): ?>
 <h4><?= htmlspecialchars((new DateTimeImmutable($forDate, $timezone))->format('D j M')) ?></h4>
-<?php if ($daySummary): ?><p class="muted"><?= htmlspecialchars($daySummary) ?></p><?php endif; ?>
+<?php if ($daySummary): [$summaryHead, $summaryRest] = splitDaySummary($daySummary); ?><?= expandableText(htmlspecialchars($summaryHead), htmlspecialchars($summaryRest)) ?><?php endif; ?>
 <?php if ($daySchedule['explanations']): ?>
 <ul>
     <?php foreach ($daySchedule['explanations'] as $explanation): ?>

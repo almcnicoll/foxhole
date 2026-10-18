@@ -549,10 +549,92 @@ table.dataTable thead .sorting_desc:after {
     display: flex;
     gap: 1.5rem;
     flex-wrap: wrap;
+    /* Not the default `stretch`: a wrapped flex line is as tall as its items' height at the
+       320px min-width they start from (where the cells wrap onto extra lines), and stretch
+       then pads every table row out to that height even once the table has grown to its
+       real, wider size — measured 44px rows where the content needs 27px. */
+    align-items: flex-start;
 }
 .slot-columns table {
     flex: 1;
     min-width: 320px;
+}
+
+/* index.php's rates table: tighter vertical padding/margins than the app-wide `table`
+   defaults (this is the longest table in the app — 24+ rows per column, stacked on a
+   phone), plus a phone layout below. The start–end time collapses to the start time and a
+   thin arrow there: slots are contiguous, so the next row's start is this row's end. */
+.rates-table {
+    margin: 0.5rem 0;
+}
+.rates-table th,
+.rates-table td {
+    padding: 0.2rem 0.6rem;
+    line-height: 1.25;
+}
+.rates-table .t-arrow {
+    display: none;
+}
+@media (max-width: 640px) {
+    .rates-table {
+        font-size: 0.75rem;
+        margin: 0.3rem 0;
+    }
+    .rates-table th,
+    .rates-table td {
+        padding: 0.1rem 0.4rem;
+    }
+    .rates-table .badge {
+        padding: 0 0.4rem;
+        font-size: 0.68rem;
+    }
+    .rates-table .t-end {
+        display: none;
+    }
+    .rates-table .t-arrow {
+        display: inline;
+        margin-left: 0.35em;
+        font-weight: 200;
+        opacity: 0.65;
+    }
+}
+
+/* index.php's expandable explanatory text (expandableText()): a native <details> whose
+   <summary> is the always-visible head, with the rest hidden until [open]. Kept inside
+   the <summary> so the revealed text continues the same sentence instead of dropping to
+   a new line the way a details body would. */
+details.inline-more > summary {
+    display: inline;
+    cursor: pointer;
+    list-style: none;
+}
+details.inline-more > summary::-webkit-details-marker {
+    display: none;
+}
+details.inline-more .more-dots {
+    margin-left: 0.2em;
+    padding: 0 0.35em;
+    border-radius: 3px;
+    background: var(--color-primary-light);
+    color: var(--color-primary-dark);
+}
+details.inline-more .more-rest {
+    display: none;
+}
+details.inline-more[open] .more-rest {
+    display: inline;
+}
+details.inline-more[open] .more-dots {
+    display: none;
+}
+
+/* index.php's solar forecast: a closed-by-default accordion; the <h3> inside the <summary>
+   keeps the heading semantics but sits on the same line as the disclosure marker. */
+details.accordion > summary {
+    cursor: pointer;
+}
+details.accordion > summary h3 {
+    display: inline;
 }
 
 /* settings.php: boxed fieldsets laid out as a responsive grid instead of one long
