@@ -327,6 +327,63 @@ function getLatestPriceFetchedAt(): ?DateTimeImmutable
     return $value !== null ? new DateTimeImmutable($value) : null;
 }
 
+/**
+ * Recomputes the all-time min/avg/max of import and export rates (the reference range for the
+ * dashboard's price colour marks) and stores it as one JSON setting. Called from each scheduler
+ * run rather than on every page load, so the marks only shift when the scheduler runs.
+ * ponytail: scans the whole price_slots table (~17k rows/year), fine until it isn't.
+ */
+function refreshPriceSpectrumStats(): void
+{
+    $stats = [];
+    foreach (['import' => 'import_rate_pence', 'export' => 'export_rate_pence'] as $side => $col) {
+        $row = db()->query("SELECT MIN($col) AS min, MAX($col) AS max, AVG($col) AS avg FROM price_slots")->fetch(PDO::FETCH_ASSOC);
+        if ($row && $row['min'] !== null) {
+            $stats[$side] = ['min' => (float) $row['min'], 'avg' => (float) $row['avg'], 'max' => (float) $row['max']];
+        }
+    }
+    setSetting('price_spectrum_stats', json_encode($stats));
+}
+
+/** @return array{import?: array{min: float, avg: float, max: float}, export?: array{min: float, avg: float, max: float}} */
+function getPriceSpectrumStats(): array
+{
+    $decoded = json_decode((string) getSetting('price_spectrum_stats', '{}'), true);
+    return is_array($decoded) ? $decoded : [];
+}
+
+/**
+ * CSS colour for a price against the all-time range: min = blue, average = the green/yellow
+ * midpoint, max = red (so a typical price reads mid-spectrum however skewed the extremes are).
+ * Prices outside the range clamp to the ends. Pure function.
+ *
+ * @param array{min: float, avg: float, max: float} $range
+ */
+function priceSpectrumColor(float $price, array $range): string
+{
+    ['min' => $min, 'avg' => $avg, 'max' => $max] = $range;
+    if ($price <= $avg) {
+        $t = $avg > $min ? 0.5 * ($price - $min) / ($avg - $min) : 0.5;
+    } else {
+        $t = $max > $avg ? 0.5 + 0.5 * ($price - $avg) / ($max - $avg) : 0.5;
+    }
+    $t = max(0.0, min(1.0, $t));
+    // hue stops: blue, green, yellow, red
+    $stops = [[0.0, 220], [0.33, 130], [0.66, 52], [1.0, 0]];
+    $prevT = 0.0;
+    $prevH = 220;
+    foreach ($stops as [$stopT, $hue]) {
+        if ($t <= $stopT) {
+            $span = $stopT - $prevT;
+            $h = $span > 0 ? $prevH + ($hue - $prevH) * ($t - $prevT) / $span : $hue;
+            return sprintf('hsl(%d, 80%%, 50%%)', round($h));
+        }
+        $prevT = $stopT;
+        $prevH = $hue;
+    }
+    return 'hsl(0, 80%, 50%)';
+}
+
 /** The latest slot_to across every known price slot — the true end of current pricing knowledge, or null if none. */
 function getLatestPriceHorizon(): ?DateTimeImmutable
 {

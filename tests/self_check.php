@@ -739,6 +739,23 @@ check(count(getApiLogEntriesSince($logNow->modify('+8 days')->modify('-2 hours')
 check(getApiLogEntriesSince($logNow->modify('+100 days')) === [], 'a cutoff after every logged entry finds nothing');
 check(getApiLogEntriesSince($logNow)[0]['endpoint'] === '/op/v1/device/scheduler/get', 'getApiLogEntriesSince() returns most-recent-first, same as getApiLogEntries()');
 
+// --- Store: price spectrum colour marks ---
+$spectrumRange = ['min' => -5.0, 'avg' => 20.0, 'max' => 100.0];
+check(priceSpectrumColor(-5.0, $spectrumRange) === 'hsl(220, 80%, 50%)', 'priceSpectrumColor(): the all-time minimum is blue');
+check(priceSpectrumColor(-50.0, $spectrumRange) === 'hsl(220, 80%, 50%)', 'priceSpectrumColor(): below the minimum clamps to blue');
+check(priceSpectrumColor(100.0, $spectrumRange) === 'hsl(0, 80%, 50%)', 'priceSpectrumColor(): the all-time maximum is red');
+check(priceSpectrumColor(500.0, $spectrumRange) === 'hsl(0, 80%, 50%)', 'priceSpectrumColor(): above the maximum clamps to red');
+$spectrumAvgHue = (int) sscanf(priceSpectrumColor(20.0, $spectrumRange), 'hsl(%d,')[0];
+check($spectrumAvgHue > 52 && $spectrumAvgHue < 130, 'priceSpectrumColor(): the average sits between green and yellow');
+upsertPriceSlots(
+    [['from' => new DateTimeImmutable('2030-01-01T00:00:00+00:00'), 'to' => new DateTimeImmutable('2030-01-01T00:30:00+00:00'), 'rate' => 10.0],
+     ['from' => new DateTimeImmutable('2030-01-01T00:30:00+00:00'), 'to' => new DateTimeImmutable('2030-01-01T01:00:00+00:00'), 'rate' => 30.0]],
+    null,
+    new DateTimeImmutable('2030-01-01T00:00:00+00:00'),
+);
+refreshPriceSpectrumStats();
+check((getPriceSpectrumStats()['import']['max'] ?? null) >= 30.0, 'refreshPriceSpectrumStats(): stores an import range covering the newly upserted slots');
+
 // --- Store: api_log status/level filtering (GitHub issue #8) — api-log.php's filter dropdowns.
 // At this point the throwaway DB has 3 rows: two status=200 (one redacted-to-null body, one
 // fresh with errno 0 — both read as 'success'), one status=null (a transport failure, 'error').

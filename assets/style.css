@@ -119,6 +119,11 @@ th {
     text-align: right;
 }
 
+.price-mark {
+    font-size: 1em;
+    margin-right: 0.2em;
+}
+
 .price-chart {
     display: block;
     width: 100%;

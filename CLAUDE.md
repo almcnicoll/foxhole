@@ -365,6 +365,18 @@ twice for two independent fields on the same row.
   is a closed-by-default `<details class="accordion">`. The price chart's viewBox height
   went 320 → 480 (+50%; every y position derives from `$height`).
 
+  **Price marks** (user-requested): each import/export price in the rates tables has a
+  coloured mark (`priceMark()`, `.price-mark`). A side set to *fixed* price mode is grey;
+  a variable side is coloured on a spectrum from the all-time range — min = blue, average =
+  the green/yellow midpoint, max = red (`priceSpectrumColor()`, `Store.php`; average-anchored
+  so a typical Agile price doesn't read as "high" just because of rare spikes). The
+  min/avg/max are *not* computed per page load: `refreshPriceSpectrumStats()` runs each
+  scheduler run (right after the price upsert, manual or cron) and stores them in the
+  `price_spectrum_stats` setting, so marks stay empty-grey until the first run after
+  deploying. Import gets a ★ instead of ● when its price is below that slot's export price;
+  export is always ●. Known quirk: the range is over every stored slot, so if a side's mode
+  was ever switched fixed→api, the old flat rows stay in its min/avg/max.
+
   The rates tables (`.rates-table`) are denser, and have the app's first mobile
   breakpoint (`max-width: 640px`): 12px text, tighter cell padding, and the time column
   collapses to the start time plus a thin `→` (slots are contiguous, so the next row's

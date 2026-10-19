@@ -549,8 +549,26 @@ function renderPriceChart(array $slots, array $solarForecast, array $absoluteInt
 <?php
 }
 
+/**
+ * The coloured mark beside a price: grey for a fixed-price side, else a spectrum colour from the
+ * all-time range stored at the last scheduler run. A star (import only) when importing is cheaper
+ * than the export price at that moment; a dot otherwise.
+ *
+ * @param array{min: float, avg: float, max: float}|null $range
+ */
+function priceMark(float $price, bool $fixed, ?array $range, bool $star): string
+{
+    $colour = $fixed || $range === null ? 'var(--color-muted, #888)' : priceSpectrumColor($price, $range);
+    $glyph = $star ? '★' : '●';
+    $title = $star ? 'Import is cheaper than export' : '';
+    return '<span class="price-mark" style="color:' . $colour . '"' . ($title ? ' title="' . $title . '"' : '') . ' aria-hidden="true">' . $glyph . '</span>';
+}
+
 function renderSlotTable(array $slotsForColumn, DateTimeZone $timezone, array $absoluteIntervals): void
 {
+    $spectrum = getPriceSpectrumStats();
+    $importFixed = (getSetting('import_price_mode') ?? 'api') === 'fixed';
+    $exportFixed = (getSetting('export_price_mode') ?? 'fixed') === 'fixed';
     ?>
 <table class="rates-table">
     <thead>
@@ -570,9 +588,9 @@ function renderSlotTable(array $slotsForColumn, DateTimeZone $timezone, array $a
         <tr class="row-<?= htmlspecialchars($mode) ?>">
             <?php /* Start–end on a wide screen; on a phone (see .rates-table in style.css) just the start time and a thin arrow, since slots are contiguous and the next row's start is this one's end. */ ?>
             <td class="slot-time"><?= htmlspecialchars($localFrom->format('H:i')) ?><span class="t-end">–<?= htmlspecialchars($localTo->format('H:i')) ?></span><span class="t-arrow" aria-hidden="true">→</span></td>
-            <td class="currency"><?= htmlspecialchars(number_format($slot['import_rate'], 2)) ?></td>
+            <td class="currency"><?= priceMark($slot['import_rate'], $importFixed, $spectrum['import'] ?? null, $slot['export_rate'] !== null && $slot['import_rate'] < $slot['export_rate']) ?> <?= htmlspecialchars(number_format($slot['import_rate'], 2)) ?></td>
             <td class="currency">
-                <?= $slot['export_rate'] !== null ? htmlspecialchars(number_format($slot['export_rate'], 2)) : '—' ?>
+                <?= $slot['export_rate'] !== null ? priceMark($slot['export_rate'], $exportFixed, $spectrum['export'] ?? null, false) . ' ' . htmlspecialchars(number_format($slot['export_rate'], 2)) : '—' ?>
             </td>
             <td><span class="badge badge-<?= htmlspecialchars($mode) ?>"><?= htmlspecialchars($mode) ?></span></td>
         </tr>

@@ -108,6 +108,7 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
         if (!$fetchedAnyDay) {
             throw new OctopusFetchException('No rates available for today or tomorrow.');
         }
+        refreshPriceSpectrumStats();
 
         // Not on the critical path — not used by ScheduleBuilder yet (see roadmap.MD's
         // "Solar-generation-aware scheduling"), just retrieved and stored for now, same
