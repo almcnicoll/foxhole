@@ -262,22 +262,7 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
             // real battery elsewhere on the same account produced a nonsense low starting
             // point for the simulation.
             if (!$dryRun) {
-                $socApiKey = getSetting('foxess_api_key', '');
-                $socDeviceSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('foxess_device_sns', '')))));
-                $socReadings = [];
-                foreach ($socDeviceSns as $sn) {
-                    try {
-                        $soc = (new FoxessClient($socApiKey, $sn, $config['foxess']['base_url']))->getBatterySoc();
-                        if ($soc !== null && $soc > 0.0) {
-                            $socReadings[] = $soc;
-                        }
-                    } catch (FoxessPushException $e) {
-                        $logger->warn("Battery SoC read from $sn failed, excluding from average: " . $e->getMessage());
-                    }
-                }
-                if ($socReadings) {
-                    $currentSocPercent = array_sum($socReadings) / count($socReadings);
-                }
+                $currentSocPercent = readAverageBatterySoc($config, $logger); // also logs the reading for the dashboard chart
             }
             $solarSlots = getLatestSolarForecast() ?: null;
         }
@@ -333,6 +318,7 @@ function runScheduler(bool $dryRun, ?string $forceSchedulerId = null): array
             upsertScheduleSummary($forDate, $daySchedule['summary']);
         }
         pruneOldSchedules($today->format('Y-m-d'));
+        recordPredictedSocFromSchedule($scheduleByDate, $now);
 
         // The actual FoxESS push covers from the start of the current hour through 24h
         // ahead or the end of known pricing, whichever is sooner (GitHub issue #4, point
@@ -552,20 +538,7 @@ function reapplyOverrides(): array
         $currentSocPercent = null;
         $solarSlots = null;
         if ($schedulerId === 'forecast_weighted_price_model' || $schedulerId === 'modelling') {
-            $socApiKey = getSetting('foxess_api_key', '');
-            $socDeviceSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('foxess_device_sns', '')))));
-            $socReadings = [];
-            foreach ($socDeviceSns as $sn) {
-                try {
-                    $soc = (new FoxessClient($socApiKey, $sn, $config['foxess']['base_url']))->getBatterySoc();
-                    if ($soc !== null && $soc > 0.0) {
-                        $socReadings[] = $soc;
-                    }
-                } catch (FoxessPushException $e) {
-                    $logger->warn("Battery SoC read from $sn failed, excluding from average: " . $e->getMessage());
-                }
-            }
-            $currentSocPercent = $socReadings ? array_sum($socReadings) / count($socReadings) : null;
+            $currentSocPercent = readAverageBatterySoc($config, $logger);
             $solarSlots = getLatestSolarForecast() ?: null;
         }
 
@@ -596,6 +569,7 @@ function reapplyOverrides(): array
             }
         }
         unset($daySchedule);
+        recordPredictedSocFromSchedule($scheduleByDate, $now);
 
         $apiKey = getSetting('foxess_api_key', '');
         $deviceSns = array_values(array_filter(array_map('trim', explode("\n", getSetting('foxess_device_sns', '')))));
@@ -786,8 +760,8 @@ function syncHappyHoursFromOctopus(array $config, Logger $logger, DateTimeImmuta
  * Average live SoC across the configured inverters, or null if none could be read. A
  * reading of exactly 0% is excluded — a battery-less inverter reports that, and averaging
  * it in against a real battery elsewhere on the account gives a nonsense low figure (same
- * rule, same reason as runScheduler()'s own SoC gathering for the forecast-weighted and
- * modelling schedulers, which this deliberately mirrors rather than refactors).
+ * rule, same reason — runScheduler()/reapplyOverrides() use this too). Every successful
+ * reading is also logged (recordActualSoc()) for the dashboard chart's battery line.
  */
 function readAverageBatterySoc(array $config, Logger $logger): ?float
 {
@@ -804,5 +778,15 @@ function readAverageBatterySoc(array $config, Logger $logger): ?float
             $logger->warn("Battery SoC read from $sn failed, excluding from average: " . $e->getMessage());
         }
     }
-    return $readings ? array_sum($readings) / count($readings) : null;
+    $average = $readings ? array_sum($readings) / count($readings) : null;
+    if ($average !== null) {
+        recordActualSoc($average, new DateTimeImmutable('now'));
+    }
+    return $average;
+}
+
+/** Stores the scheduler's predicted SoC trajectory (modelling scheduler only — other schedulers supply none, which just clears the stale future prediction). */
+function recordPredictedSocFromSchedule(array $scheduleByDate, DateTimeImmutable $now): void
+{
+    replacePredictedSoc(array_merge([], ...array_column($scheduleByDate, 'socTrajectory')), $now);
 }

@@ -119,6 +119,16 @@ function db(?string $overridePath = null): PDO
     if ($hasUsageColumn === 0) {
         $pdo->exec('ALTER TABLE historic_generation ADD COLUMN usage_kwh REAL');
     }
+    // Battery state-of-charge log for the dashboard chart: kind 'actual' (live readings, one
+    // per 10-minute bucket) and 'predicted' (the modelling scheduler's per-slot trajectory,
+    // rewritten for the future on each run — past predictions are left as "what we expected").
+    // `at` is UTC DATE_ATOM so TEXT comparison is chronological. See recordActualSoc().
+    $pdo->exec('CREATE TABLE IF NOT EXISTS soc_log (
+        kind TEXT NOT NULL,
+        at TEXT NOT NULL,
+        soc_percent REAL NOT NULL,
+        PRIMARY KEY (kind, at)
+    )');
     // One row per (date, kind) — a date-linked exception to the normal schedule, not
     // history, so it's fine as a plain upsertable table rather than the disposable
     // replace-all pattern rate_slots/schedule_groups use.
@@ -325,6 +335,49 @@ function getLatestPriceFetchedAt(): ?DateTimeImmutable
 {
     $value = db()->query('SELECT MAX(fetched_at) FROM price_slots')->fetchColumn();
     return $value !== null ? new DateTimeImmutable($value) : null;
+}
+
+/** Logs a live battery SoC reading, one row per 10-minute bucket (a later reading in the same bucket replaces it). */
+function recordActualSoc(float $percent, DateTimeImmutable $at): void
+{
+    $utc = $at->setTimezone(new DateTimeZone('UTC'));
+    $bucket = $utc->setTime((int) $utc->format('G'), intdiv((int) $utc->format('i'), 10) * 10, 0);
+    db()->prepare('INSERT OR REPLACE INTO soc_log (kind, at, soc_percent) VALUES (\'actual\', ?, ?)')
+        ->execute([$bucket->format(DATE_ATOM), $percent]);
+}
+
+/**
+ * Replaces the future part of the predicted SoC trajectory with $points (each ['at' =>
+ * DateTimeImmutable, 'percent' => float]; points not after $now are ignored). An empty $points
+ * (a scheduler with no per-slot prediction) just clears the stale future prediction.
+ */
+function replacePredictedSoc(array $points, DateTimeImmutable $now): void
+{
+    $cutoff = $now->setTimezone(new DateTimeZone('UTC'))->format(DATE_ATOM);
+    $pdo = db();
+    $pdo->beginTransaction();
+    $pdo->prepare('DELETE FROM soc_log WHERE kind = \'predicted\' AND at > ?')->execute([$cutoff]);
+    $insert = $pdo->prepare('INSERT OR REPLACE INTO soc_log (kind, at, soc_percent) VALUES (\'predicted\', ?, ?)');
+    foreach ($points as $point) {
+        $at = $point['at']->setTimezone(new DateTimeZone('UTC'))->format(DATE_ATOM);
+        if ($at > $cutoff) {
+            $insert->execute([$at, $point['percent']]);
+        }
+    }
+    $pdo->commit();
+}
+
+/** @return array{actual: array<int, array{at: DateTimeImmutable, percent: float}>, predicted: array<int, array{at: DateTimeImmutable, percent: float}>} within [$from, $to), ascending */
+function getSocLog(DateTimeImmutable $from, DateTimeImmutable $to): array
+{
+    $utc = new DateTimeZone('UTC');
+    $stmt = db()->prepare('SELECT kind, at, soc_percent FROM soc_log WHERE at >= ? AND at < ? ORDER BY at ASC');
+    $stmt->execute([$from->setTimezone($utc)->format(DATE_ATOM), $to->setTimezone($utc)->format(DATE_ATOM)]);
+    $result = ['actual' => [], 'predicted' => []];
+    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $result[$row['kind']][] = ['at' => new DateTimeImmutable($row['at']), 'percent' => (float) $row['soc_percent']];
+    }
+    return $result;
 }
 
 /**

@@ -124,6 +124,10 @@ if ($apiKey !== '' && $deviceSns) {
             $batterySocs[$sn] = null;
         }
     }
+    $liveSocs = array_filter($batterySocs, fn($v) => $v !== null);
+    if ($liveSocs) {
+        recordActualSoc(array_sum($liveSocs) / count($liveSocs), new DateTimeImmutable('now')); // feeds the chart's SoC line
+    }
 }
 
 /**
@@ -276,7 +280,7 @@ function renderPriceChart(array $slots, array $solarForecast, array $absoluteInt
     $width = 1000;
     $height = 480; // was 320 — 50% taller, user-requested; every y position below derives from this
     $marginLeft = 46;
-    $marginRight = 54;
+    $marginRight = 84; // room for the kW labels and, beside them, the SoC % labels
     $marginTop = 30;
     $marginBottom = 24;
     $plotWidth = $width - $marginLeft - $marginRight;
@@ -295,6 +299,7 @@ function renderPriceChart(array $slots, array $solarForecast, array $absoluteInt
     $x = fn(DateTimeImmutable $t) => $marginLeft + (($t->getTimestamp() - $chartStart->getTimestamp()) / 60 / $totalMinutes) * $plotWidth;
     $yPrice = fn(float $p) => $marginTop + (1 - ($p - $priceMin) / ($priceMax - $priceMin)) * $plotHeight;
     $yKw = fn(float $kw) => $marginTop + (1 - ($kwMax > 0 ? $kw / $kwMax : 0)) * $plotHeight;
+    $ySoc = fn(float $pct) => $marginTop + (1 - max(0.0, min(100.0, $pct)) / 100) * $plotHeight;
 
     // One background rect per half-hour slot we actually have data for (a partial day just
     // leaves a gap — see CLAUDE.md's "Partial-day data is normal" — rather than guessing).
@@ -481,6 +486,35 @@ function renderPriceChart(array $slots, array $solarForecast, array $absoluteInt
         }
     }
 
+    // Battery state of charge, 0-100% over the full plot height (labels sit beside the kW ones
+    // on the right axis — 0/50/100% line up with 0/half/full kW). Grey, solid = logged readings
+    // (soc_log), dotted = the modelling scheduler's predicted trajectory; a scheduler with no
+    // per-slot prediction simply leaves the dotted line empty.
+    $socLog = getSocLog($chartStart, $chartEnd);
+    $socPoints = [];
+    $socMarkers = '';
+    foreach ($socLog['actual'] as $p) {
+        $at = $p['at']->setTimezone($timezone);
+        $px = $x($at);
+        $py = $ySoc($p['percent']);
+        $socPoints[] = sprintf('%.1f,%.1f', $px, $py);
+        $socMarkers .= $marker($px, $py, 'var(--color-soc)', sprintf('Battery: %.0f%% at %s', $p['percent'], $at->format('D H:i')));
+    }
+    $predictedSocPoints = [];
+    $predictedSocMarkers = '';
+    foreach ($socLog['predicted'] as $p) {
+        $at = $p['at']->setTimezone($timezone);
+        $px = $x($at);
+        $py = $ySoc($p['percent']);
+        $predictedSocPoints[] = sprintf('%.1f,%.1f', $px, $py);
+        $predictedSocMarkers .= $marker($px, $py, 'var(--color-soc)', sprintf('Predicted battery: %.0f%% at %s', $p['percent'], $at->format('D H:i')));
+    }
+    if ($socPoints || $predictedSocPoints) {
+        foreach ([0, 50, 100] as $pct) {
+            $grid .= sprintf('<text x="%.1f" y="%.1f" fill="var(--color-soc)" font-size="10" text-anchor="start" dominant-baseline="middle">%d%%</text>', $marginLeft + $plotWidth + 46, $ySoc((float) $pct), $pct);
+        }
+    }
+
     // "Now" only makes sense while it actually falls within the charted span — always true
     // for the "today" portion, but not once now has moved past the last known slot (e.g.
     // only a partial day is known and it's later than that).
@@ -491,7 +525,7 @@ function renderPriceChart(array $slots, array $solarForecast, array $absoluteInt
         $nowLine = sprintf('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="var(--color-primary)" stroke-width="1.5" stroke-dasharray="4,3" />', $nowX, $marginTop, $nowX, $marginTop + $plotHeight);
     }
     ?>
-<svg class="price-chart" viewBox="0 0 <?= $width ?> <?= $height ?>" role="img" aria-label="Import and export price, and solar generation/forecast, over the known period">
+<svg class="price-chart" viewBox="0 0 <?= $width ?> <?= $height ?>" role="img" aria-label="Import and export price, solar generation/forecast, and battery charge, over the known period">
     <defs>
         <clipPath id="price-chart-plot"><rect x="<?= $marginLeft ?>" y="<?= $marginTop ?>" width="<?= $plotWidth ?>" height="<?= $plotHeight ?>" /></clipPath>
     </defs>
@@ -504,13 +538,15 @@ function renderPriceChart(array $slots, array $solarForecast, array $absoluteInt
         <?php if ($solarPoints): ?><polyline points="<?= implode(' ', $solarPoints) ?>" fill="none" stroke="var(--color-solar)" stroke-width="2" stroke-dasharray="5,4" /><?php endif; ?>
         <?php if ($usagePoints): ?><polyline points="<?= implode(' ', $usagePoints) ?>" fill="none" stroke="var(--color-usage)" stroke-width="2" /><?php endif; ?>
         <?php if ($projectedUsagePoints): ?><polyline points="<?= implode(' ', $projectedUsagePoints) ?>" fill="none" stroke="var(--color-usage)" stroke-width="2" stroke-dasharray="5,4" /><?php endif; ?>
+        <?php if ($socPoints): ?><polyline points="<?= implode(' ', $socPoints) ?>" fill="none" stroke="var(--color-soc)" stroke-width="2" /><?php endif; ?>
+        <?php if ($predictedSocPoints): ?><polyline points="<?= implode(' ', $predictedSocPoints) ?>" fill="none" stroke="var(--color-soc)" stroke-width="2" stroke-dasharray="1,4" stroke-linecap="round" /><?php endif; ?>
     </g>
     <?= $grid ?>
     <?php /* Markers sit outside the clipped group, deliberately — the first/last point of
     every series lands exactly on the clip boundary, and clip-path silently eats half their
     hit-circle there (confirmed live: elementFromPoint missed it), breaking hover for
     exactly those points. */ ?>
-    <g><?= $importMarkers . $exportMarkers . $generationMarkers . $solarMarkers . $usageMarkers . $projectedUsageMarkers ?></g>
+    <g><?= $importMarkers . $exportMarkers . $generationMarkers . $solarMarkers . $usageMarkers . $projectedUsageMarkers . $socMarkers . $predictedSocMarkers ?></g>
     <g font-size="10" fill="var(--color-muted)">
         <line x1="<?= $marginLeft ?>" y1="12" x2="<?= $marginLeft + 16 ?>" y2="12" stroke="var(--color-error)" stroke-width="2" /><text x="<?= $marginLeft + 20 ?>" y="15">Import price</text>
         <line x1="<?= $marginLeft + 110 ?>" y1="12" x2="<?= $marginLeft + 126 ?>" y2="12" stroke="var(--color-success)" stroke-width="2" /><text x="<?= $marginLeft + 130 ?>" y="15">Export price</text>
@@ -518,6 +554,8 @@ function renderPriceChart(array $slots, array $solarForecast, array $absoluteInt
         <?php if ($solarPoints): ?><line x1="<?= $marginLeft + 330 ?>" y1="12" x2="<?= $marginLeft + 346 ?>" y2="12" stroke="var(--color-solar)" stroke-width="2" stroke-dasharray="4,3" /><text x="<?= $marginLeft + 350 ?>" y="15">Solar forecast</text><?php endif; ?>
         <?php if ($usagePoints): ?><line x1="<?= $marginLeft + 440 ?>" y1="12" x2="<?= $marginLeft + 456 ?>" y2="12" stroke="var(--color-usage)" stroke-width="2" /><text x="<?= $marginLeft + 460 ?>" y="15">Usage</text><?php endif; ?>
         <?php if ($projectedUsagePoints): ?><line x1="<?= $marginLeft + 510 ?>" y1="12" x2="<?= $marginLeft + 526 ?>" y2="12" stroke="var(--color-usage)" stroke-width="2" stroke-dasharray="4,3" /><text x="<?= $marginLeft + 530 ?>" y="15">Projected usage</text><?php endif; ?>
+        <?php if ($socPoints): ?><line x1="<?= $marginLeft + 640 ?>" y1="12" x2="<?= $marginLeft + 656 ?>" y2="12" stroke="var(--color-soc)" stroke-width="2" /><text x="<?= $marginLeft + 660 ?>" y="15">Battery</text><?php endif; ?>
+        <?php if ($predictedSocPoints): ?><line x1="<?= $marginLeft + 720 ?>" y1="12" x2="<?= $marginLeft + 736 ?>" y2="12" stroke="var(--color-soc)" stroke-width="2" stroke-dasharray="1,4" stroke-linecap="round" /><text x="<?= $marginLeft + 740 ?>" y="15">Predicted battery</text><?php endif; ?>
     </g>
 </svg>
 <script>

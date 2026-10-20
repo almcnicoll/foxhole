@@ -755,6 +755,20 @@ upsertPriceSlots(
 );
 refreshPriceSpectrumStats();
 check((getPriceSpectrumStats()['import']['max'] ?? null) >= 30.0, 'refreshPriceSpectrumStats(): stores an import range covering the newly upserted slots');
+// --- Store: soc_log (dashboard battery line) ---
+$socNow = new DateTimeImmutable("2031-01-01T12:00:00+00:00");
+recordActualSoc(40.0, $socNow->modify("-25 minutes"));
+recordActualSoc(41.0, $socNow->modify("-23 minutes")); // same 10-minute bucket as the one above
+recordActualSoc(50.0, $socNow);
+replacePredictedSoc([["at" => $socNow->modify("+30 minutes"), "percent" => 55.0], ["at" => $socNow->modify("+60 minutes"), "percent" => 60.0]], $socNow);
+$socRange = getSocLog($socNow->modify("-1 hour"), $socNow->modify("+2 hours"));
+check(count($socRange["actual"]) === 2 && $socRange["actual"][0]["percent"] === 41.0, "recordActualSoc(): one row per 10-minute bucket, a later reading replaces an earlier one");
+check(count($socRange["predicted"]) === 2, "replacePredictedSoc(): stores the future points");
+replacePredictedSoc([["at" => $socNow->modify("-30 minutes"), "percent" => 1.0], ["at" => $socNow->modify("+30 minutes"), "percent" => 70.0]], $socNow->modify("+10 minutes"));
+$socRange = getSocLog($socNow->modify("-1 hour"), $socNow->modify("+2 hours"));
+check(count($socRange["predicted"]) === 1 && $socRange["predicted"][0]["percent"] === 70.0, "replacePredictedSoc(): rewrites only the future, ignoring points not after now");
+replacePredictedSoc([], $socNow->modify("-1 hour"));
+check(getSocLog($socNow->modify("-1 hour"), $socNow->modify("+2 hours"))["predicted"] === [], "replacePredictedSoc([]): clears the stale future prediction (a scheduler with no trajectory)");
 
 // --- Store: api_log status/level filtering (GitHub issue #8) — api-log.php's filter dropdowns.
 // At this point the throwaway DB has 3 rows: two status=200 (one redacted-to-null body, one
@@ -1562,6 +1576,8 @@ $cheapFirstSlots = buildSlotsFrom([10.0, 50.0], new DateTimeImmutable('2026-03-0
 $noUsage = [0.0, 0.0];
 $forceEndAt20pct = ['soc_bin_kwh' => 1.0, 'min_end_soc_pct' => 20];
 $cheapCharge = (new ModellingScheduleBuilder($mStrategy, $mBattery, $forceEndAt20pct))->build($cheapFirstSlots, null, $noUsage, null, 0.0);
+check(count($cheapCharge["socTrajectory"]) === count($cheapFirstSlots), "ModellingScheduleBuilder: one SoC trajectory point per slot");
+check(abs(end($cheapCharge["socTrajectory"])["percent"] - $cheapCharge["finalSocPercent"]) < 1e-6, "ModellingScheduleBuilder: trajectory ends at finalSocPercent");
 check(
     count($cheapCharge['intervals']) === 1 && $cheapCharge['intervals'][0]['workMode'] === 'ForceCharge',
     'a single ForceCharge interval satisfies the min-end-SoC constraint: got ' . json_encode(array_column($cheapCharge['intervals'], 'workMode')),

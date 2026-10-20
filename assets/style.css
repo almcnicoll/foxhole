@@ -22,6 +22,7 @@
     --color-error-bg: #fdeeee;
     --color-solar: #daa520;
     --color-usage: #3b82f6;
+    --color-soc: #7d7d85;
 
     /* Green = discharging/exporting (saving money), red = charging/importing (costs money) —
      mode colouring is about cost direction, not charge-vs-discharge as such. */
@@ -54,6 +55,7 @@
         --color-primary-light: #2a2140;
         --color-border: #ffffff33;
         --color-muted: #a8a3b8;
+        --color-soc: #a3a3ad;
         --color-success-bg: #16321f;
         --color-warning-bg: #3a2c05;
         --color-error-bg: #3a1518;

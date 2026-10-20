@@ -200,11 +200,18 @@ function buildModellingSchedule(
         $touchedDates[$slot['from']->setTimezone($timezone)->format('Y-m-d')] = true;
     }
 
+    // Predicted-SoC points go to the date their slot *started* on (a slot ending exactly at
+    // midnight belongs to the day it covered, which is always a touched date).
+    $socByDate = [];
+    foreach ($result['socTrajectory'] as $point) {
+        $socByDate[$point['at']->modify('-1 second')->setTimezone($timezone)->format('Y-m-d')][] = $point;
+    }
+
     $scheduleBuilder = new ScheduleBuilder($strategyConfig, $batteryConfig);
     $byDate = [];
     foreach (array_keys($touchedDates) as $forDate) {
         $converted = $scheduleBuilder->absoluteIntervalsToGroups($intervalsByDate[$forDate] ?? []);
-        $byDate[$forDate] = ['groups' => $converted['groups'], 'explanations' => $converted['explanations'], 'summary' => $result['summary']];
+        $byDate[$forDate] = ['groups' => $converted['groups'], 'explanations' => $converted['explanations'], 'summary' => $result['summary'], 'socTrajectory' => $socByDate[$forDate] ?? []];
     }
     ksort($byDate);
     return $byDate;

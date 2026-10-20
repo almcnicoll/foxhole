@@ -377,6 +377,22 @@ twice for two independent fields on the same row.
   export is always ●. Known quirk: the range is over every stored slot, so if a side's mode
   was ever switched fixed→api, the old flat rows stay in its min/avg/max.
 
+  **Battery line on the chart** (user-requested): a grey solid line for logged SoC and a grey
+  dotted one for the predicted trajectory, 0-100% over the full plot height (its % labels sit
+  beside the kW ones on the right axis; 0/50/100% line up with 0/half/full kW). Stored in
+  `soc_log (kind, at, soc_percent)`, not `historic_generation`: SoC is an instantaneous state
+  with exact timestamps, not an hourly kWh total, and FoxESS's `report/query` has no SoC
+  history to backfill, so *actual* is logged going forward only — one row per 10-minute
+  bucket, written by `readAverageBatterySoc()` (scheduler runs, happy-hour sync, opt-in) and
+  by each dashboard load. *Predicted* comes from `ModellingScheduleBuilder`'s optimal-path
+  trajectory (`socTrajectory`, SoC at each slot end), carried per date through
+  `buildModellingSchedule()` and rewritten for the future on every real run
+  (`recordPredictedSocFromSchedule()`, also from `reapplyOverrides()`); past predictions are
+  left as "what we expected". **Only the modelling scheduler predicts** — the classic one has
+  no SoC model, and the forecast-weighted one simulates each *whole* day from midnight starting
+  at the live SoC, so its trajectory for today would be misleading; both just clear the stale
+  future prediction. History page chart unchanged (kWh axes).
+
   The rates tables (`.rates-table`) are denser, and have the app's first mobile
   breakpoint (`max-width: 640px`): 12px text, tighter cell padding, and the time column
   collapses to the start time plus a thin `→` (slots are contiguous, so the next row's

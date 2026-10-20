@@ -88,7 +88,8 @@ class ModellingScheduleBuilder
      *        set of actions considered for it shrinks to one — so a forced discharge with
      *        nothing available to discharge still correctly does nothing, same as an
      *        unconstrained one would.
-     * @return array{intervals: array, summary: string, finalSocPercent: float, totalCostPence: float}
+     * @return array{intervals: array, summary: string, finalSocPercent: float, totalCostPence: float, socTrajectory: array<int, array{at: DateTimeImmutable, percent: float}>}
+     *         socTrajectory is the optimal path's SoC at the end of each slot, aligned to $importSlots.
      *         intervals: array<int, array{start: DateTimeImmutable, end: DateTimeImmutable, workMode: string, explanation: string}>,
      *         already excluding SelfUse periods (nothing to explicitly push for those, same
      *         convention as the other two schedulers' own build() output). totalCostPence
@@ -200,13 +201,16 @@ class ModellingScheduleBuilder
 
         // --- Reconstruct the action sequence via backpointers ---
         $actionByIndex = [];
+        $socTrajectory = []; // SoC at the end of each slot, for the dashboard's predicted-SoC line
         $bin = $bestBin;
         for ($t = $n; $t > 0; $t--) {
             $bp = $backpointer[$t][$bin];
+            $socTrajectory[$t - 1] = ['at' => $importSlots[$t - 1]['to'], 'percent' => $capacityKwh > 0 ? $binKwh($bin) / $capacityKwh * 100 : 0.0];
             $actionByIndex[$t - 1] = $bp['action'];
             $bin = $bp['fromBin'];
         }
         ksort($actionByIndex);
+        ksort($socTrajectory);
 
         $periods = $this->mergeContiguous($importSlots, $actionByIndex, $timezone);
         $intervals = [];
@@ -243,7 +247,7 @@ class ModellingScheduleBuilder
             $constraintRelaxed ? ' — below the configured minimum end-of-horizon SoC, which no reachable state could meet' : '',
         );
 
-        return ['intervals' => $intervals, 'summary' => $summary, 'finalSocPercent' => $finalSocPercent, 'totalCostPence' => $cost[$n][$bestBin]];
+        return ['intervals' => $intervals, 'summary' => $summary, 'finalSocPercent' => $finalSocPercent, 'totalCostPence' => $cost[$n][$bestBin], 'socTrajectory' => array_values($socTrajectory)];
     }
 
     /** @return array{0: float, 1: float} [newSocKwh, netGridKwh] (netGridKwh negative = export) */
